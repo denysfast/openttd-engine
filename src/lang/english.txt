@@ -2862,6 +2862,7 @@ STR_RAIL_TOOLBAR_TOOLTIP_BUILD_RAILROAD_TUNNEL                  :{BLACK}Build ra
 STR_RAIL_TOOLBAR_TOOLTIP_TOGGLE_BUILD_REMOVE_FOR                :{BLACK}Toggle build/remove for railway track, signals, waypoints and stations. Ctrl+Click to also remove the rail of waypoints and stations
 STR_RAIL_TOOLBAR_TOOLTIP_CONVERT_RAIL                           :{BLACK}Convert/Upgrade the type of rail. Also press Shift to show cost estimate only
 STR_RAIL_TOOLBAR_TOOLTIP_BLUEPRINTS                             :{BLACK}Rail blueprints: copy an area of railway and paste it elsewhere, rotated or mirrored
+STR_RAIL_TOOLBAR_TOOLTIP_TRUNK_LINE                             :{BLACK}Trunk line: build many parallel one-way tracks from one point to another, clearing and levelling the corridor. Hotkey: K
 
 # Rail blueprint window
 STR_BLUEPRINT_CAPTION                                           :{WHITE}Rail Blueprints
@@ -2918,6 +2919,50 @@ STR_ERROR_BLUEPRINT_DOES_NOT_FIT                                :{WHITE}... the 
 STR_ERROR_BLUEPRINT_EMPTY                                       :{WHITE}... the blueprint is empty
 STR_ERROR_BLUEPRINT_OTHER                                       :{WHITE}... {RAW_STRING}
 STR_ERROR_BLUEPRINT_PASTE_RUNNING                               :{WHITE}... another blueprint is still being pasted
+
+# Rail trunk line window
+STR_RAIL_ROUTE_CAPTION                                          :{WHITE}Trunk Line
+STR_RAIL_ROUTE_TRACKS                                           :{BLACK}Tracks:
+STR_RAIL_ROUTE_TRACKS_TOOLTIP                                   :{BLACK}Number of parallel one-way tracks, 1 to 30. Hotkeys: comma and period
+STR_RAIL_ROUTE_SIGNALS                                          :{BLACK}Signals, every (tiles):
+STR_RAIL_ROUTE_SIGNALS_TOOLTIP                                  :{BLACK}Build one-way path signals on every track, in the direction from the start to the end
+STR_RAIL_ROUTE_INTERVAL_TOOLTIP                                 :{BLACK}Distance between signals along the line, 1 to 20 tiles
+STR_RAIL_ROUTE_WATER                                            :{BLACK}Remove water
+STR_RAIL_ROUTE_WATER_TOOLTIP                                    :{BLACK}Fill sea, lakes, rivers and canals in the corridor; otherwise water tiles block the line
+STR_RAIL_ROUTE_DEMOLISH                                         :{BLACK}Demolish houses, industries and town roads
+STR_RAIL_ROUTE_DEMOLISH_TOOLTIP                                 :{BLACK}Demolish town houses, industries and town roads in the corridor; otherwise they block the line
+STR_RAIL_ROUTE_SEA                                              :{BLACK}Raise land at sea level
+STR_RAIL_ROUTE_SEA_TOOLTIP                                      :{BLACK}Keep the line at least one level above the sea, raising the land where needed
+STR_RAIL_ROUTE_BUILD                                            :{BLACK}Build
+STR_RAIL_ROUTE_BUILD_TOOLTIP                                    :{BLACK}Click the start tile on the map, then the end tile: the line follows the mouse as a preview and is built at the second click with the rail type of the railway toolbar. Stays active for more lines until Esc or right-click. Hotkey: K
+STR_RAIL_ROUTE_ABORT                                            :{BLACK}Abort construction
+STR_RAIL_ROUTE_ABORT_TOOLTIP                                    :{BLACK}Stop the running construction; what was already built stays
+STR_RAIL_ROUTE_INFO_RAILTYPE                                    :{BLACK}Rail type: {GOLD}{STRING}{BLACK}, signals: {GOLD}{STRING}
+STR_RAIL_ROUTE_INFO_ELECTRIC                                    :electric
+STR_RAIL_ROUTE_INFO_SEMAPHORE                                   :semaphores
+STR_RAIL_ROUTE_INFO_IDLE                                        :{BLACK}Press "Build", then click the start and the end of the line
+STR_RAIL_ROUTE_INFO_PICK_START                                  :{YELLOW}Click the start tile of the line
+STR_RAIL_ROUTE_INFO_PICK_END                                    :{YELLOW}Click the end tile of the line (start {NUM},{NUM})
+STR_RAIL_ROUTE_INFO_ERROR                                       :{RED}Cannot build: {RAW_STRING}
+STR_RAIL_ROUTE_INFO_LENGTH                                      :{BLACK}Length {GOLD}{COMMA}{BLACK}, {GOLD}{COMMA}{BLACK} bend{P "" s}, {GOLD}{COMMA}{BLACK} track tile{P "" s}, height {NUM}..{NUM}
+STR_RAIL_ROUTE_INFO_COST                                        :{BLACK}Estimated cost: {GOLD}{CURRENCY_LONG}
+STR_RAIL_ROUTE_INFO_COST_PARTS                                  :{BLACK}Clearing {CURRENCY_LONG}, terraforming {CURRENCY_LONG}, track {CURRENCY_LONG}
+STR_RAIL_ROUTE_INFO_DEMOLISH                                    :{BLACK}Demolish: {GOLD}{COMMA}{BLACK} house tile{P "" s}, {GOLD}{COMMA}{BLACK} industr{P y ies}
+STR_RAIL_ROUTE_INFO_WATER_BLOCKED                               :{BLACK}Water tiles to fill: {GOLD}{COMMA}{BLACK}, tiles that cannot be cleared: {GOLD}{COMMA}
+STR_RAIL_ROUTE_INFO_NOT_ENOUGH_MONEY                            :{RED}Not enough money: needs {CURRENCY_LONG}, you have {CURRENCY_LONG}
+STR_RAIL_ROUTE_STATUS_NONE                                      :{BLACK}No construction running
+STR_RAIL_ROUTE_STATUS_RUNNING                                   :{BLACK}Building {GOLD}{RAW_STRING}{BLACK}: {NUM}/{NUM} commands, {COMMA} done, {COMMA} failed, {CURRENCY_LONG}
+STR_RAIL_ROUTE_STATUS_DONE                                      :{BLACK}Finished {GOLD}{RAW_STRING}{BLACK}: {COMMA} done, {COMMA} failed, cost {CURRENCY_LONG}
+STR_RAIL_ROUTE_ERROR_INVALID_TILE                               :invalid tile
+STR_RAIL_ROUTE_ERROR_INVALID_TRACKS                             :invalid number of tracks
+STR_RAIL_ROUTE_ERROR_TOO_SHORT                                  :the route is too short
+STR_RAIL_ROUTE_ERROR_NO_ROUTE                                   :no route found
+STR_RAIL_ROUTE_ERROR_DOES_NOT_FIT                               :the corridor does not fit on the map
+
+STR_ERROR_RAIL_ROUTE_CAN_T_BUILD                                :{WHITE}Can't build the trunk line...
+STR_ERROR_RAIL_ROUTE_DETAIL                                     :{WHITE}... {RAW_STRING}
+STR_ERROR_RAIL_ROUTE_NOT_ENOUGH_MONEY                           :{WHITE}... it needs about {CURRENCY_LONG}, the company has {CURRENCY_LONG}
+STR_ERROR_RAIL_ROUTE_JOB_RUNNING                                :{WHITE}... another construction is still running
 
 STR_RAIL_NAME_RAILROAD                                          :Railway
 STR_RAIL_NAME_ELRAIL                                            :Electrified railway

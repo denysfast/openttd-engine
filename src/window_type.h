@@ -362,6 +362,12 @@ enum class WindowClass : uint16_t {
 	Blueprints,
 
 	/**
+	 * Rail trunk line tool; %Window numbers:
+	 *   - 0 = #RailRouteWidgets
+	 */
+	RailRoute,
+
+	/**
 	 * Vehicle view; %Window numbers:
 	 *   - #VehicleID = #VehicleViewWidgets
 	 */

@@ -13,6 +13,7 @@
 #include "blueprint.h"
 #include "rail_route.h"
 #include "blueprint_gui.h"
+#include "rail_route_gui.h"
 #include "debug.h"
 #include "engine_func.h"
 #include "landscape.h"
@@ -3432,6 +3433,21 @@ static bool ConRailRoute(std::span<std::string_view> argv)
 	return true;
 }
 
+/** Open the rail trunk line window. @copydoc IConsoleCmdProc */
+static bool ConRailRouteWindow(std::span<std::string_view> argv)
+{
+	if (argv.empty()) {
+		IConsolePrint(CC_HELP, "Open the rail trunk line window. Usage: 'rail_route_window'.");
+		return true;
+	}
+	if (_game_mode != GameMode::Normal) {
+		IConsolePrint(CC_ERROR, "Only available in a game.");
+		return true;
+	}
+	ShowRailRouteWindow();
+	return true;
+}
+
 /** List all road types and their configuration. */
 static void ConDumpRoadTypes()
 {
@@ -3751,6 +3767,7 @@ void IConsoleStdLibRegister()
 	IConsole::CmdRegister("blueprint_status",        ConBlueprintStatus);
 	IConsole::CmdRegister("rail_route",              ConRailRoute);
 	IConsole::CmdRegister("blueprint_window",        ConBlueprintWindow);
+	IConsole::CmdRegister("rail_route_window",       ConRailRouteWindow);
 
 	/* NewGRF development stuff */
 	IConsole::CmdRegister("reload_newgrfs",          ConNewGRFReload,     ConHookNewGRFDeveloperTool);
