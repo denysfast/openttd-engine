@@ -2162,7 +2162,7 @@ static bool ConTownNeeds(std::span<std::string_view> argv)
 static bool ConTownForceNeed(std::span<std::string_view> argv)
 {
 	if (argv.empty()) {
-		IConsolePrint(CC_HELP, "Force the level of a town need, or let it follow the supply again. Usage: 'town_force_need <town id|all> <p|m|g|e|all> <0..5|auto>'.");
+		IConsolePrint(CC_HELP, "Force the level of a town need, or let it follow the supply again. Usage: 'town_force_need <town id|all> <p|m|g|e|v|all> <0..15|auto>'.");
 		IConsolePrint(CC_HELP, "Needs: p = passengers, m = mail, g = goods, e = electricity. A forced level ignores the unlock and small town rules.");
 		return true;
 	}

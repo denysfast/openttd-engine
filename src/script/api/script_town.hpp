@@ -129,7 +129,7 @@ public:
 
 	/**
 	 * Supplies a town needs to grow.
-	 * Each need has a level from 0 to 5 derived from the coverage of its monthly norm; the levels set the growth multiplier.
+	 * Each need has a level from 0 to 15 derived from the coverage of its monthly norm; the levels set the growth multiplier.
 	 */
 	enum TownNeed {
 		/* Note: these values represent part of the in-game TownNeed enum */
@@ -540,7 +540,7 @@ public:
 	 * @param need The need to get the level of.
 	 * @pre IsValidTown(town_id).
 	 * @pre IsValidNeed(need).
-	 * @return The level from the supply, 0 to 5.
+	 * @return The level from the supply, 0 to 15.
 	 */
 	static SQInteger GetNeedRawLevel(TownID town_id, TownNeed need);
 
@@ -550,7 +550,7 @@ public:
 	 * @param need The need to get the forced level of.
 	 * @pre IsValidTown(town_id).
 	 * @pre IsValidNeed(need).
-	 * @return The forced level 0 to 5, or -1 when the level follows the supply.
+	 * @return The forced level 0 to 15, or -1 when the level follows the supply.
 	 * @see SetNeedLevelOverride
 	 */
 	static SQInteger GetNeedLevelOverride(TownID town_id, TownNeed need);
@@ -663,7 +663,7 @@ public:
 	 * A forced level replaces the level from the supply and all rules for locked needs and small towns.
 	 * @param town_id The town to change.
 	 * @param need The need to force.
-	 * @param level The level 0 to 5, or -1 to let the level follow the supply again.
+	 * @param level The level 0 to 15, or -1 to let the level follow the supply again.
 	 * @pre IsValidTown(town_id).
 	 * @pre IsValidNeed(need).
 	 * @pre level >= -1 && level <= 5.

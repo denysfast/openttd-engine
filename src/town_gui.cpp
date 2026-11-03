@@ -1336,15 +1336,13 @@ public:
 				return true;
 
 			case WID_TS_NEEDS: {
-				/* Coverage thresholds of levels 1..5, then the multipliers of levels 1..5 as value and decimals. */
-				std::vector<StringParameter> params;
-				for (uint16_t coverage : TownGrowthBalance::LEVEL_COVERAGE) params.emplace_back(static_cast<uint64_t>(coverage));
+				/* One line per level: the coverage it needs and its growth multiplier. */
+				std::string levels = GetString(STR_TOWN_SUPPLY_TOOLTIP_LEVELS_HEADER);
 				for (uint8_t level = 1; level <= TOWN_NEED_LEVEL_MAX; level++) {
 					auto [value, decimals] = GetMultiplierDecimal(GetTownNeedLevelMultiplier(level));
-					params.emplace_back(value);
-					params.emplace_back(static_cast<uint64_t>(decimals));
+					levels += "\n" + GetString(STR_TOWN_SUPPLY_TOOLTIP_LEVEL_LINE, level, TownGrowthBalance::LEVEL_COVERAGE[level - 1], value, decimals);
 				}
-				std::string levels = GetStringWithArgs(STR_TOWN_SUPPLY_TOOLTIP_LEVELS, params);
+				levels += "\n" + GetString(STR_TOWN_SUPPLY_TOOLTIP_LEVELS_FOOTER);
 
 				const NWidgetBase *nwid = this->GetWidget<NWidgetBase>(WID_TS_NEEDS);
 				int y = pt.y - nwid->pos_y - WidgetDimensions::scaled.framerect.top - GetCharacterHeight(FontSize::Normal) - WidgetDimensions::scaled.vsep_normal;

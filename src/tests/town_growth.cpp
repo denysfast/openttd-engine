@@ -20,8 +20,10 @@
 
 /** Default base growth constant (setting economy.town_growth_base). */
 static constexpr uint32_t BASE = 1031;
-/** Multiplier with all four needs at level 5. */
-static constexpr uint32_t ALL_FIVE = 6553;
+/** Multiplier with all four needs at level 5 (2.2 each). */
+static constexpr uint32_t ALL_FIVE = 23425;
+/** A multiplier of 6.553, for the tests of the growth formula (the old level 5 calibration). */
+static constexpr uint32_t FORMULA_MULTIPLIER = 6553;
 /** Multiplier with all four needs at level 3. */
 static constexpr uint32_t ALL_THREE = 1000;
 /** Value of the town growth speed setting for normal speed. */
@@ -59,7 +61,11 @@ TEST_CASE("TownNeedLevelForCoverage")
 	CHECK(GetTownNeedLevelForCoverage(75) == 4);
 	CHECK(GetTownNeedLevelForCoverage(99) == 4);
 	CHECK(GetTownNeedLevelForCoverage(100) == 5);
-	CHECK(GetTownNeedLevelForCoverage(TOWN_NEED_COVERAGE_MAX) == 5);
+	CHECK(GetTownNeedLevelForCoverage(119) == 5);
+	CHECK(GetTownNeedLevelForCoverage(120) == 6);
+	CHECK(GetTownNeedLevelForCoverage(299) == 14);
+	CHECK(GetTownNeedLevelForCoverage(300) == 15);
+	CHECK(GetTownNeedLevelForCoverage(TOWN_NEED_COVERAGE_MAX) == 15);
 }
 
 TEST_CASE("TownNeedCoverage")
@@ -166,7 +172,7 @@ TEST_CASE("TownGrowthMultiplier")
 
 	CHECK(CalcTownGrowthMultiplier(all_five, false, SPEED_NORMAL) == ALL_FIVE);
 	CHECK(CalcTownGrowthMultiplier(all_three, false, SPEED_NORMAL) == ALL_THREE);
-	CHECK(CalcTownGrowthMultiplier(mixed, false, SPEED_NORMAL) == 1456); // 1.6 * 1.3 * 0.7
+	CHECK(CalcTownGrowthMultiplier(mixed, false, SPEED_NORMAL) == 2464); // 2.2 * 1.6 * 0.7
 	CHECK(CalcTownGrowthMultiplier(blocked, false, SPEED_NORMAL) == 0);
 
 	/* Funding: x1.5, but it never lifts a blocking need. */
@@ -189,8 +195,9 @@ TEST_CASE("TownValuablesBonus")
 
 	/* A bonus never slows growth: level 0 is neutral, every level adds 2%. */
 	CHECK(GetTownNeedMultiplier(TownNeed::Valuables, 0) == 1000);
-	CHECK(GetTownNeedMultiplier(TownNeed::Valuables, 1) == 1020);
-	CHECK(GetTownNeedMultiplier(TownNeed::Valuables, 5) == 1100);
+	CHECK(GetTownNeedMultiplier(TownNeed::Valuables, 1) == 1040);
+	CHECK(GetTownNeedMultiplier(TownNeed::Valuables, 5) == 1200);
+	CHECK(GetTownNeedMultiplier(TownNeed::Valuables, 15) == 1600);
 	CHECK(GetTownNeedMultiplier(TownNeed::Goods, 0) == 0);
 
 	/* The fifth level in the multiplier is the valuables bonus. */
@@ -199,16 +206,16 @@ TEST_CASE("TownValuablesBonus")
 	const std::array<uint8_t, 5> all_five_with_valuables = {5, 5, 5, 5, 5};
 	const std::array<uint8_t, 5> blocked_with_valuables = {5, 0, 5, 5, 5};
 	CHECK(CalcTownGrowthMultiplier(neutral_no_valuables, false, SPEED_NORMAL) == 1000);
-	CHECK(CalcTownGrowthMultiplier(neutral_full_valuables, false, SPEED_NORMAL) == 1100);
-	CHECK(CalcTownGrowthMultiplier(all_five_with_valuables, false, SPEED_NORMAL) == ALL_FIVE * 11 / 10);
+	CHECK(CalcTownGrowthMultiplier(neutral_full_valuables, false, SPEED_NORMAL) == 1200);
+	CHECK(CalcTownGrowthMultiplier(all_five_with_valuables, false, SPEED_NORMAL) == ALL_FIVE * 12 / 10);
 	CHECK(CalcTownGrowthMultiplier(blocked_with_valuables, false, SPEED_NORMAL) == 0);
 }
 
 TEST_CASE("TownYearlyGrowth")
 {
 	/* Calibration: all needs at 5 (M = 1.6^4) or all at 3 (M = 1). */
-	CHECK(CalcTownYearlyGrowth(BASE, ALL_FIVE, 1000) == 427);
-	CHECK(CalcTownYearlyGrowth(BASE, ALL_FIVE, 500000) == 9554);
+	CHECK(CalcTownYearlyGrowth(BASE, FORMULA_MULTIPLIER, 1000) == 427);
+	CHECK(CalcTownYearlyGrowth(BASE, FORMULA_MULTIPLIER, 500000) == 9554);
 	CHECK(CalcTownYearlyGrowth(BASE, ALL_THREE, 1000) == 65);
 	CHECK(CalcTownYearlyGrowth(BASE, 0, 1000) == 0);
 
@@ -243,7 +250,7 @@ TEST_CASE("TownDailyBudget")
 TEST_CASE("TownGrowthCalibration")
 {
 	/* A fully supplied town of 1000 reaches about 500000 in 100 years. */
-	uint32_t full = GrowForYears(1000, ALL_FIVE, 100);
+	uint32_t full = GrowForYears(1000, FORMULA_MULTIPLIER, 100);
 	CHECK(full > 480000);
 	CHECK(full < 520000);
 
@@ -261,4 +268,31 @@ TEST_CASE("TownGrowthRateEstimate")
 	/* 9554 residents per year in houses of 90: a house every 254 ticks. */
 	CHECK(CalcTownGrowthRateEstimate(9554, 90) == 253);
 	CHECK(CalcTownGrowthRateEstimate(UINT32_MAX, 1) == 0);
+}
+
+TEST_CASE("TownNeedLevels")
+{
+	/* Every level above the neutral one adds 0.6, up to level 15. */
+	CHECK(GetTownNeedLevelMultiplier(4) == 1600);
+	CHECK(GetTownNeedLevelMultiplier(5) == 2200);
+	CHECK(GetTownNeedLevelMultiplier(15) == 8200);
+	for (uint8_t level = 4; level <= TOWN_NEED_LEVEL_MAX; level++) {
+		CHECK(GetTownNeedLevelMultiplier(level) - GetTownNeedLevelMultiplier(level - 1) == 600);
+	}
+}
+
+TEST_CASE("TownNeedDemandScale")
+{
+	/* Linear up to 1000 residents, then like population^0.9. */
+	CHECK(ScaleTownNeedDemand(10, 500) == 10);
+	CHECK(ScaleTownNeedDemand(1000, 1000) == 1000);
+	CHECK(ScaleTownNeedDemand(2000, 2000) == 1866); // 2000 * 0.933
+	CHECK(ScaleTownNeedDemand(1024000, 1024000) == 512000); // 2^10 thousand: half the linear norm
+	/* Monotonic: a bigger town never needs less in total. */
+	uint32_t prev = 0;
+	for (uint32_t pop = 1000; pop < 5000000; pop += 997) {
+		uint32_t d = ScaleTownNeedDemand(pop, pop);
+		CHECK(d >= prev);
+		prev = d;
+	}
 }

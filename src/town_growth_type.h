@@ -24,7 +24,7 @@ enum class TownNeed : uint8_t {
 	End, ///< End marker.
 };
 
-static constexpr uint8_t TOWN_NEED_LEVEL_MAX = 5; ///< Highest need level.
+static constexpr uint8_t TOWN_NEED_LEVEL_MAX = 15; ///< Highest need level; levels above 5 need more than the norm.
 static constexpr uint8_t TOWN_NEED_LEVEL_NEUTRAL = 3; ///< Need level that neither speeds up nor slows down growth.
 static constexpr uint8_t TOWN_NEED_NOT_FORCED = 0xFF; ///< Value of #TownNeedState::forced when the level is computed, not forced.
 
@@ -43,7 +43,7 @@ struct TownNeedState {
 	uint32_t demand = 0; ///< Amount needed last month for full coverage (100%).
 	std::array<uint16_t, 3> coverage_history{}; ///< Coverage in percent of the last three months, newest first.
 	uint16_t coverage = 0; ///< Smoothed coverage in percent; can exceed 100.
-	uint8_t level = TOWN_NEED_LEVEL_NEUTRAL; ///< Current level 0..5 from the coverage, before the unlock and grace rules.
+	uint8_t level = TOWN_NEED_LEVEL_NEUTRAL; ///< Current level 0..15 from the coverage, before the unlock and grace rules.
 	uint8_t forced = TOWN_NEED_NOT_FORCED; ///< Debug override of the level (console, scripts), or #TOWN_NEED_NOT_FORCED.
 };
 

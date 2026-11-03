@@ -10,7 +10,7 @@
  *
  * Once a month every need of a town gets the coverage of its norm for the month
  * that just ended. The coverage of the last three months is averaged and mapped
- * to a level 0..5, which moves at most one step per month. The effective levels
+ * to a level 0..15, which moves at most one step per month. The effective levels
  * of the four needs give the growth multiplier, and with the population the
  * yearly growth in residents.
  *
@@ -302,9 +302,6 @@ static void GetTownProductionLastMonth(const Town *t, TownProductionEffect effec
  */
 static void GetTownNeedSupplyAndDemand(const Town *t, TownNeed need, uint32_t &supplied, uint32_t &demand)
 {
-	const EconomySettings &settings = _settings_game.economy;
-	uint32_t population = t->cache.population;
-
 	switch (need) {
 		case TownNeed::Passengers:
 		case TownNeed::Mail: {
@@ -312,27 +309,35 @@ static void GetTownNeedSupplyAndDemand(const Town *t, TownNeed need, uint32_t &s
 			uint64_t transported;
 			GetTownProductionLastMonth(t, need == TownNeed::Passengers ? TownProductionEffect::Passengers : TownProductionEffect::Mail, production, transported);
 			supplied = ClampTo<uint32_t>(transported);
-			demand = ClampTo<uint32_t>(production * settings.town_need_transport_pct / 100);
 			break;
 		}
 
-		case TownNeed::Goods:
-			supplied = t->received[TownAcceptanceEffect::Goods].old_act;
-			demand = population / std::max<uint16_t>(settings.town_need_goods_residents, 1);
-			break;
-
-		case TownNeed::Electricity:
-			supplied = GetTownPowerReceived(t);
-			demand = population / std::max<uint16_t>(settings.town_need_power_residents, 1);
-			break;
-
-		case TownNeed::Valuables:
-			supplied = t->growth.valuables_received;
-			demand = GetTownNeedDemand(t, need);
-			break;
-
+		case TownNeed::Goods: supplied = t->received[TownAcceptanceEffect::Goods].old_act; break;
+		case TownNeed::Electricity: supplied = GetTownPowerReceived(t); break;
+		case TownNeed::Valuables: supplied = t->growth.valuables_received; break;
 		default: NOT_REACHED();
 	}
+	demand = GetTownNeedDemand(t, need);
+}
+
+/**
+ * Lower a norm that is proportional to the population so that it grows like population^0.9 instead:
+ * big towns need relatively less. Below 1000 residents the norm stays linear. Integer only (multiplayer).
+ * @param linear_demand The norm, proportional to the population.
+ * @param population Population of the town.
+ * @return The scaled norm.
+ */
+uint32_t ScaleTownNeedDemand(uint64_t linear_demand, uint32_t population)
+{
+	const auto &table = TownGrowthBalance::DEMAND_SCALE;
+	if (population <= 1000) return ClampTo<uint32_t>(linear_demand);
+	/* Bucket i covers 1000 * 2^i .. 1000 * 2^(i+1) residents; interpolate linearly inside it, without rounding the scale. */
+	uint i = 0;
+	while (i + 1 < table.size() - 1 && population >= (1000U << (i + 1))) i++;
+	uint64_t lo = 1000ULL << i;
+	uint64_t pos = std::min<uint64_t>(population - lo, lo);
+	uint64_t scale_lo = table[i] * lo - static_cast<uint64_t>(table[i] - table[i + 1]) * pos; // Per mille, times lo.
+	return ClampTo<uint32_t>(std::min<uint64_t>(linear_demand, UINT32_MAX) * scale_lo / (lo * 1000));
 }
 
 /**
@@ -351,18 +356,18 @@ uint32_t GetTownNeedDemand(const Town *t, TownNeed need)
 			uint64_t production;
 			uint64_t transported;
 			GetTownProductionLastMonth(t, need == TownNeed::Passengers ? TownProductionEffect::Passengers : TownProductionEffect::Mail, production, transported);
-			return ClampTo<uint32_t>(production * _settings_game.economy.town_need_transport_pct / 100);
+			return ScaleTownNeedDemand(production * _settings_game.economy.town_need_transport_pct / 100, t->cache.population);
 		}
 
 		case TownNeed::Goods:
-			return t->cache.population / std::max<uint16_t>(_settings_game.economy.town_need_goods_residents, 1);
+			return ScaleTownNeedDemand(t->cache.population / std::max<uint16_t>(_settings_game.economy.town_need_goods_residents, 1), t->cache.population);
 
 		case TownNeed::Electricity:
-			return t->cache.population / std::max<uint16_t>(_settings_game.economy.town_need_power_residents, 1);
+			return ScaleTownNeedDemand(t->cache.population / std::max<uint16_t>(_settings_game.economy.town_need_power_residents, 1), t->cache.population);
 
 		case TownNeed::Valuables:
 			/* Never zero: without a demand the coverage of a bonus would count as neutral (level 3) for free. */
-			return std::max<uint32_t>(t->cache.population / TownGrowthBalance::VALUABLES_RESIDENTS, 1);
+			return std::max<uint32_t>(ScaleTownNeedDemand(t->cache.population / TownGrowthBalance::VALUABLES_RESIDENTS, t->cache.population), 1);
 
 		default: NOT_REACHED();
 	}
