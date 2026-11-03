@@ -91,7 +91,7 @@ std::tuple<CommandCost, Money, uint32_t, uint32_t, StringID> CmdPasteBlueprint(D
 			if (ret.GetErrorMessage() != STR_ERROR_ALREADY_BUILT) {
 				failed++;
 				last_error = ret.GetErrorMessage();
-				if (exec && item_tile != INVALID_TILE) Debug(Facility::Misc, Severity::Info, "[blueprint] item failed at {}x{}: {}", TileX(item_tile), TileY(item_tile), GetString(last_error));
+				if (exec && item_tile != INVALID_TILE) Debug(Facility::Misc, Severity::Info, "[blueprint] item failed at {}x{}: {}", TileX(item_tile), TileY(item_tile), last_error == INVALID_STRING_ID ? std::string("generic error") : GetString(last_error));
 			}
 			return false;
 		}

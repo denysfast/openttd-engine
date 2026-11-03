@@ -1137,8 +1137,13 @@ void RunBlueprintPasteJob()
 				Command<Commands::PasteBlueprint>::Post(STR_NULL, CcPasteBlueprint, _paste_origin, chunk.data);
 		cur_company.Restore();
 		if (!ok && !_paste_callback_seen) {
-			/* Refused before execution, e.g. while the game is paused. */
-			_paste_status.chunks_done++;
+			_paste_status.chunks_sent--;
+			if (_pause_mode.Any()) {
+				/* Refused before it was sent because the game got paused: send it again after the pause. */
+				_paste_queue.push_front(std::move(chunk));
+				return;
+			}
+			/* Refused for good. */
 			_paste_status.aborted = true;
 			_paste_queue.clear();
 			if (_paste_status.chunks_done >= _paste_status.chunks_sent) FinishBlueprintPaste();

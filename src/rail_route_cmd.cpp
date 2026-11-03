@@ -76,6 +76,24 @@ static bool IsRouteTileToClear(TileIndex tile, bool water, bool demolish)
 }
 
 /**
+ * Is one of the four tiles around a tile corner a water tile?
+ * @param x X of the corner (the north corner of tile x, y).
+ * @param y Y of the corner.
+ * @return True iff a tile touching the corner is water.
+ */
+static bool IsCornerNextToWater(uint x, uint y)
+{
+	for (uint dy = 0; dy < 2; dy++) {
+		for (uint dx = 0; dx < 2; dx++) {
+			if (x < dx || y < dy) continue;
+			TileIndex t = TileXY(x - dx, y - dy);
+			if (IsTileType(t, TileType::Water)) return true;
+		}
+	}
+	return false;
+}
+
+/**
  * Prepare a part of the corridor of a rail trunk line.
  * @param flags Operation to perform.
  * @param origin Tile the item offsets are relative to.
@@ -96,9 +114,10 @@ std::tuple<CommandCost, Money, uint32_t, uint32_t, StringID> CmdPrepareRailRoute
 			if (kind >= to_underlying(RailRouteItemKind::End)) return {CMD_ERROR, 0, 0, 0, INVALID_STRING_ID};
 			r.U16(); r.U16();
 			uint16_t w = r.U16(), h = r.U16();
-			uint8_t value = r.U8();
+			r.U8();
+			uint8_t item_flags = r.U8();
 			if (!r.ok || w == 0 || h == 0) return {CMD_ERROR, 0, 0, 0, INVALID_STRING_ID};
-			if (kind == to_underlying(RailRouteItemKind::Clear) && HasBit(value, to_underlying(RailRouteClearFlag::Demolish))) demolish_any = true;
+			if (HasBit(item_flags, to_underlying(RailRouteClearFlag::Demolish))) demolish_any = true;
 		}
 	}
 
@@ -122,13 +141,21 @@ std::tuple<CommandCost, Money, uint32_t, uint32_t, StringID> CmdPrepareRailRoute
 	bool old_bulldozer = _cheats.magic_bulldozer.value;
 	if (demolish_any) _cheats.magic_bulldozer.value = true;
 
+	/* The landscaping limits are lifted again before every step: one chunk may terraform more than the limit can hold. */
+	auto lift_limits = [&]() {
+		if (c == nullptr) return;
+		c->terraform_limit = UINT32_MAX;
+		c->clear_limit = UINT32_MAX;
+	};
+
 	/* Do one step: test, check the money, execute. Returns whether it was done. */
 	auto attempt = [&](TileIndex tile, auto &&action) -> bool {
+		lift_limits();
 		CommandCost ret = action(test_flags);
 		if (ret.Failed()) {
 			failed++;
 			last_error = ret.GetErrorMessage();
-			if (exec) Debug(Facility::Misc, Severity::Info, "[route] prepare failed at {}x{}: {}", TileX(tile), TileY(tile), GetString(last_error));
+			if (exec) Debug(Facility::Misc, Severity::Info, "[route] prepare failed at {}x{}: {}", TileX(tile), TileY(tile), last_error == INVALID_STRING_ID ? std::string("generic error") : GetString(last_error));
 			return false;
 		}
 		if (exec) {
@@ -153,11 +180,12 @@ std::tuple<CommandCost, Money, uint32_t, uint32_t, StringID> CmdPrepareRailRoute
 		uint8_t kind = r.U8();
 		uint16_t x0 = r.U16(), y0 = r.U16(), w = r.U16(), h = r.U16();
 		uint8_t value = r.U8();
+		uint8_t item_flags = r.U8();
 		uint ox = TileX(origin), oy = TileY(origin);
+		bool water = HasBit(item_flags, to_underlying(RailRouteClearFlag::Water));
+		bool demolish = HasBit(item_flags, to_underlying(RailRouteClearFlag::Demolish));
 
 		if (kind == to_underlying(RailRouteItemKind::Clear)) {
-			bool water = HasBit(value, to_underlying(RailRouteClearFlag::Water));
-			bool demolish = HasBit(value, to_underlying(RailRouteClearFlag::Demolish));
 			for (uint y = oy + y0; y < oy + y0 + h && needed == 0; y++) {
 				for (uint x = ox + x0; x < ox + x0 + w && needed == 0; x++) {
 					if (x >= Map::MaxX() || y >= Map::MaxY()) continue;
@@ -174,11 +202,23 @@ std::tuple<CommandCost, Money, uint32_t, uint32_t, StringID> CmdPrepareRailRoute
 					if (x >= Map::MaxX() || y >= Map::MaxY()) continue;
 					TileIndex tile = TileXY(x, y);
 					if (static_cast<int>(TileHeight(tile)) == target) continue;
+					/* Keeping the water: leave the corners of water tiles alone. */
+					if (!water && IsCornerNextToWater(x, y)) continue;
 					bool ok = true;
 					/* In a test run nothing changes, so test a single level. */
 					int steps = exec ? std::abs(static_cast<int>(TileHeight(tile)) - target) : 1;
+					int clears = 0;
 					for (int i = 0; i < steps && ok && needed == 0; i++) {
 						bool up = static_cast<int>(TileHeight(tile)) < target;
+						/* Something beside the corridor may be in the way of the reshaped land: clear it when the options allow and retry. */
+						lift_limits();
+						auto [test, extra, err_tile] = Command<Commands::TerraformLand>::Do(test_flags, tile, SLOPE_N, up);
+						if (exec && test.Failed() && clears < 8 && err_tile != INVALID_TILE && err_tile < Map::Size() && IsRouteTileToClear(err_tile, water, demolish) &&
+								attempt(err_tile, [&](DoCommandFlags f) { return Command<Commands::LandscapeClear>::Do(f, err_tile); })) {
+							clears++;
+							i--;
+							continue;
+						}
 						ok = attempt(tile, [&](DoCommandFlags f) { return std::get<0>(Command<Commands::TerraformLand>::Do(f, tile, SLOPE_N, up)); });
 					}
 					if (ok && needed == 0) done++;

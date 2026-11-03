@@ -46,8 +46,10 @@ struct RailRouteOptions {
 
 /** Item kinds of a #Commands::PrepareRailRoute chunk. */
 enum class RailRouteItemKind : uint8_t {
-	Clear = 0, ///< x, y, width, height (u16, tiles relative to the origin), flags (u8, #RailRouteClearFlag).
-	Level = 1, ///< x, y, width, height (u16, tile corners relative to the origin), height (u8): set every corner to the height.
+	Clear = 0, ///< x, y, width, height (u16, tiles relative to the origin), unused (u8), flags (u8, #RailRouteClearFlag).
+	Level = 1, ///< x, y, width, height (u16, tile corners relative to the origin), height (u8), flags (u8, #RailRouteClearFlag):
+	           ///< set every corner to the height; obstacles in the way that the flags allow to clear are cleared.
+	           ///< Without the water flag, corners next to water are left alone.
 	End, ///< End marker.
 };
 

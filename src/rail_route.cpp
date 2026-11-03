@@ -473,7 +473,8 @@ public:
 			item.push_back(to_underlying(kind));
 			auto u16 = [&](int val) { item.push_back(GB(val, 0, 8)); item.push_back(GB(val, 8, 8)); };
 			u16(x - minx); u16(y - miny); u16(w); u16(h);
-			item.push_back(static_cast<uint8_t>(kind == RailRouteItemKind::Clear ? clear_flags : height));
+			item.push_back(static_cast<uint8_t>(kind == RailRouteItemKind::Clear ? 0 : height));
+			item.push_back(clear_flags);
 			prepare.Commit();
 		};
 
@@ -589,11 +590,15 @@ public:
 		for (int c = 0; c <= this->length + 1; c++) {
 			for (int k = corner_rows[c].first; k <= corner_rows[c].second; k++) {
 				int h = this->CornerHeight(c, k);
-				if (h >= 0) levels += std::abs(h - column_height[c]);
+				if (h < 0) continue;
+				int d = std::abs(h - column_height[c]);
+				levels += d;
+				/* A corner on the edge drags the land beside it along: a slope of d - 1 + d - 2 + ... levels. */
+				if (k == corner_rows[c].first || k == corner_rows[c].second) levels += static_cast<int64_t>(d) * (d - 1) / 2;
 			}
 		}
-		/* Levelling a corner reshapes the land beside it too; in tests that about doubles the work. */
-		est.terraform = _price[Price::Terraform] * levels * 2;
+		/* Plus a margin for the knock-on effects at the ends and on diagonal edges. */
+		est.terraform = _price[Price::Terraform] * levels * 3 / 2;
 		est.track = RailBuildCost(this->options.railtype) * static_cast<int64_t>(pieces) + _price[Price::BuildSignals] * static_cast<int64_t>(signals);
 	}
 
