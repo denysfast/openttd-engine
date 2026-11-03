@@ -13,11 +13,12 @@
  * a straight step moves +1 u, a diagonal step +1 u and +1 v. Track pieces are named as if u were x and v were y;
  * the frame is mapped to the map by flipping and/or swapping the axes.
  *
+ * Shape: the route is as straight as possible - one straight run and one diagonal run (at most one bend), in
+ * the order that needs less earthworks. Demolition and filling are not avoided.
+ *
  * Height: diagonal track is always level, so heights change only on straight steps, by at most one level per
- * step (an inclined tile). The steps are grouped in blocks of equal type; a dynamic programme over the blocks
- * chooses the type of every block (straight, diagonal, or one block with the remaining diagonal steps) and the
- * height at every block border, minimising the earthworks of the corridor plus a cost for what has to be
- * demolished and a high cost for what cannot be.
+ * #ROUTE_RAMP_SPACING steps. A dynamic programme over blocks of steps chooses the height at every block border,
+ * minimising the earthworks of the corridor plus a cost for what has to be demolished.
  */
 
 #include "stdafx.h"
@@ -221,24 +222,23 @@ public:
 	 * @param u0 First step of the block.
 	 * @param len Number of steps.
 	 * @param v0 Number of diagonal steps before the block.
-	 * @param diagonal_steps The first this many steps of the block are diagonal, the rest straight.
+	 * @param diagonal Type of every step of the route.
 	 * @return The costs.
 	 */
-	BlockCost ComputeBlockCost(int u0, int len, int v0, int diagonal_steps) const
+	BlockCost ComputeBlockCost(int u0, int len, int v0, const std::vector<bool> &diagonal) const
 	{
 		std::array<int64_t, 256> count{};
 		int64_t obstacles = 0;
 		int v = v0;
 		for (int s = 0; s < len; s++) {
-			bool diagonal = s < diagonal_steps;
 			int u = u0 + s;
-			int rows_hi = this->k1 + (diagonal ? 1 : 0);
+			int rows_hi = this->k1 + (diagonal[u] ? 1 : 0);
 			for (int k = this->k0; k <= rows_hi; k++) obstacles += this->ObstacleCost(this->MapTile(u, v + k));
 			for (int k = this->k0; k <= rows_hi + 1; k++) {
 				int h = this->CornerHeight(u, v + k);
 				if (h >= 0) count[h]++;
 			}
-			if (diagonal) v++;
+			if (diagonal[u]) v++;
 		}
 
 		BlockCost bc;
@@ -264,7 +264,79 @@ public:
 	}
 
 	/**
-	 * Find the steps of the route: where the diagonal steps go and the height of every step.
+	 * Choose the heights of a route with known step types: diagonal steps keep the height, straight steps may
+	 * ramp (at most one level per #ROUTE_RAMP_SPACING steps); the heights minimise earthworks and demolition.
+	 * @param diagonal Type of every step.
+	 * @param[out] steps The steps with their heights.
+	 * @return The cost of the route, or INT64_MAX when there is none.
+	 */
+	int64_t PlanHeights(const std::vector<bool> &diagonal, std::vector<RailRouteStep> &steps)
+	{
+		const int range = this->hhi - this->hlo + 1;
+		const int block = std::max<int>(ROUTE_MIN_BLOCK, CeilDiv(this->length, ROUTE_MAX_BLOCKS));
+		const int blocks = CeilDiv(this->length, block);
+		constexpr int64_t INF = INT64_MAX / 4;
+
+		std::vector<int64_t> cur(range, 0), nxt(range);
+		std::vector<std::vector<int16_t>> back(blocks, std::vector<int16_t>(range, -1));
+		int v0 = 0;
+		for (int j = 0; j < blocks; j++) {
+			int u0 = j * block;
+			int len = std::min(block, this->length - u0);
+			int diag = 0;
+			for (int s = 0; s < len; s++) diag += diagonal[u0 + s] ? 1 : 0;
+			/* A block with diagonal steps keeps one height; a straight block may ramp. */
+			int max_ramp = diag > 0 ? 0 : len / static_cast<int>(ROUTE_RAMP_SPACING);
+			BlockCost bc = this->ComputeBlockCost(u0, len, v0, diagonal);
+			std::fill(nxt.begin(), nxt.end(), INF);
+			for (int h = this->hlo; h <= this->hhi; h++) {
+				int64_t c = cur[h - this->hlo];
+				if (c >= INF) continue;
+				for (int nh = std::max(this->hlo, h - max_ramp); nh <= std::min(this->hhi, h + max_ramp); nh++) {
+					int64_t total = c + bc.by_height[(h + nh) / 2 - this->hlo] + std::abs(nh - h);
+					if (total < nxt[nh - this->hlo]) {
+						nxt[nh - this->hlo] = total;
+						back[j][nh - this->hlo] = static_cast<int16_t>(h);
+					}
+				}
+			}
+			std::swap(cur, nxt);
+			v0 += diag;
+		}
+
+		int best_h = -1;
+		int64_t best = INF;
+		for (int h = this->hlo; h <= this->hhi; h++) {
+			if (cur[h - this->hlo] < best) {
+				best = cur[h - this->hlo];
+				best_h = h;
+			}
+		}
+		if (best_h < 0) return INT64_MAX;
+
+		std::vector<int> border(blocks + 1);
+		border[blocks] = best_h;
+		for (int j = blocks - 1; j >= 0; j--) border[j] = back[j][border[j + 1] - this->hlo];
+
+		steps.assign(this->length, {});
+		for (int j = 0; j < blocks; j++) {
+			int u0 = j * block;
+			int len = std::min(block, this->length - u0);
+			int dh = border[j + 1] - border[j];
+			for (int s = 0; s < len; s++) {
+				RailRouteStep &step = steps[u0 + s];
+				step.diagonal = diagonal[u0 + s];
+				/* Ramps spread evenly over the block (only straight blocks ramp). */
+				step.height = border[j] + dh * s / len;
+			}
+		}
+		this->end_height = best_h;
+		return best;
+	}
+
+	/**
+	 * Find the steps of the route. The route is as straight as possible: at most one bend, a straight run and
+	 * a diagonal run in the order that needs less earthworks; demolition and filling do not matter.
 	 * @param[out] steps The steps.
 	 * @return False when no route was found.
 	 */
@@ -284,117 +356,24 @@ public:
 		int floor = this->options.raise_sea_level ? 1 : 0;
 		this->hlo = std::max(tmin, floor);
 		this->hhi = std::clamp(tmax, this->hlo, static_cast<int>(_settings_game.construction.map_height_limit));
-		const int range = this->hhi - this->hlo + 1;
 
-		const int block = std::max<int>(ROUTE_MIN_BLOCK, CeilDiv(this->length, ROUTE_MAX_BLOCKS));
-		const int blocks = CeilDiv(this->length, block);
-		const int q = this->minor / block; // Full diagonal blocks.
-		const int r = this->minor % block; // Diagonal steps of the one partial block.
-		const int partial_states = r > 0 ? 2 : 1;
-
-		/* State: full diagonal blocks so far (0..q), partial block used (0..1), height. */
-		const size_t layer = static_cast<size_t>(q + 1) * partial_states * range;
-		auto index = [&](int qd, int p, int h) { return (static_cast<size_t>(qd) * partial_states + p) * range + (h - this->hlo); };
-
-		constexpr int64_t INF = INT64_MAX / 4;
-		std::vector<int64_t> cur(layer, 0), nxt(layer, INF);
-		/* Backpointer per block and state: type (0 straight, 1 diagonal, 2 partial) and previous height + 128. */
-		std::vector<std::vector<uint16_t>> back(blocks, std::vector<uint16_t>(layer, UINT16_MAX));
-
-		for (int j = 0; j < blocks; j++) {
-			int u0 = j * block;
-			int len = std::min(block, this->length - u0);
-			int max_ramp = len / static_cast<int>(ROUTE_RAMP_SPACING);
-			std::fill(nxt.begin(), nxt.end(), INF);
-
-			for (int qd = 0; qd <= q; qd++) {
-				for (int p = 0; p < partial_states; p++) {
-					/* Skip states that can no longer reach the end: too many diagonal steps left. */
-					int diag_left = (q - qd) * block + (p == 0 ? r : 0);
-					if (diag_left > this->length - u0) continue;
-					bool any = false;
-					for (int h = this->hlo; h <= this->hhi && !any; h++) any = cur[index(qd, p, h)] < INF;
-					if (!any) continue;
-
-					int v0 = qd * block + p * r;
-					BlockCost straight = this->ComputeBlockCost(u0, len, v0, 0);
-					std::optional<BlockCost> diagonal;
-					if (qd < q && len == block) diagonal = this->ComputeBlockCost(u0, len, v0, len);
-					std::optional<BlockCost> part;
-					if (p == 0 && r > 0 && len >= r) part = this->ComputeBlockCost(u0, len, v0, r);
-
-					for (int h = this->hlo; h <= this->hhi; h++) {
-						int64_t c = cur[index(qd, p, h)];
-						if (c >= INF) continue;
-						auto relax = [&](int nqd, int np, int nh, int64_t add, uint16_t type) {
-							size_t i = index(nqd, np, nh);
-							if (c + add < nxt[i]) {
-								nxt[i] = c + add;
-								back[j][i] = static_cast<uint16_t>(type << 8 | (h - nh + 128));
-							}
-						};
-						for (int nh = std::max(this->hlo, h - max_ramp); nh <= std::min(this->hhi, h + max_ramp); nh++) {
-							relax(qd, p, nh, straight.by_height[(h + nh) / 2 - this->hlo] + std::abs(nh - h), 0);
-						}
-						if (diagonal.has_value()) relax(qd + 1, p, h, diagonal->by_height[h - this->hlo], 1);
-						if (part.has_value()) {
-							int ramp = (len - r) / static_cast<int>(ROUTE_RAMP_SPACING);
-							for (int nh = std::max(this->hlo, h - ramp); nh <= std::min(this->hhi, h + ramp); nh++) {
-								relax(qd, 1, nh, part->by_height[(h + nh) / 2 - this->hlo] + std::abs(nh - h), 2);
-							}
-						}
-					}
-				}
-			}
-			std::swap(cur, nxt);
-		}
-
-		/* Best end state. */
-		int end_p = r > 0 ? 1 : 0;
-		int best_h = -1;
-		int64_t best = INF;
-		for (int h = this->hlo; h <= this->hhi; h++) {
-			if (cur[index(q, end_p, h)] < best) {
-				best = cur[index(q, end_p, h)];
-				best_h = h;
+		int64_t best = INT64_MAX;
+		int best_end = 0;
+		for (bool diagonal_first : {false, true}) {
+			/* Without a straight or without a diagonal part both orders are the same route. */
+			if (diagonal_first && (this->minor == 0 || this->minor == this->length)) break;
+			std::vector<bool> diagonal(this->length);
+			for (int u = 0; u < this->length; u++) diagonal[u] = diagonal_first ? u < this->minor : u >= this->length - this->minor;
+			std::vector<RailRouteStep> candidate;
+			int64_t cost = this->PlanHeights(diagonal, candidate);
+			if (cost < best) {
+				best = cost;
+				steps = std::move(candidate);
+				best_end = this->end_height;
 			}
 		}
-		if (best_h < 0) return false;
-		this->end_height = best_h;
-
-		/* Walk back: block types and the heights at the block borders. */
-		std::vector<int> types(blocks);
-		std::vector<int> border(blocks + 1);
-		border[blocks] = best_h;
-		int qd = q, p = end_p, h = best_h;
-		for (int j = blocks - 1; j >= 0; j--) {
-			uint16_t bp = back[j][index(qd, p, h)];
-			assert(bp != UINT16_MAX);
-			int type = bp >> 8;
-			int prev_h = h + (bp & 0xFF) - 128;
-			types[j] = type;
-			if (type == 1) qd--;
-			if (type == 2) p = 0;
-			h = prev_h;
-			border[j] = h;
-		}
-
-		steps.assign(this->length, {});
-		for (int j = 0; j < blocks; j++) {
-			int u0 = j * block;
-			int len = std::min(block, this->length - u0);
-			int diag = types[j] == 1 ? len : (types[j] == 2 ? r : 0);
-			int straight = len - diag;
-			int dh = border[j + 1] - border[j];
-			for (int s = 0; s < len; s++) {
-				RailRouteStep &step = steps[u0 + s];
-				step.diagonal = s < diag;
-				/* Ramps spread evenly over the straight steps. */
-				int si = std::max(0, s - diag);
-				step.height = border[j] + (straight > 0 ? dh * si / straight : 0);
-			}
-		}
-		return true;
+		this->end_height = best_end;
+		return best != INT64_MAX;
 	}
 
 	/**
@@ -442,8 +421,9 @@ public:
 
 		/* Bounding box on the map (with the cleared strip) and the origin of all chunks. */
 		int minx = INT_MAX, miny = INT_MAX, maxx = INT_MIN, maxy = INT_MIN;
-		for (int c = 0; c <= this->length; c++) {
-			for (int k : {tile_rows[c].first - margin[c], tile_rows[c].second + margin[c]}) {
+		for (int c = -margin[0]; c <= this->length + margin[this->length]; c++) {
+			int t = std::clamp(c, 0, this->length);
+			for (int k : {tile_rows[t].first - margin[t], tile_rows[t].second + margin[t]}) {
 				auto [x, y] = this->frame.Tile(c, k);
 				minx = std::min(minx, x);
 				maxx = std::max(maxx, x);
@@ -504,6 +484,11 @@ public:
 			emit_rect(RailRouteItemKind::Clear, c, e, tile_rows[c].first - margin[c], tile_rows[c].second + margin[c], false, 0);
 			c = e + 1;
 		}
+
+		/* Clear beyond both ends too: the corners of the first and the last column touch the tiles outside. */
+		emit_rect(RailRouteItemKind::Clear, -margin[0], -1, tile_rows[0].first - margin[0], tile_rows[0].second + margin[0], false, 0);
+		emit_rect(RailRouteItemKind::Clear, this->length + 1, this->length + margin[this->length],
+				tile_rows[this->length].first - margin[this->length], tile_rows[this->length].second + margin[this->length], false, 0);
 
 		/* Level: corner column c spans the corners of the tiles of columns c - 1 and c. */
 		std::vector<std::pair<int, int>> corner_rows(this->length + 2);

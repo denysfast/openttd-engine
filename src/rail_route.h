@@ -8,12 +8,12 @@
 /**
  * @file rail_route.h Rail trunk line tool: plan and build many parallel one-way tracks from one tile to another.
  *
- * The route goes from the start tile to the end tile along the major axis, made of straight runs and 45 degree
- * diagonal runs (a diagonal step moves one tile along both axes). Every track of the corridor is the same
- * polyline moved sideways, so parallel tracks never cross. Diagonal track cannot climb in OpenTTD, so the
- * height only changes on straight runs; a dynamic programme chooses where the diagonal runs go and the
- * height of the corridor, minimising earthworks and demolition. The corridor is then cleared, levelled
- * (sloped along the track on ramps), and the tracks and one-way signals are built.
+ * The route goes from the start tile to the end tile as straight as possible: one straight run along the major
+ * axis and one 45 degree diagonal run (a diagonal step moves one tile along both axes), so at most one bend.
+ * Every track of the corridor is the same polyline moved sideways, so parallel tracks never cross. Diagonal
+ * track cannot climb in OpenTTD, so the height only changes on the straight run; a dynamic programme chooses
+ * the heights, minimising earthworks. Whatever is in the way is demolished or filled. The corridor is then
+ * cleared, levelled (sloped along the track on ramps), and the tracks and one-way signals are built.
  *
  * Planning runs on the client and only reads the map. Building is a list of commands sent by the
  * construction job of blueprint.cpp: #Commands::PrepareRailRoute (clear and level areas) followed by
