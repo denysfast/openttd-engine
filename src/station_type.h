@@ -120,15 +120,17 @@ enum class AirportAnimationTrigger : uint8_t {
 using AirportAnimationTriggers = EnumBitSet<AirportAnimationTrigger, uint8_t>;
 
 /* The different catchment area sizes. */
+static constexpr uint CATCHMENT_SCALE = 2; ///< Fork: every catchment radius is this many times the original one.
 static constexpr uint CA_NONE = 0; ///< Catchment when the station has no facilities
-static constexpr uint CA_BUS = 3; ///< Catchment for bus stops with "modified catchment" enabled
-static constexpr uint CA_TRUCK = 3; ///< Catchment for truck stops with "modified catchment" enabled
-static constexpr uint CA_TRAIN = 4; ///< Catchment for train stations with "modified catchment" enabled
-static constexpr uint CA_DOCK = 5; ///< Catchment for docks with "modified catchment" enabled
+static constexpr uint CA_BUS = 3 * CATCHMENT_SCALE; ///< Catchment for bus stops with "modified catchment" enabled
+static constexpr uint CA_TRUCK = 3 * CATCHMENT_SCALE; ///< Catchment for truck stops with "modified catchment" enabled
+static constexpr uint CA_TRAIN = 4 * CATCHMENT_SCALE; ///< Catchment for train stations with "modified catchment" enabled
+static constexpr uint CA_DOCK = 5 * CATCHMENT_SCALE; ///< Catchment for docks with "modified catchment" enabled
 
-static constexpr uint CA_UNMODIFIED = 4; ///< Catchment for all stations with "modified catchment" disabled
+static constexpr uint CA_UNMODIFIED = 4 * CATCHMENT_SCALE; ///< Catchment for all stations with "modified catchment" disabled
 
-static constexpr uint MAX_CATCHMENT = 10; ///< Maximum catchment for airports with "modified catchment" enabled
+static constexpr uint MAX_AIRPORT_CATCHMENT_SPEC = 10; ///< Maximum catchment of an airport spec (before #CATCHMENT_SCALE).
+static constexpr uint MAX_CATCHMENT = MAX_AIRPORT_CATCHMENT_SPEC * CATCHMENT_SCALE; ///< Maximum catchment for airports with "modified catchment" enabled
 
 static const uint MAX_LENGTH_STATION_NAME_CHARS = 32; ///< The maximum length of a station name in characters including '\0'
 

@@ -202,7 +202,7 @@ static ChangeInfoResult AirportChangeInfo(uint first, uint last, int prop, ByteR
 				break;
 
 			case 0x0E:
-				as->catchment = Clamp(buf.ReadByte(), 1, MAX_CATCHMENT);
+				as->catchment = Clamp(buf.ReadByte(), 1, MAX_AIRPORT_CATCHMENT_SPEC);
 				break;
 
 			case 0x0F:

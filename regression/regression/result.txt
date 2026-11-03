@@ -1587,55 +1587,55 @@ ERROR: IsEnd() is invalid as Begin() is never called
   IsValidAirportType(0):            true
   GetAirportWidth(0):               4
   GetAirportHeight(0):              3
-  GetAirportCoverageRadius(0):      4
+  GetAirportCoverageRadius(0):      8
   GetAirportNumHelipads(0):         0
   IsAirportInformationAvailable(1): true
   IsValidAirportType(1):            false
   GetAirportWidth(1):               6
   GetAirportHeight(1):              6
-  GetAirportCoverageRadius(1):      5
+  GetAirportCoverageRadius(1):      10
   GetAirportNumHelipads(1):         0
   IsAirportInformationAvailable(2): true
   IsValidAirportType(2):            false
   GetAirportWidth(2):               1
   GetAirportHeight(2):              1
-  GetAirportCoverageRadius(2):      4
+  GetAirportCoverageRadius(2):      8
   GetAirportNumHelipads(2):         1
   IsAirportInformationAvailable(3): true
   IsValidAirportType(3):            false
   GetAirportWidth(3):               6
   GetAirportHeight(3):              6
-  GetAirportCoverageRadius(3):      6
+  GetAirportCoverageRadius(3):      12
   GetAirportNumHelipads(3):         0
   IsAirportInformationAvailable(4): true
   IsValidAirportType(4):            false
   GetAirportWidth(4):               7
   GetAirportHeight(4):              7
-  GetAirportCoverageRadius(4):      8
+  GetAirportCoverageRadius(4):      16
   GetAirportNumHelipads(4):         2
   IsAirportInformationAvailable(5): true
   IsValidAirportType(5):            false
   GetAirportWidth(5):               5
   GetAirportHeight(5):              4
-  GetAirportCoverageRadius(5):      4
+  GetAirportCoverageRadius(5):      8
   GetAirportNumHelipads(5):         2
   IsAirportInformationAvailable(6): true
   IsValidAirportType(6):            false
   GetAirportWidth(6):               2
   GetAirportHeight(6):              2
-  GetAirportCoverageRadius(6):      4
+  GetAirportCoverageRadius(6):      8
   GetAirportNumHelipads(6):         1
   IsAirportInformationAvailable(7): true
   IsValidAirportType(7):            false
   GetAirportWidth(7):               9
   GetAirportHeight(7):              11
-  GetAirportCoverageRadius(7):      10
+  GetAirportCoverageRadius(7):      20
   GetAirportNumHelipads(7):         2
   IsAirportInformationAvailable(8): true
   IsValidAirportType(8):            false
   GetAirportWidth(8):               4
   GetAirportHeight(8):              2
-  GetAirportCoverageRadius(8):      4
+  GetAirportCoverageRadius(8):      8
   GetAirportNumHelipads(8):         3
   IsAirportInformationAvailable(9): false
   IsValidAirportType(9):            false
@@ -8760,9 +8760,9 @@ ERROR: IsEnd() is invalid as Begin() is never called
   HasRoadType(33411, ROAD): true
   HasStationType(3, BUS):   false
   HasStationType(3, TRAIN): false
-  GetCoverageRadius(BUS):   3
-  GetCoverageRadius(TRUCK): 3
-  GetCoverageRadius(TRAIN): 4
+  GetCoverageRadius(BUS):   6
+  GetCoverageRadius(TRUCK): 6
+  GetCoverageRadius(TRAIN): 8
   GetNearestTown():         15
   GetNearestTown():         65535
   GetNearestTown():         10
@@ -8846,6 +8846,48 @@ ERROR: IsEnd() is invalid as Begin() is never called
 --StationList--
   GetName(): Little Frutford Valley
   TileList_StationCoverage:
+    34963
+    34962
+    34961
+    34960
+    34959
+    34958
+    34957
+    34956
+    34955
+    34954
+    34953
+    34952
+    34951
+    34707
+    34706
+    34705
+    34704
+    34703
+    34702
+    34701
+    34700
+    34699
+    34698
+    34697
+    34696
+    34695
+    34451
+    34450
+    34449
+    34448
+    34447
+    34446
+    34445
+    34444
+    34443
+    34442
+    34441
+    34440
+    34439
+    34195
+    34194
+    34193
     34192
     34191
     34190
@@ -8853,6 +8895,12 @@ ERROR: IsEnd() is invalid as Begin() is never called
     34188
     34187
     34186
+    34185
+    34184
+    34183
+    33939
+    33938
+    33937
     33936
     33935
     33934
@@ -8860,6 +8908,12 @@ ERROR: IsEnd() is invalid as Begin() is never called
     33932
     33931
     33930
+    33929
+    33928
+    33927
+    33683
+    33682
+    33681
     33680
     33679
     33678
@@ -8867,6 +8921,12 @@ ERROR: IsEnd() is invalid as Begin() is never called
     33676
     33675
     33674
+    33673
+    33672
+    33671
+    33427
+    33426
+    33425
     33424
     33423
     33422
@@ -8874,6 +8934,12 @@ ERROR: IsEnd() is invalid as Begin() is never called
     33420
     33419
     33418
+    33417
+    33416
+    33415
+    33171
+    33170
+    33169
     33168
     33167
     33166
@@ -8881,6 +8947,12 @@ ERROR: IsEnd() is invalid as Begin() is never called
     33164
     33163
     33162
+    33161
+    33160
+    33159
+    32915
+    32914
+    32913
     32912
     32911
     32910
@@ -8888,6 +8960,12 @@ ERROR: IsEnd() is invalid as Begin() is never called
     32908
     32907
     32906
+    32905
+    32904
+    32903
+    32659
+    32658
+    32657
     32656
     32655
     32654
@@ -8895,8 +8973,107 @@ ERROR: IsEnd() is invalid as Begin() is never called
     32652
     32651
     32650
+    32649
+    32648
+    32647
+    32403
+    32402
+    32401
+    32400
+    32399
+    32398
+    32397
+    32396
+    32395
+    32394
+    32393
+    32392
+    32391
+    32147
+    32146
+    32145
+    32144
+    32143
+    32142
+    32141
+    32140
+    32139
+    32138
+    32137
+    32136
+    32135
+    31891
+    31890
+    31889
+    31888
+    31887
+    31886
+    31885
+    31884
+    31883
+    31882
+    31881
+    31880
+    31879
   GetName(): Little Frutford Woods
   TileList_StationCoverage:
+    35210
+    35209
+    35208
+    35207
+    35206
+    35205
+    35204
+    35203
+    35202
+    35201
+    35200
+    35199
+    35198
+    35197
+    34958
+    34957
+    34956
+    34955
+    34954
+    34953
+    34952
+    34951
+    34950
+    34949
+    34948
+    34947
+    34946
+    34945
+    34944
+    34943
+    34942
+    34941
+    34702
+    34701
+    34700
+    34699
+    34698
+    34697
+    34696
+    34695
+    34694
+    34693
+    34692
+    34691
+    34690
+    34689
+    34688
+    34687
+    34686
+    34685
+    34446
+    34445
+    34444
+    34443
+    34442
+    34441
+    34440
     34439
     34438
     34437
@@ -8905,6 +9082,12 @@ ERROR: IsEnd() is invalid as Begin() is never called
     34434
     34433
     34432
+    34431
+    34430
+    34429
+    34190
+    34189
+    34188
     34187
     34186
     34185
@@ -8917,6 +9100,12 @@ ERROR: IsEnd() is invalid as Begin() is never called
     34178
     34177
     34176
+    34175
+    34174
+    34173
+    33934
+    33933
+    33932
     33931
     33930
     33929
@@ -8929,6 +9118,12 @@ ERROR: IsEnd() is invalid as Begin() is never called
     33922
     33921
     33920
+    33919
+    33918
+    33917
+    33678
+    33677
+    33676
     33675
     33674
     33673
@@ -8941,6 +9136,12 @@ ERROR: IsEnd() is invalid as Begin() is never called
     33666
     33665
     33664
+    33663
+    33662
+    33661
+    33422
+    33421
+    33420
     33419
     33418
     33417
@@ -8953,6 +9154,12 @@ ERROR: IsEnd() is invalid as Begin() is never called
     33410
     33409
     33408
+    33407
+    33406
+    33405
+    33166
+    33165
+    33164
     33163
     33162
     33161
@@ -8965,6 +9172,12 @@ ERROR: IsEnd() is invalid as Begin() is never called
     33154
     33153
     33152
+    33151
+    33150
+    33149
+    32910
+    32909
+    32908
     32907
     32906
     32905
@@ -8977,6 +9190,12 @@ ERROR: IsEnd() is invalid as Begin() is never called
     32898
     32897
     32896
+    32895
+    32894
+    32893
+    32654
+    32653
+    32652
     32651
     32650
     32649
@@ -8989,6 +9208,63 @@ ERROR: IsEnd() is invalid as Begin() is never called
     32642
     32641
     32640
+    32639
+    32638
+    32637
+    32398
+    32397
+    32396
+    32395
+    32394
+    32393
+    32392
+    32391
+    32390
+    32389
+    32388
+    32387
+    32386
+    32385
+    32384
+    32383
+    32382
+    32381
+    32142
+    32141
+    32140
+    32139
+    32138
+    32137
+    32136
+    32135
+    32134
+    32133
+    32132
+    32131
+    32130
+    32129
+    32128
+    32127
+    32126
+    32125
+    31886
+    31885
+    31884
+    31883
+    31882
+    31881
+    31880
+    31879
+    31878
+    31877
+    31876
+    31875
+    31874
+    31873
+    31872
+    31871
+    31870
+    31869
 
 --Tile--
   HasTreeOnTile():      false

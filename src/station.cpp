@@ -319,7 +319,7 @@ static uint GetTileCatchmentRadius(TileIndex tile, const Station *st)
 		switch (GetStationType(tile)) {
 			case StationType::Rail:    return CA_TRAIN;
 			case StationType::Oilrig:  return CA_UNMODIFIED;
-			case StationType::Airport: return st->airport.GetSpec()->catchment;
+			case StationType::Airport: return st->airport.GetSpec()->catchment * CATCHMENT_SCALE;
 			case StationType::Truck:   return CA_TRUCK;
 			case StationType::Bus:     return CA_BUS;
 			case StationType::Dock:    return CA_DOCK;
@@ -352,7 +352,7 @@ uint Station::GetCatchmentRadius() const
 		if (this->truck_stops != nullptr) ret = std::max<uint>(ret, CA_TRUCK);
 		if (!this->train_station.IsEmpty()) ret = std::max<uint>(ret, CA_TRAIN);
 		if (!this->ship_station.IsEmpty()) ret = std::max<uint>(ret, CA_DOCK);
-		if (!this->airport.IsEmpty()) ret = std::max<uint>(ret, this->airport.GetSpec()->catchment);
+		if (!this->airport.IsEmpty()) ret = std::max<uint>(ret, this->airport.GetSpec()->catchment * CATCHMENT_SCALE);
 	} else {
 		if (this->bus_stops != nullptr || this->truck_stops != nullptr || !this->train_station.IsEmpty() || !this->ship_station.IsEmpty() || !this->airport.IsEmpty()) {
 			ret = CA_UNMODIFIED;
