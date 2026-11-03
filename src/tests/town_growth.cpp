@@ -20,8 +20,8 @@
 
 /** Default base growth constant (setting economy.town_growth_base). */
 static constexpr uint32_t BASE = 1031;
-/** Multiplier with all four needs at level 5 (2.2 each). */
-static constexpr uint32_t ALL_FIVE = 23425;
+/** Multiplier with all four needs at level 5 (1.6 each). */
+static constexpr uint32_t ALL_FIVE = 6553;
 /** A multiplier of 6.553, for the tests of the growth formula (the old level 5 calibration). */
 static constexpr uint32_t FORMULA_MULTIPLIER = 6553;
 /** Multiplier with all four needs at level 3. */
@@ -172,7 +172,7 @@ TEST_CASE("TownGrowthMultiplier")
 
 	CHECK(CalcTownGrowthMultiplier(all_five, false, SPEED_NORMAL) == ALL_FIVE);
 	CHECK(CalcTownGrowthMultiplier(all_three, false, SPEED_NORMAL) == ALL_THREE);
-	CHECK(CalcTownGrowthMultiplier(mixed, false, SPEED_NORMAL) == 2464); // 2.2 * 1.6 * 0.7
+	CHECK(CalcTownGrowthMultiplier(mixed, false, SPEED_NORMAL) == 1456); // 1.6 * 1.3 * 0.7
 	CHECK(CalcTownGrowthMultiplier(blocked, false, SPEED_NORMAL) == 0);
 
 	/* Funding: x1.5, but it never lifts a blocking need. */
@@ -195,9 +195,9 @@ TEST_CASE("TownValuablesBonus")
 
 	/* A bonus never slows growth: level 0 is neutral, every level adds 2%. */
 	CHECK(GetTownNeedMultiplier(TownNeed::Valuables, 0) == 1000);
-	CHECK(GetTownNeedMultiplier(TownNeed::Valuables, 1) == 1040);
-	CHECK(GetTownNeedMultiplier(TownNeed::Valuables, 5) == 1200);
-	CHECK(GetTownNeedMultiplier(TownNeed::Valuables, 15) == 1600);
+	CHECK(GetTownNeedMultiplier(TownNeed::Valuables, 1) == 1020);
+	CHECK(GetTownNeedMultiplier(TownNeed::Valuables, 5) == 1100);
+	CHECK(GetTownNeedMultiplier(TownNeed::Valuables, 15) == 1300);
 	CHECK(GetTownNeedMultiplier(TownNeed::Goods, 0) == 0);
 
 	/* The fifth level in the multiplier is the valuables bonus. */
@@ -206,8 +206,8 @@ TEST_CASE("TownValuablesBonus")
 	const std::array<uint8_t, 5> all_five_with_valuables = {5, 5, 5, 5, 5};
 	const std::array<uint8_t, 5> blocked_with_valuables = {5, 0, 5, 5, 5};
 	CHECK(CalcTownGrowthMultiplier(neutral_no_valuables, false, SPEED_NORMAL) == 1000);
-	CHECK(CalcTownGrowthMultiplier(neutral_full_valuables, false, SPEED_NORMAL) == 1200);
-	CHECK(CalcTownGrowthMultiplier(all_five_with_valuables, false, SPEED_NORMAL) == ALL_FIVE * 12 / 10);
+	CHECK(CalcTownGrowthMultiplier(neutral_full_valuables, false, SPEED_NORMAL) == 1100);
+	CHECK(CalcTownGrowthMultiplier(all_five_with_valuables, false, SPEED_NORMAL) == ALL_FIVE * 11 / 10);
 	CHECK(CalcTownGrowthMultiplier(blocked_with_valuables, false, SPEED_NORMAL) == 0);
 }
 
@@ -272,12 +272,12 @@ TEST_CASE("TownGrowthRateEstimate")
 
 TEST_CASE("TownNeedLevels")
 {
-	/* Every level above the neutral one adds 0.6, up to level 15. */
-	CHECK(GetTownNeedLevelMultiplier(4) == 1600);
-	CHECK(GetTownNeedLevelMultiplier(5) == 2200);
-	CHECK(GetTownNeedLevelMultiplier(15) == 8200);
+	/* Every level above the neutral one adds 0.3, up to level 15: level 5 stays at x1.6 as before. */
+	CHECK(GetTownNeedLevelMultiplier(4) == 1300);
+	CHECK(GetTownNeedLevelMultiplier(5) == 1600);
+	CHECK(GetTownNeedLevelMultiplier(15) == 4600);
 	for (uint8_t level = 4; level <= TOWN_NEED_LEVEL_MAX; level++) {
-		CHECK(GetTownNeedLevelMultiplier(level) - GetTownNeedLevelMultiplier(level - 1) == 600);
+		CHECK(GetTownNeedLevelMultiplier(level) - GetTownNeedLevelMultiplier(level - 1) == 300);
 	}
 }
 

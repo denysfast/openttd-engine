@@ -41,10 +41,10 @@ namespace TownGrowthBalance {
 	static constexpr uint32_t GRACE_POPULATION = 1000;
 	/** Population from which a need is unlocked; a locked need counts as at least neutral. */
 	static constexpr std::array<uint32_t, to_underlying(TownNeed::End)> UNLOCK_POPULATION = {0, 1000, 2500, 5000, 0};
-	/** Growth multiplier per need level 0..15, per mille: +0.6 for every level above the neutral 3. */
-	static constexpr std::array<uint16_t, TOWN_NEED_LEVEL_MAX + 1> LEVEL_MULTIPLIER = {0, 250, 700, 1000, 1600, 2200, 2800, 3400, 4000, 4600, 5200, 5800, 6400, 7000, 7600, 8200};
-	/** Growth multiplier per level 0..15 of a bonus need (valuables), per mille: it only speeds growth up, 4% per level, up to 60%. */
-	static constexpr std::array<uint16_t, TOWN_NEED_LEVEL_MAX + 1> BONUS_LEVEL_MULTIPLIER = {1000, 1040, 1080, 1120, 1160, 1200, 1240, 1280, 1320, 1360, 1400, 1440, 1480, 1520, 1560, 1600};
+	/** Growth multiplier per need level 0..15, per mille: +0.3 for every level above the neutral 3 (level 5: x1.6, level 15: x4.6). */
+	static constexpr std::array<uint16_t, TOWN_NEED_LEVEL_MAX + 1> LEVEL_MULTIPLIER = {0, 250, 700, 1000, 1300, 1600, 1900, 2200, 2500, 2800, 3100, 3400, 3700, 4000, 4300, 4600};
+	/** Growth multiplier per level 0..15 of a bonus need (valuables), per mille: it only speeds growth up, 2% per level, up to 30%. */
+	static constexpr std::array<uint16_t, TOWN_NEED_LEVEL_MAX + 1> BONUS_LEVEL_MULTIPLIER = {1000, 1020, 1040, 1060, 1080, 1100, 1120, 1140, 1160, 1180, 1200, 1220, 1240, 1260, 1280, 1300};
 	/** Valuables a town wants per month for full coverage of the bonus: one unit per this many residents (at least one unit). */
 	static constexpr uint32_t VALUABLES_RESIDENTS = 2000;
 	/** Minimal coverage in percent for need levels 1..15 (index 0 is level 1); levels above 5 need more than the norm. */
