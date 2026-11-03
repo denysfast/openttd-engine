@@ -297,7 +297,9 @@ public:
 		auto index = [&](int qd, int p, int h) { return (static_cast<size_t>(qd) * partial_states + p) * range + (h - this->hlo); };
 
 		constexpr int64_t INF = INT64_MAX / 4;
-		std::vector<int64_t> cur(layer, 0), nxt(layer, INF);
+		std::vector<int64_t> cur(layer, INF), nxt(layer, INF);
+		/* The route starts with no diagonal steps done, at any height. */
+		for (int h = this->hlo; h <= this->hhi; h++) cur[index(0, 0, h)] = 0;
 		/* Backpointer per block and state: type (0 straight, 1 diagonal, 2 partial) and previous height + 128. */
 		std::vector<std::vector<uint16_t>> back(blocks, std::vector<uint16_t>(layer, UINT16_MAX));
 
