@@ -3025,6 +3025,7 @@ STR_RAIL_TOOLBAR_TOOLTIP_BUILD_RAILROAD_TUNNEL                  :{BLACK}Стро
 STR_RAIL_TOOLBAR_TOOLTIP_TOGGLE_BUILD_REMOVE_FOR                :{BLACK}Переключение между строительством и удалением ж/д путей, сигналов, станций. При нажатом Ctrl убирает станции вместе с рельсами.
 STR_RAIL_TOOLBAR_TOOLTIP_CONVERT_RAIL                           :{BLACK}Преобразовать/модернизировать железнодорожное полотно. При нажатом Shift - оценка стоимости модернизации.
 STR_RAIL_TOOLBAR_TOOLTIP_BLUEPRINTS                             :{BLACK}Шаблоны путей: скопировать участок железной дороги и вставить его в другом месте, с поворотом или отражением
+STR_RAIL_TOOLBAR_TOOLTIP_TRUNK_LINE                             :{BLACK}Магистраль: построить несколько параллельных односторонних путей от одной точки до другой, расчистив и выровняв коридор. Клавиша: K
 
 # Rail blueprint window
 STR_BLUEPRINT_CAPTION                                           :{WHITE}Шаблоны путей
@@ -3052,11 +3053,11 @@ STR_BLUEPRINT_ABORT                                             :{BLACK}Прер
 STR_BLUEPRINT_ABORT_TOOLTIP                                     :{BLACK}Остановить вставку шаблона; уже построенное останется
 STR_BLUEPRINT_STATUS_TRANSFORM                                  :{BLACK}Поворот: {GOLD}{NUM}°{STRING}
 STR_BLUEPRINT_STATUS_MIRRORED                                   :, отражён
-STR_BLUEPRINT_STATUS_SIZE                                       :{BLACK}Выбран: {GOLD}{RAW_STRING}{BLACK}, {NUM}x{NUM} после поворота, {COMMA} объект{P "" а ов}
+STR_BLUEPRINT_STATUS_SIZE                                       :{BLACK}Выбран: {GOLD}{STRING}{BLACK}, {NUM}x{NUM} после поворота, {COMMA} объект{P "" а ов}
 STR_BLUEPRINT_STATUS_NO_SELECTION                               :{BLACK}Шаблон не выбран
 STR_BLUEPRINT_STATUS_PASTE_NONE                                 :{BLACK}Шаблоны ещё не вставлялись
-STR_BLUEPRINT_STATUS_PASTE_RUNNING                              :{BLACK}Вставка {GOLD}{RAW_STRING}{BLACK}: {NUM}/{NUM} команд, построено {COMMA}, не удалось {COMMA}, {CURRENCY_LONG}
-STR_BLUEPRINT_STATUS_PASTE_DONE                                 :{BLACK}Вставлен {GOLD}{RAW_STRING}{BLACK}: построено {COMMA}, не удалось {COMMA}, стоимость {CURRENCY_LONG}
+STR_BLUEPRINT_STATUS_PASTE_RUNNING                              :{BLACK}Вставка {GOLD}{STRING}{BLACK}: {NUM}/{NUM} команд, построено {COMMA}, не удалось {COMMA}, {CURRENCY_LONG}
+STR_BLUEPRINT_STATUS_PASTE_DONE                                 :{BLACK}Вставлен {GOLD}{STRING}{BLACK}: построено {COMMA}, не удалось {COMMA}, стоимость {CURRENCY_LONG}
 STR_BLUEPRINT_STATUS_OUT_OF_MONEY                               :{RED}Остановлено: не хватает денег
 STR_BLUEPRINT_STATUS_ABORTED                                    :{RED}Прервано
 STR_BLUEPRINT_STATUS_LAST_ERROR                                 :{BLACK}Последняя ошибка: {STRING}
@@ -3064,8 +3065,8 @@ STR_BLUEPRINT_DEFAULT_NAME                                      :Шаблон {N
 STR_BLUEPRINT_QUERY_NAME_CAPTION                                :{WHITE}Название нового шаблона
 STR_BLUEPRINT_QUERY_RENAME_CAPTION                              :{WHITE}Переименовать шаблон
 STR_BLUEPRINT_DELETE_CAPTION                                    :{WHITE}Удаление шаблона
-STR_BLUEPRINT_DELETE_QUERY                                      :{YELLOW}Удалить шаблон «{RAW_STRING}»?
-STR_BLUEPRINT_SAVED                                             :{WHITE}Шаблон «{RAW_STRING}» сохранён
+STR_BLUEPRINT_DELETE_QUERY                                      :{YELLOW}Удалить шаблон «{STRING}»?
+STR_BLUEPRINT_SAVED                                             :{WHITE}Шаблон «{STRING}» сохранён
 STR_BLUEPRINT_PARTIAL_LEFT_OUT                                  :{WHITE}Пропущено мостов и туннелей: {COMMA}{NBSP}- внутри участка только один их конец
 
 STR_ERROR_BLUEPRINT_CAN_T_COPY                                  :{WHITE}Невозможно скопировать участок...
@@ -3075,12 +3076,56 @@ STR_ERROR_BLUEPRINT_WRITE_FAILED                                :{WHITE}... не
 STR_ERROR_BLUEPRINT_NAME_EXISTS                                 :{WHITE}... шаблон с таким названием уже есть
 STR_ERROR_BLUEPRINT_CAN_T_RENAME                                :{WHITE}Невозможно переименовать шаблон...
 STR_ERROR_BLUEPRINT_CAN_T_LOAD                                  :{WHITE}Невозможно загрузить шаблон...
-STR_ERROR_BLUEPRINT_FILE_BROKEN                                 :{WHITE}... файл шаблона «{RAW_STRING}» отсутствует или повреждён
+STR_ERROR_BLUEPRINT_FILE_BROKEN                                 :{WHITE}... файл шаблона «{STRING}» отсутствует или повреждён
 STR_ERROR_BLUEPRINT_CAN_T_PASTE                                 :{WHITE}Невозможно вставить шаблон здесь...
 STR_ERROR_BLUEPRINT_DOES_NOT_FIT                                :{WHITE}... шаблон не помещается на карте в этом месте
 STR_ERROR_BLUEPRINT_EMPTY                                       :{WHITE}... шаблон пуст
-STR_ERROR_BLUEPRINT_OTHER                                       :{WHITE}... {RAW_STRING}
+STR_ERROR_BLUEPRINT_OTHER                                       :{WHITE}... {STRING}
 STR_ERROR_BLUEPRINT_PASTE_RUNNING                               :{WHITE}... ещё идёт вставка другого шаблона
+
+# Rail trunk line window
+STR_RAIL_ROUTE_CAPTION                                          :{WHITE}Магистраль
+STR_RAIL_ROUTE_TRACKS                                           :{BLACK}Путей:
+STR_RAIL_ROUTE_TRACKS_TOOLTIP                                   :{BLACK}Число параллельных односторонних путей, от 1 до 30. Клавиши: запятая и точка
+STR_RAIL_ROUTE_SIGNALS                                          :{BLACK}Сигналы, через (клеток):
+STR_RAIL_ROUTE_SIGNALS_TOOLTIP                                  :{BLACK}Поставить односторонние маршрутные сигналы на всех путях, по направлению от начала к концу
+STR_RAIL_ROUTE_INTERVAL_TOOLTIP                                 :{BLACK}Расстояние между сигналами вдоль линии, от 1 до 20 клеток
+STR_RAIL_ROUTE_WATER                                            :{BLACK}Убирать воду
+STR_RAIL_ROUTE_WATER_TOOLTIP                                    :{BLACK}Засыпать море, озёра, реки и каналы в коридоре; иначе клетки с водой мешают линии
+STR_RAIL_ROUTE_DEMOLISH                                         :{BLACK}Сносить дома, предприятия и городские дороги
+STR_RAIL_ROUTE_DEMOLISH_TOOLTIP                                 :{BLACK}Сносить городские дома, предприятия и городские дороги в коридоре; иначе они мешают линии
+STR_RAIL_ROUTE_SEA                                              :{BLACK}Поднимать землю на уровне моря
+STR_RAIL_ROUTE_SEA_TOOLTIP                                      :{BLACK}Держать линию хотя бы на один уровень выше моря, поднимая землю где нужно
+STR_RAIL_ROUTE_BUILD                                            :{BLACK}Строить
+STR_RAIL_ROUTE_BUILD_TOOLTIP                                    :{BLACK}Щёлкните на карте начальную клетку, затем конечную: линия следует за мышью как предпросмотр и строится по второму щелчку с типом рельсов из панели ж/д строительства. Инструмент остаётся включённым для следующих линий до Esc или правого щелчка. Клавиша: K
+STR_RAIL_ROUTE_ABORT                                            :{BLACK}Прервать стройку
+STR_RAIL_ROUTE_ABORT_TOOLTIP                                    :{BLACK}Остановить идущую стройку; уже построенное остаётся
+STR_RAIL_ROUTE_INFO_RAILTYPE                                    :{BLACK}Тип рельсов: {GOLD}{STRING}{BLACK}, сигналы: {GOLD}{STRING}
+STR_RAIL_ROUTE_INFO_ELECTRIC                                    :светофоры
+STR_RAIL_ROUTE_INFO_SEMAPHORE                                   :семафоры
+STR_RAIL_ROUTE_INFO_IDLE                                        :{BLACK}Нажмите «Строить», затем щёлкните начало и конец линии
+STR_RAIL_ROUTE_INFO_PICK_START                                  :{YELLOW}Щёлкните начальную клетку линии
+STR_RAIL_ROUTE_INFO_PICK_END                                    :{YELLOW}Щёлкните конечную клетку линии (начало {NUM},{NUM})
+STR_RAIL_ROUTE_INFO_ERROR                                       :{RED}Построить нельзя: {STRING}
+STR_RAIL_ROUTE_INFO_LENGTH                                      :{BLACK}Длина {GOLD}{COMMA}{BLACK}, {GOLD}{COMMA}{BLACK} поворот{P "" а ов}, {GOLD}{COMMA}{BLACK} клет{P ка ки ок} с рельсами, высота {NUM}..{NUM}
+STR_RAIL_ROUTE_INFO_COST                                        :{BLACK}Примерная стоимость: {GOLD}{CURRENCY_LONG}
+STR_RAIL_ROUTE_INFO_COST_PARTS                                  :{BLACK}Расчистка {CURRENCY_LONG}, грунт {CURRENCY_LONG}, пути {CURRENCY_LONG}
+STR_RAIL_ROUTE_INFO_DEMOLISH                                    :{BLACK}Снести: {GOLD}{COMMA}{BLACK} клет{P ку ки ок} с домами, {GOLD}{COMMA}{BLACK} предприяти{P е я й}
+STR_RAIL_ROUTE_INFO_WATER_BLOCKED                               :{BLACK}Засыпать клеток с водой: {GOLD}{COMMA}{BLACK}, нельзя расчистить клеток: {GOLD}{COMMA}
+STR_RAIL_ROUTE_INFO_NOT_ENOUGH_MONEY                            :{RED}Не хватает денег: нужно {CURRENCY_LONG}, у вас {CURRENCY_LONG}
+STR_RAIL_ROUTE_STATUS_NONE                                      :{BLACK}Стройка не идёт
+STR_RAIL_ROUTE_STATUS_RUNNING                                   :{BLACK}Стройка {GOLD}{STRING}{BLACK}: команд {NUM}/{NUM}, сделано {COMMA}, не удалось {COMMA}, {CURRENCY_LONG}
+STR_RAIL_ROUTE_STATUS_DONE                                      :{BLACK}Закончено {GOLD}{STRING}{BLACK}: сделано {COMMA}, не удалось {COMMA}, стоимость {CURRENCY_LONG}
+STR_RAIL_ROUTE_ERROR_INVALID_TILE                               :неверная клетка
+STR_RAIL_ROUTE_ERROR_INVALID_TRACKS                             :неверное число путей
+STR_RAIL_ROUTE_ERROR_TOO_SHORT                                  :линия слишком короткая
+STR_RAIL_ROUTE_ERROR_NO_ROUTE                                   :путь не найден
+STR_RAIL_ROUTE_ERROR_DOES_NOT_FIT                               :коридор не помещается на карте
+
+STR_ERROR_RAIL_ROUTE_CAN_T_BUILD                                :{WHITE}Невозможно построить магистраль...
+STR_ERROR_RAIL_ROUTE_DETAIL                                     :{WHITE}... {STRING}
+STR_ERROR_RAIL_ROUTE_NOT_ENOUGH_MONEY                           :{WHITE}... нужно около {CURRENCY_LONG}, у компании {CURRENCY_LONG}
+STR_ERROR_RAIL_ROUTE_JOB_RUNNING                                :{WHITE}... ещё идёт другая стройка
 
 STR_RAIL_NAME_RAILROAD                                          :Ж/д
 STR_RAIL_NAME_RAILROAD.m                                        :Ж/д

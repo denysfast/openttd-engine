@@ -999,6 +999,7 @@ static void FinishBlueprintPaste()
 		_paste_status.aborted ? ", aborted" : "",
 		_paste_status.last_error != INVALID_STRING_ID && _paste_status.failed != 0 ? fmt::format(", last error: {}", GetString(_paste_status.last_error)) : "");
 	InvalidateWindowClassesData(WindowClass::Blueprints);
+	InvalidateWindowClassesData(WindowClass::RailRoute);
 }
 
 /**
@@ -1053,6 +1054,7 @@ static void OnConstructionJobResult(const CommandCost &result, Money extra_money
 
 	if (_paste_queue.empty() && _paste_status.chunks_done >= _paste_status.chunks_sent) FinishBlueprintPaste();
 	InvalidateWindowClassesData(WindowClass::Blueprints);
+	InvalidateWindowClassesData(WindowClass::RailRoute);
 }
 
 /**

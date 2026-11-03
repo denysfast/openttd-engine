@@ -85,6 +85,7 @@
 #include "linkgraph/linkgraph_gui.h"
 #include "viewport_kdtree.h"
 #include "blueprint_gui.h"
+#include "rail_route_gui.h"
 #include "town_kdtree.h"
 #include "viewport_sprite_sorter.h"
 #include "bridge_map.h"
@@ -1036,6 +1037,21 @@ static void DrawBlueprintPreviewTile(const TileInfo *ti)
 	}
 }
 
+/**
+ * Draw the preview of a rail trunk line on a tile: the planned track pieces as autorail highlights (red when the
+ * company cannot afford the route) and a blue rectangle on the start tile.
+ * @param ti The tile being drawn.
+ */
+static void DrawRailRoutePreviewTile(const TileInfo *ti)
+{
+	if (!IsValidTile(ti->tile)) return;
+
+	RailRoutePreviewTile preview = GetRailRoutePreviewTile(ti->tile);
+	/* HighLightStyle directions are in the same order as tracks. */
+	for (Track track : preview.tracks) DrawAutorailSelection(ti, static_cast<HighLightStyle>(to_underlying(track)), preview.red);
+	if (preview.start) DrawTileSelectionRect(ti, PALETTE_SEL_TILE_BLUE);
+}
+
 /** Types of tile highlight. */
 enum class TileHighlightType : uint8_t {
 	None, ///< No tile highlight.
@@ -1161,6 +1177,9 @@ static void DrawTileSelection(const TileInfo *ti)
 
 	TileHighlightType tht = GetTileHighlightType(ti->tile);
 	DrawTileHighlightType(ti, tht);
+
+	/* Planned trunk line, anywhere on the map. */
+	if (IsRailRoutePreviewActive()) DrawRailRoutePreviewTile(ti);
 
 	/* No tile selection active? */
 	if ((_thd.drawstyle & HT_DRAG_MASK) == HT_NONE) return;

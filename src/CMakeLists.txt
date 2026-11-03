@@ -391,6 +391,8 @@ add_files(
     rail_route.h
     rail_route_cmd.cpp
     rail_route_cmd.h
+    rail_route_gui.cpp
+    rail_route_gui.h
     rail_gui.h
     rail_map.h
     rail_type.h

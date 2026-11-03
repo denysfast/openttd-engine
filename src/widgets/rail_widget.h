@@ -29,6 +29,7 @@ enum RailToolbarWidgets : WidgetID {
 	WID_RAT_REMOVE,         ///< Bulldozer to remove rail.
 	WID_RAT_CONVERT_RAIL,   ///< Convert other rail to this type.
 	WID_RAT_BLUEPRINTS,     ///< Open the rail blueprint window.
+	WID_RAT_TRUNK_LINE,     ///< Open the rail trunk line window.
 };
 
 /** Widgets of the #BuildRailStationWindow class. */

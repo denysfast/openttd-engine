@@ -44,6 +44,7 @@
 #include "timer/timer_game_calendar.h"
 #include "picker_gui.h"
 #include "blueprint_gui.h"
+#include "rail_route_gui.h"
 
 #include "station_map.h"
 #include "tunnelbridge_map.h"
@@ -469,7 +470,7 @@ struct BuildRailToolbarWindow : Window {
 	static inline const std::initializer_list<WidgetID> can_build_widgets = {
 		WID_RAT_BUILD_NS, WID_RAT_BUILD_X, WID_RAT_BUILD_EW, WID_RAT_BUILD_Y, WID_RAT_AUTORAIL,
 		WID_RAT_BUILD_DEPOT, WID_RAT_BUILD_WAYPOINT, WID_RAT_BUILD_STATION, WID_RAT_BUILD_SIGNALS,
-		WID_RAT_BUILD_BRIDGE, WID_RAT_BUILD_TUNNEL, WID_RAT_CONVERT_RAIL,
+		WID_RAT_BUILD_BRIDGE, WID_RAT_BUILD_TUNNEL, WID_RAT_CONVERT_RAIL, WID_RAT_TRUNK_LINE,
 	};
 
 	void OnInvalidateData([[maybe_unused]] int data = 0, [[maybe_unused]] bool gui_scope = true) override
@@ -649,6 +650,11 @@ struct BuildRailToolbarWindow : Window {
 			return;
 		}
 
+		if (widget == WID_RAT_TRUNK_LINE) {
+			ShowRailRouteWindow();
+			return;
+		}
+
 		this->last_user_action = widget;
 		bool started = HandlePlacePushButton(this, widget, this->GetCursorForWidget(widget), this->GetHighLightStyleForWidget(widget));
 
@@ -688,6 +694,8 @@ struct BuildRailToolbarWindow : Window {
 		if (IsSpecialHotkey(hotkey)) return this->ChangeRailTypeOnHotkey(hotkey);
 		/* While a blueprint is placed, R and C rotate and copy in the blueprint window. */
 		if ((hotkey == WID_RAT_REMOVE || hotkey == WID_RAT_CONVERT_RAIL) && _thd.GetCallbackWnd() != nullptr && _thd.GetCallbackWnd()->window_class == WindowClass::Blueprints) return EventState::NotHandled;
+		/* While a trunk line is placed, K toggles the placement in the trunk line window. */
+		if (hotkey == WID_RAT_TRUNK_LINE && _thd.GetCallbackWnd() != nullptr && _thd.GetCallbackWnd()->window_class == WindowClass::RailRoute) return EventState::NotHandled;
 		MarkTileDirtyByTile(TileVirtXY(_thd.pos.x, _thd.pos.y)); // redraw tile selection
 		return Window::OnHotkey(hotkey);
 	}
@@ -915,6 +923,7 @@ struct BuildRailToolbarWindow : Window {
 		Hotkey('R', "remove", WID_RAT_REMOVE),
 		Hotkey('C', "convert", WID_RAT_CONVERT_RAIL),
 		Hotkey('P', "blueprints", WID_RAT_BLUEPRINTS),
+		Hotkey('K', "trunk_line", WID_RAT_TRUNK_LINE),
 		Hotkey(WKC_L_BRACKET, "prev_railtype", to_underlying(SpecialListHotkeys::PreviousItem)),
 		Hotkey(WKC_R_BRACKET, "next_railtype", to_underlying(SpecialListHotkeys::NextItem)),
 		Hotkey(WKC_L_BRACKET | WKC_CTRL, "first_railtype", to_underlying(SpecialListHotkeys::FirstItem)),
@@ -962,6 +971,8 @@ static constexpr std::initializer_list<NWidgetPart> _nested_build_rail_widgets =
 						SetFill(0, 1), SetToolbarMinimalSize(1), SetSpriteTip(SPR_IMG_CONVERT_RAIL, STR_RAIL_TOOLBAR_TOOLTIP_CONVERT_RAIL),
 		NWidget(WWT_IMGBTN, Colours::DarkGreen, WID_RAT_BLUEPRINTS),
 						SetFill(0, 1), SetToolbarMinimalSize(1), SetSpriteTip(SPR_IMG_STORY_BOOK, STR_RAIL_TOOLBAR_TOOLTIP_BLUEPRINTS),
+		NWidget(WWT_IMGBTN, Colours::DarkGreen, WID_RAT_TRUNK_LINE),
+						SetFill(0, 1), SetToolbarMinimalSize(1), SetSpriteTip(SPR_IMG_BUILDRAIL, STR_RAIL_TOOLBAR_TOOLTIP_TRUNK_LINE),
 	EndContainer(),
 };
 
@@ -983,6 +994,16 @@ RailType GetSelectedRailType()
 {
 	if (!Company::IsValidID(_local_company) || !ValParamRailType(_cur_railtype)) return INVALID_RAILTYPE;
 	return _cur_railtype;
+}
+
+/**
+ * Get the signal variant the signal GUI uses: the one picked there by the player, or by default semaphores before
+ * the year set in the settings and electric signals after it.
+ * @return The signal variant.
+ */
+SignalVariant GetSelectedSignalVariant()
+{
+	return _cur_signal_variant;
 }
 
 /**
