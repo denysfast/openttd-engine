@@ -26,6 +26,8 @@
 #include "slope_type.h"
 #include "terraform_cmd.h"
 #include "tile_map.h"
+#include "bridge_map.h"
+#include "tunnelbridge_map.h"
 #include "debug.h"
 #include "strings_func.h"
 
@@ -52,6 +54,18 @@ struct RouteChunkReader {
 };
 
 /**
+ * Is a tile the end of a road bridge or tunnel of a town (or of nobody)?
+ * @param tile A tunnel or bridge end.
+ * @return True iff demolishing may remove it.
+ */
+static bool IsRemovableRoadTunnelBridge(TileIndex tile)
+{
+	if (GetTunnelBridgeTransportType(tile) != TransportType::Road) return false;
+	Owner owner = GetRoadOwner(tile, RoadTramType::Road);
+	return owner == OWNER_TOWN || owner == OWNER_NONE;
+}
+
+/**
  * Should a tile of the corridor be cleared before levelling?
  * Grass, rocks, fields and trees are cleared by the levelling and the track themselves.
  * @param tile The tile.
@@ -71,8 +85,25 @@ static bool IsRouteTileToClear(TileIndex tile, bool water, bool demolish)
 			return owner == OWNER_TOWN || owner == OWNER_NONE;
 		}
 		case TileType::Object: return demolish && GetTileOwner(tile) == OWNER_NONE;
+		case TileType::TunnelBridge: return demolish && IsRemovableRoadTunnelBridge(tile);
 		default: return false;
 	}
+}
+
+/**
+ * Get the tile to clear to free a tile of the corridor: the tile itself, or the head of a removable bridge above it.
+ * @param tile The tile.
+ * @param water Clear water.
+ * @param demolish Demolish town property.
+ * @return The tile to clear, or INVALID_TILE when nothing may be cleared.
+ */
+static TileIndex GetRouteClearTarget(TileIndex tile, bool water, bool demolish)
+{
+	if (IsBridgeAbove(tile)) {
+		TileIndex head = GetSouthernBridgeEnd(tile);
+		return demolish && IsRemovableRoadTunnelBridge(head) ? head : INVALID_TILE;
+	}
+	return IsRouteTileToClear(tile, water, demolish) ? tile : INVALID_TILE;
 }
 
 /**
@@ -189,9 +220,9 @@ std::tuple<CommandCost, Money, uint32_t, uint32_t, StringID> CmdPrepareRailRoute
 			for (uint y = oy + y0; y < oy + y0 + h && needed == 0; y++) {
 				for (uint x = ox + x0; x < ox + x0 + w && needed == 0; x++) {
 					if (x >= Map::MaxX() || y >= Map::MaxY()) continue;
-					TileIndex tile = TileXY(x, y);
-					if (!IsRouteTileToClear(tile, water, demolish)) continue;
-					if (attempt(tile, [&](DoCommandFlags f) { return Command<Commands::LandscapeClear>::Do(f, tile); })) done++;
+					TileIndex target = GetRouteClearTarget(TileXY(x, y), water, demolish);
+					if (target == INVALID_TILE) continue;
+					if (attempt(target, [&](DoCommandFlags f) { return Command<Commands::LandscapeClear>::Do(f, target); })) done++;
 				}
 			}
 		} else {
@@ -213,8 +244,8 @@ std::tuple<CommandCost, Money, uint32_t, uint32_t, StringID> CmdPrepareRailRoute
 						/* Something beside the corridor may be in the way of the reshaped land: clear it when the options allow and retry. */
 						lift_limits();
 						auto [test, extra, err_tile] = Command<Commands::TerraformLand>::Do(test_flags, tile, SLOPE_N, up);
-						if (exec && test.Failed() && clears < 8 && err_tile != INVALID_TILE && err_tile < Map::Size() && IsRouteTileToClear(err_tile, water, demolish) &&
-								attempt(err_tile, [&](DoCommandFlags f) { return Command<Commands::LandscapeClear>::Do(f, err_tile); })) {
+						TileIndex target = (exec && test.Failed() && err_tile != INVALID_TILE && err_tile < Map::Size()) ? GetRouteClearTarget(err_tile, water, demolish) : INVALID_TILE;
+						if (target != INVALID_TILE && clears < 8 && attempt(target, [&](DoCommandFlags f) { return Command<Commands::LandscapeClear>::Do(f, target); })) {
 							clears++;
 							i--;
 							continue;

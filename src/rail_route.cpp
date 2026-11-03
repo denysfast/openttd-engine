@@ -26,6 +26,7 @@
 #include <set>
 #include "rail_route.h"
 #include "bridge_map.h"
+#include "tunnelbridge_map.h"
 #include "house.h"
 #include "town_map.h"
 #include "economy_func.h"
@@ -188,7 +189,13 @@ public:
 	int64_t ObstacleCost(TileIndex tile) const
 	{
 		if (tile == INVALID_TILE) return ROUTE_BLOCKED_COST * 10;
-		int64_t cost = IsBridgeAbove(tile) ? ROUTE_BLOCKED_COST / 4 : 0;
+		int64_t cost = 0;
+		if (IsBridgeAbove(tile)) {
+			TileIndex head = GetSouthernBridgeEnd(tile);
+			bool removable = GetTunnelBridgeTransportType(head) == TransportType::Road &&
+					(GetRoadOwner(head, RoadTramType::Road) == OWNER_TOWN || GetRoadOwner(head, RoadTramType::Road) == OWNER_NONE);
+			cost = this->options.demolish && removable ? 20 : ROUTE_BLOCKED_COST;
+		}
 		switch (GetTileType(tile)) {
 			case TileType::Clear:
 			case TileType::Trees:
@@ -207,6 +214,12 @@ public:
 				return cost + ROUTE_BLOCKED_COST;
 			case TileType::Object:
 				return cost + (this->options.demolish && GetTileOwner(tile) == OWNER_NONE ? 30 : ROUTE_BLOCKED_COST);
+			case TileType::TunnelBridge:
+				if (this->options.demolish && GetTunnelBridgeTransportType(tile) == TransportType::Road) {
+					Owner owner = GetRoadOwner(tile, RoadTramType::Road);
+					if (owner == OWNER_TOWN || owner == OWNER_NONE) return cost + 20;
+				}
+				return cost + ROUTE_BLOCKED_COST;
 			default:
 				return cost + ROUTE_BLOCKED_COST;
 		}
@@ -585,6 +598,8 @@ public:
 			}
 		}
 		est.industries = static_cast<uint>(industries.size());
+		/* Demolition in towns costs more than the removal prices: the knock-on terraforming hits houses and roads beside. */
+		est.clearing = est.clearing * 6 / 5;
 
 		int64_t levels = 0;
 		for (int c = 0; c <= this->length + 1; c++) {
@@ -598,7 +613,7 @@ public:
 			}
 		}
 		/* Plus a margin for the knock-on effects at the ends and on diagonal edges. */
-		est.terraform = _price[Price::Terraform] * levels * 3 / 2;
+		est.terraform = _price[Price::Terraform] * levels * 2;
 		est.track = RailBuildCost(this->options.railtype) * static_cast<int64_t>(pieces) + _price[Price::BuildSignals] * static_cast<int64_t>(signals);
 	}
 
