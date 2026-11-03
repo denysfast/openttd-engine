@@ -387,6 +387,10 @@ add_files(
     rail_cmd.cpp
     rail_cmd.h
     rail_gui.cpp
+    rail_route.cpp
+    rail_route.h
+    rail_route_cmd.cpp
+    rail_route_cmd.h
     rail_gui.h
     rail_map.h
     rail_type.h

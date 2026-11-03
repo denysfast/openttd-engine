@@ -7,6 +7,7 @@ add_test_files(
     history_func.cpp
     landscape_partial_pixel_z.cpp
     math_func.cpp
+    rail_route.cpp
     mock_environment.h
     mock_fontcache.h
     mock_spritecache.cpp

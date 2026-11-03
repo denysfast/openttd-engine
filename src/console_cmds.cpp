@@ -11,6 +11,7 @@
 #include "core/string_consumer.hpp"
 #include "console_internal.h"
 #include "blueprint.h"
+#include "rail_route.h"
 #include "blueprint_gui.h"
 #include "debug.h"
 #include "engine_func.h"
@@ -3322,6 +3323,115 @@ static bool ConBlueprintWindow(std::span<std::string_view> argv)
 	return true;
 }
 
+/** Plan or build a rail trunk line. @copydoc IConsoleCmdProc */
+static bool ConRailRoute(std::span<std::string_view> argv)
+{
+	if (argv.empty()) {
+		IConsolePrint(CC_HELP, "Build a rail trunk line of parallel one-way tracks from x1,y1 to x2,y2. Usage: 'rail_route <x1> <y1> <x2> <y2> <tracks 1-30> [<company> [<options>]]'.");
+		IConsolePrint(CC_HELP, "Options, comma separated: signals=<interval|0>, water=0|1, demolish=0|1, sea=0|1, rt=<rail type label>, type=<signal type 0-5>, semaphore, plan (only show the plan).");
+		IConsolePrint(CC_HELP, "Company: 1-based; defaults to your company. Progress: 'blueprint_status'.");
+		return true;
+	}
+	if (argv.size() < 6 || argv.size() > 8) return false;
+
+	auto x1 = ParseBlueprintCoordinate(argv[1], Map::SizeX());
+	auto y1 = ParseBlueprintCoordinate(argv[2], Map::SizeY());
+	auto x2 = ParseBlueprintCoordinate(argv[3], Map::SizeX());
+	auto y2 = ParseBlueprintCoordinate(argv[4], Map::SizeY());
+	auto tracks = ParseType<uint>(argv[5]);
+	if (!x1.has_value() || !y1.has_value() || !x2.has_value() || !y2.has_value() || !tracks.has_value() || *tracks < 1 || *tracks > RailRouteOptions::MAX_TRACKS) {
+		IConsolePrint(CC_ERROR, "Invalid coordinates or number of tracks.");
+		return true;
+	}
+
+	CompanyID company = _local_company;
+	if (argv.size() > 6) {
+		auto c = ParseType<uint>(argv[6]);
+		if (!c.has_value() || *c == 0 || !Company::IsValidID(static_cast<CompanyID>(*c - 1))) {
+			IConsolePrint(CC_ERROR, "Unknown company '{}'.", argv[6]);
+			return true;
+		}
+		company = static_cast<CompanyID>(*c - 1);
+		if (!_network_server && _networking && company != _local_company) {
+			IConsolePrint(CC_ERROR, "Only the server can build for another company.");
+			return true;
+		}
+	}
+
+	RailRouteOptions options;
+	options.tracks = static_cast<uint8_t>(*tracks);
+	bool plan_only = false;
+	if (argv.size() > 7) {
+		std::string_view rest = argv[7];
+		while (!rest.empty()) {
+			size_t comma = rest.find(',');
+			std::string_view opt = rest.substr(0, comma);
+			rest = comma == std::string_view::npos ? std::string_view{} : rest.substr(comma + 1);
+			size_t eq = opt.find('=');
+			std::string_view key = opt.substr(0, eq);
+			std::string_view val = eq == std::string_view::npos ? std::string_view{} : opt.substr(eq + 1);
+			auto num = ParseType<uint>(val);
+			if (key == "plan") {
+				plan_only = true;
+			} else if (key == "semaphore") {
+				options.signal_variant = SignalVariant::Semaphore;
+			} else if (key == "signals" && num.has_value()) {
+				options.signals = *num > 0;
+				options.signal_interval = static_cast<uint8_t>(std::clamp<uint>(*num, 1, 255));
+			} else if (key == "type" && num.has_value() && *num < to_underlying(SignalType::End)) {
+				options.signal_type = static_cast<SignalType>(*num);
+			} else if (key == "water" && num.has_value()) {
+				options.remove_water = *num != 0;
+			} else if (key == "demolish" && num.has_value()) {
+				options.demolish = *num != 0;
+			} else if (key == "sea" && num.has_value()) {
+				options.raise_sea_level = *num != 0;
+			} else if (key == "rt" && val.size() == 4) {
+				RailTypeLabel label{};
+				for (size_t i = 0; i < 4; i++) label[i] = static_cast<uint8_t>(val[i]);
+				options.railtype = GetRailTypeByLabel(label);
+				if (options.railtype == INVALID_RAILTYPE) {
+					IConsolePrint(CC_ERROR, "Unknown rail type '{}'.", val);
+					return true;
+				}
+			} else {
+				IConsolePrint(CC_ERROR, "Unknown option '{}'.", opt);
+				return true;
+			}
+		}
+	}
+
+	auto start = std::chrono::steady_clock::now();
+	RailRoutePlan plan = PlanRailRoute(TileXY(*x1, *y1), TileXY(*x2, *y2), options);
+	auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - start).count();
+	if (!plan.error.empty()) {
+		IConsolePrint(CC_ERROR, "Cannot build the trunk line: {}.", plan.error);
+		return true;
+	}
+	const RailRouteEstimate &e = plan.estimate;
+	IConsolePrint(CC_INFO, "Trunk line: {} steps, {} bends, height {}..{}, {} track tiles, {} prepare + {} build commands; planned in {} ms.",
+		plan.length, plan.bends, plan.min_height, plan.max_height, plan.tracks.size(), plan.prepare.size(), plan.build.size(), ms);
+	IConsolePrint(CC_INFO, "Estimate: total {} (clearing {}, terraform {}, track {}); demolish {} houses, {} industries; fill {} water tiles; {} tiles cannot be cleared.",
+		static_cast<int64_t>(e.Total()), static_cast<int64_t>(e.clearing), static_cast<int64_t>(e.terraform), static_cast<int64_t>(e.track), e.houses, e.industries, e.water, e.blocked);
+	if (plan_only) return true;
+
+	if (!Company::IsValidID(company)) {
+		IConsolePrint(CC_ERROR, "No company to build for; give one.");
+		return true;
+	}
+	Money available = Company::Get(company)->money;
+	if (available < e.Total()) {
+		IConsolePrint(CC_ERROR, "Not enough money: the trunk line needs about {}, the company has {}.", static_cast<int64_t>(e.Total()), static_cast<int64_t>(available));
+		return true;
+	}
+	if (!StartConstructionJob(fmt::format("{},{} - {},{}", *x1, *y1, *x2, *y2), plan.origin, std::move(plan.prepare), std::move(plan.build), company, true)) {
+		IConsolePrint(CC_ERROR, "Another construction is running.");
+		return true;
+	}
+	IConsolePrint(CC_INFO, "Building the trunk line.");
+	return true;
+}
+
 /** List all road types and their configuration. */
 static void ConDumpRoadTypes()
 {
@@ -3639,6 +3749,7 @@ void IConsoleStdLibRegister()
 	IConsole::CmdRegister("blueprint_delete",        ConBlueprintDelete);
 	IConsole::CmdRegister("blueprint_compare",       ConBlueprintCompare);
 	IConsole::CmdRegister("blueprint_status",        ConBlueprintStatus);
+	IConsole::CmdRegister("rail_route",              ConRailRoute);
 	IConsole::CmdRegister("blueprint_window",        ConBlueprintWindow);
 
 	/* NewGRF development stuff */

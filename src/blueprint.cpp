@@ -14,6 +14,7 @@
 #include <set>
 #include "blueprint.h"
 #include "blueprint_cmd.h"
+#include "rail_route_cmd.h"
 #include "bridge_map.h"
 #include "command_func.h"
 #include "company_base.h"
@@ -960,7 +961,13 @@ BlueprintPastePlan PlanBlueprintPaste(const Blueprint &bp, TileIndex origin, con
 /* --- The paste job --- */
 
 static BlueprintPasteStatus _paste_status; ///< State of the current or last paste.
-static std::deque<BlueprintChunkData> _paste_queue; ///< Chunks not sent yet.
+/** A command of the construction job. */
+struct ConstructionJobChunk {
+	bool prepare_route; ///< A #Commands::PrepareRailRoute chunk; otherwise a #Commands::PasteBlueprint chunk.
+	BlueprintChunkData data; ///< The items.
+};
+static std::deque<ConstructionJobChunk> _paste_queue; ///< Chunks not sent yet.
+static bool _paste_is_route = false; ///< The job builds a trunk line, not a blueprint (for messages).
 static TileIndex _paste_origin = INVALID_TILE; ///< Origin of the chunks.
 static CompanyID _paste_company = CompanyID::Invalid(); ///< Company that pastes.
 static bool _paste_callback_seen = false; ///< The callback of the last posted command ran.
@@ -979,13 +986,15 @@ const BlueprintPasteStatus &GetBlueprintPasteStatus()
 	return _paste_status;
 }
 
+static void OnConstructionJobResult(const CommandCost &result, Money extra_money, uint32_t built, uint32_t failed, StringID last_error);
+
 /** Finish the paste job: report the result. */
 static void FinishBlueprintPaste()
 {
 	_paste_status.active = false;
 	_paste_queue.clear();
 	IConsolePrint(_paste_status.failed == 0 && !_paste_status.out_of_money && !_paste_status.aborted ? CC_INFO : CC_WARNING,
-		"Blueprint '{}' pasted: {} built, {} failed, cost {}{}{}{}.", _paste_status.name, _paste_status.built, _paste_status.failed, static_cast<int64_t>(_paste_status.cost),
+		"{} '{}' {}: {} built, {} failed, cost {}{}{}{}.", _paste_is_route ? "Trunk line" : "Blueprint", _paste_status.name, _paste_is_route ? "built" : "pasted", _paste_status.built, _paste_status.failed, static_cast<int64_t>(_paste_status.cost),
 		_paste_status.out_of_money ? ", stopped: out of money" : "",
 		_paste_status.aborted ? ", aborted" : "",
 		_paste_status.last_error != INVALID_STRING_ID && _paste_status.failed != 0 ? fmt::format(", last error: {}", GetString(_paste_status.last_error)) : "");
@@ -1001,6 +1010,32 @@ static void FinishBlueprintPaste()
  * @param last_error Error of the last failed item.
  */
 void CcPasteBlueprint(Commands, const CommandCost &result, Money extra_money, uint32_t built, uint32_t failed, StringID last_error)
+{
+	OnConstructionJobResult(result, extra_money, built, failed, last_error);
+}
+
+/**
+ * Result of one command preparing the corridor of a trunk line.
+ * @param result Cost, or the error when nothing was done.
+ * @param extra_money Money that was missing for the next step.
+ * @param done Tiles cleared and corners levelled.
+ * @param failed Steps that failed.
+ * @param last_error Error of the last failed step.
+ */
+void CcPrepareRailRoute(Commands, const CommandCost &result, Money extra_money, uint32_t done, uint32_t failed, StringID last_error)
+{
+	OnConstructionJobResult(result, extra_money, done, failed, last_error);
+}
+
+/**
+ * Account the result of one command of the construction job.
+ * @param result Cost of the built items, or the error when nothing was built.
+ * @param extra_money Money that was missing to build the next item.
+ * @param built Items built.
+ * @param failed Items that failed.
+ * @param last_error Error of the last failed item.
+ */
+static void OnConstructionJobResult(const CommandCost &result, Money extra_money, uint32_t built, uint32_t failed, StringID last_error)
 {
 	_paste_callback_seen = true;
 	if (!_paste_status.active) return;
@@ -1029,15 +1064,34 @@ void CcPasteBlueprint(Commands, const CommandCost &result, Money extra_money, ui
  */
 bool StartBlueprintPaste(std::string_view name, BlueprintPastePlan &&plan, CompanyID company)
 {
-	if (_paste_status.active || plan.chunks.empty()) return false;
+	return StartConstructionJob(name, plan.origin, {}, std::move(plan.chunks), company, false);
+}
+
+/**
+ * Start a construction job: first the commands preparing a trunk line corridor, then the blueprint paste commands.
+ * Only one job runs at a time; it reports through the blueprint paste status.
+ * @param name Name for messages.
+ * @param origin Origin of all chunks.
+ * @param prepare #Commands::PrepareRailRoute chunks.
+ * @param build #Commands::PasteBlueprint chunks.
+ * @param company Company that builds.
+ * @param route The job builds a trunk line (for messages).
+ * @return False when there is nothing to do or another job is running.
+ */
+bool StartConstructionJob(std::string_view name, TileIndex origin, std::vector<BlueprintChunkData> &&prepare, std::vector<BlueprintChunkData> &&build, CompanyID company, bool route)
+{
+	if (_paste_status.active || (prepare.empty() && build.empty())) return false;
 
 	_paste_status = {};
 	_paste_status.active = true;
 	_paste_status.name = name;
-	_paste_status.chunks_total = plan.chunks.size();
-	_paste_queue.assign(std::make_move_iterator(plan.chunks.begin()), std::make_move_iterator(plan.chunks.end()));
-	_paste_origin = plan.origin;
+	_paste_status.chunks_total = prepare.size() + build.size();
+	_paste_queue.clear();
+	for (auto &c : prepare) _paste_queue.push_back({true, std::move(c)});
+	for (auto &c : build) _paste_queue.push_back({false, std::move(c)});
+	_paste_origin = origin;
 	_paste_company = company;
+	_paste_is_route = route;
 	RunBlueprintPasteJob();
 	return true;
 }
@@ -1069,14 +1123,16 @@ void RunBlueprintPasteJob()
 			return;
 		}
 
-		BlueprintChunkData chunk = std::move(_paste_queue.front());
+		ConstructionJobChunk chunk = std::move(_paste_queue.front());
 		_paste_queue.pop_front();
 		_paste_status.chunks_sent++;
 		sent++;
 
 		_paste_callback_seen = false;
 		Backup<CompanyID> cur_company(_current_company, _paste_company);
-		bool ok = Command<Commands::PasteBlueprint>::Post(STR_NULL, CcPasteBlueprint, _paste_origin, chunk);
+		bool ok = chunk.prepare_route ?
+				Command<Commands::PrepareRailRoute>::Post(STR_NULL, CcPrepareRailRoute, _paste_origin, chunk.data) :
+				Command<Commands::PasteBlueprint>::Post(STR_NULL, CcPasteBlueprint, _paste_origin, chunk.data);
 		cur_company.Restore();
 		if (!ok && !_paste_callback_seen) {
 			/* Refused before execution, e.g. while the game is paused. */

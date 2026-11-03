@@ -26,6 +26,8 @@
 #include "station_map.h"
 #include "tunnelbridge_cmd.h"
 #include "waypoint_cmd.h"
+#include "debug.h"
+#include "strings_func.h"
 
 #include "table/strings.h"
 
@@ -82,12 +84,14 @@ std::tuple<CommandCost, Money, uint32_t, uint32_t, StringID> CmdPasteBlueprint(D
 	};
 
 	/* Build one item: test, check the money, execute. Returns whether the item was built. */
+	TileIndex item_tile = INVALID_TILE;
 	auto attempt = [&](auto &&build) -> bool {
 		CommandCost ret = build(test_flags);
 		if (ret.Failed()) {
 			if (ret.GetErrorMessage() != STR_ERROR_ALREADY_BUILT) {
 				failed++;
 				last_error = ret.GetErrorMessage();
+				if (exec && item_tile != INVALID_TILE) Debug(Facility::Misc, Severity::Info, "[blueprint] item failed at {}x{}: {}", TileX(item_tile), TileY(item_tile), GetString(last_error));
 			}
 			return false;
 		}
@@ -123,6 +127,7 @@ std::tuple<CommandCost, Money, uint32_t, uint32_t, StringID> CmdPasteBlueprint(D
 				TrackBits bits{r.U8()};
 				if (!r.ok || bits.None() || !TRACK_BIT_ALL.All(bits)) return {CMD_ERROR, 0, 0, 0, INVALID_STRING_ID};
 				TileIndex tile = tile_at(dx, dy);
+				item_tile = tile;
 				if (tile == INVALID_TILE) {
 					item_off_map();
 					break;
@@ -142,6 +147,7 @@ std::tuple<CommandCost, Money, uint32_t, uint32_t, StringID> CmdPasteBlueprint(D
 				Track track = static_cast<Track>(track_raw);
 				if (present == 0 || (present & ~SignalOnTrack(track)) != 0) return {CMD_ERROR, 0, 0, 0, INVALID_STRING_ID};
 				TileIndex tile = tile_at(dx, dy);
+				item_tile = tile;
 				if (tile == INVALID_TILE) {
 					item_off_map();
 					break;
@@ -160,6 +166,7 @@ std::tuple<CommandCost, Money, uint32_t, uint32_t, StringID> CmdPasteBlueprint(D
 				uint8_t dir_raw = r.U8();
 				if (!r.ok || dir_raw >= to_underlying(DiagDirection::End)) return {CMD_ERROR, 0, 0, 0, INVALID_STRING_ID};
 				TileIndex tile = tile_at(dx, dy);
+				item_tile = tile;
 				if (tile == INVALID_TILE) {
 					item_off_map();
 					break;

@@ -25,6 +25,7 @@
 #include "object_base.h"
 #include "autoreplace_cmd.h"
 #include "blueprint_cmd.h"
+#include "rail_route_cmd.h"
 #include "company_cmd.h"
 #include "depot_cmd.h"
 #include "economy_cmd.h"

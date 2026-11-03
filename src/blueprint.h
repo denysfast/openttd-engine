@@ -212,6 +212,7 @@ struct BlueprintPasteStatus {
 };
 
 bool StartBlueprintPaste(std::string_view name, BlueprintPastePlan &&plan, CompanyID company);
+bool StartConstructionJob(std::string_view name, TileIndex origin, std::vector<BlueprintChunkData> &&prepare, std::vector<BlueprintChunkData> &&build, CompanyID company, bool route);
 void AbortBlueprintPaste();
 const BlueprintPasteStatus &GetBlueprintPasteStatus();
 void RunBlueprintPasteJob();
