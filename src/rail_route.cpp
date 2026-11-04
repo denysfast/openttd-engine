@@ -665,19 +665,20 @@ private:
 };
 
 /**
- * Get the first track piece of a track of a route in a frame, on the map.
+ * Get a track piece near the start of a track of a route in a frame, on the map.
  * @param frame The frame.
  * @param k Offset of the track.
- * @param diagonal The route starts with a diagonal step.
- * @param index 0 for the first piece, 1 for the second one.
+ * @param diagonal The route starts with diagonal steps (otherwise with straight ones).
+ * @param index Index of the piece along the track, within the first run.
  * @return The tile (INVALID_TILE when off the map) and the track.
  */
 static std::pair<TileIndex, Track> GetStartPiece(const RouteFrame &frame, int k, bool diagonal, int index)
 {
-	/* Canonical pieces: a straight step is X at (0, k) then X at (1, k); a diagonal step Right at (0, k), then Left at (0, k + 1). */
-	int u = (!diagonal && index == 1) ? 1 : 0;
-	int v = k + ((diagonal && index == 1) ? 1 : 0);
-	Track canonical = diagonal ? (index == 0 ? Track::Right : Track::Left) : Track::X;
+	/* Canonical pieces: straight step s is X at (s, k); diagonal step s is Right at (s, s + k), then Left at (s, s + k + 1). */
+	int step = diagonal ? index / 2 : index;
+	int u = step;
+	int v = k + (diagonal ? step + (index % 2) : 0);
+	Track canonical = diagonal ? (index % 2 == 0 ? Track::Right : Track::Left) : Track::X;
 	auto [x, y] = frame.Tile(u, v);
 	auto [e1, e2] = _route_track_edges[to_underlying(canonical)];
 	Track track = TrackFromEdges(frame.Edge(e1), frame.Edge(e2));
@@ -804,28 +805,49 @@ RailRoutePlan PlanRailRoute(TileIndex from, TileIndex to, const RailRouteOptions
 		return plan;
 	}
 
-	RoutePlanner planner(options, frame, length, minor);
-	if (options.start != RailRouteStart::Auto) {
-		/* Find, for every piece of the fixed start, the track of this route that runs through it. */
-		bool diagonal = options.start == RailRouteStart::NS || options.start == RailRouteStart::EW;
+	if (options.start == RailRouteStart::Auto) {
+		RoutePlanner planner(options, frame, length, minor);
+		planner.Plan(plan);
+		return plan;
+	}
+
+	/* Find, for every piece of the fixed start, the track of this route that runs through it. In a frame turned
+	 * against the reference frame the tracks cross the start pieces at different steps: they start staggered.
+	 * When some of them would cross their start piece before the start tile, the route is planned from a few
+	 * diagonal steps further back; the pieces before the start pieces are never built. */
+	bool diagonal = options.start == RailRouteStart::NS || options.start == RailRouteStart::EW;
+	int k_range = 2 * static_cast<int>(options.tracks) + 6;
+	auto templ = GetStartTemplate(from, options.start, options.tracks);
+	for (int back = 0; back <= (diagonal ? static_cast<int>(options.tracks) + 3 : 0); back++) {
+		RouteFrame f = frame;
+		f.ax -= back * frame.sx;
+		f.ay -= back * frame.sy;
+		if (f.ax < 1 || f.ay < 1 || f.ax >= static_cast<int>(Map::MaxX()) || f.ay >= static_cast<int>(Map::MaxY())) break;
+		int len = length + back;
+		int mnr = minor + back;
+		/* Only pieces of the first run (diagonal for a diagonal start, straight for a straight one) can be start pieces. */
+		int first_run = diagonal ? mnr : len - mnr;
+		int max_index = std::min(diagonal ? 2 * first_run : first_run, 2 * static_cast<int>(options.tracks) + 2 * back + 6);
 		std::vector<std::pair<int, int>> tracks;
-		for (auto [tile, track] : GetStartTemplate(from, options.start, options.tracks)) {
+		for (auto [tile, track] : templ) {
 			bool found = false;
-			for (int k = -static_cast<int>(options.tracks) - 3; k <= static_cast<int>(options.tracks) + 3 && !found; k++) {
-				for (int index = 0; index < 2 && !found; index++) {
-					if (GetStartPiece(frame, k, diagonal, index) == std::make_pair(tile, track)) {
+			for (int k = -k_range; k <= k_range && !found; k++) {
+				for (int index = 0; index < max_index && !found; index++) {
+					if (GetStartPiece(f, k, diagonal, index) == std::make_pair(tile, track)) {
 						tracks.emplace_back(k, index);
 						found = true;
 					}
 				}
 			}
-			if (!found) {
-				plan.error = "the route does not fit the start";
-				return plan;
-			}
+			if (!found) break;
 		}
+		if (tracks.size() != templ.size()) continue;
+
+		RoutePlanner planner(options, f, len, mnr);
 		planner.SetTracks(std::move(tracks));
+		planner.Plan(plan);
+		return plan;
 	}
-	planner.Plan(plan);
+	plan.error = "the route does not fit the start";
 	return plan;
 }
