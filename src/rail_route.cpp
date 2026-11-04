@@ -486,9 +486,10 @@ public:
 				Track track = TrackFromEdges(this->frame.Edge(e1), this->frame.Edge(e2));
 				Trackdir trackdir = TrackExitdirToTrackdir(track, this->frame.Edge(TrackdirToExitdir(piece.trackdir)));
 				track_tiles[tile].Set(track);
-				/* One signal per track every interval steps, on the first piece of the step. */
+				/* One signal per track at its first piece, then every interval steps on the first piece of the step. */
 				bool first_piece = piece.track != Track::Left;
-				if (this->options.signals && first_piece && piece.step % std::max<int>(this->options.signal_interval, 1) == 0) {
+				int steps_in = piece.step - pieces[skip].step;
+				if (this->options.signals && (pi == skip || (first_piece && steps_in > 0 && steps_in % std::max<int>(this->options.signal_interval, 1) == 0))) {
 					signals.push_back({tile, track, trackdir});
 				}
 			}
