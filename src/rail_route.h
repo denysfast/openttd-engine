@@ -29,6 +29,16 @@
 #include "signal_type.h"
 #include "tile_type.h"
 
+/** Orientation of the track at the start of a trunk line, like the four track buttons of the rail toolbar. */
+enum class RailRouteStart : uint8_t {
+	Auto = 0, ///< Chosen by the planner from the end tile (the start moves with the end).
+	X = 1, ///< Straight along the x axis (north-east <-> south-west); the route starts with its straight run.
+	Y = 2, ///< Straight along the y axis (north-west <-> south-east); the route starts with its straight run.
+	NS = 3, ///< Diagonal, north <-> south on the screen (left and right track pieces); the route starts with its diagonal run.
+	EW = 4, ///< Diagonal, east <-> west on the screen (upper and lower track pieces); the route starts with its diagonal run.
+	End, ///< End marker.
+};
+
 /** Options of a trunk line. */
 struct RailRouteOptions {
 	static constexpr uint MAX_TRACKS = 30; ///< Maximum number of parallel tracks.
@@ -42,6 +52,7 @@ struct RailRouteOptions {
 	bool remove_water = true; ///< Clear water (sea, lakes, rivers, canals) in the corridor and fill it.
 	bool demolish = true; ///< Demolish town houses, industries and town roads in the corridor.
 	bool raise_sea_level = true; ///< Keep the corridor at least one level above the sea.
+	RailRouteStart start = RailRouteStart::Auto; ///< Orientation of the start; with it the tracks at the start tile never move.
 };
 
 /** Item kinds of a #Commands::PrepareRailRoute chunk. */
@@ -84,9 +95,11 @@ struct RailRoutePlan {
 	uint bends = 0; ///< Number of 45 degree bends.
 	int min_height = 0; ///< Lowest height of the track.
 	int max_height = 0; ///< Highest height of the track.
+	TileIndex end = INVALID_TILE; ///< End tile of the centre track; with a fixed start orientation the requested end may be moved into reach.
 };
 
 RailRoutePlan PlanRailRoute(TileIndex from, TileIndex to, const RailRouteOptions &options);
+std::vector<std::pair<TileIndex, TrackBits>> GetRailRouteStartPieces(TileIndex from, RailRouteStart start, uint8_t tracks);
 
 /* Exposed for the tests: the steps of a route and the pieces of its tracks in the canonical frame. */
 

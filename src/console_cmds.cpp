@@ -3329,7 +3329,7 @@ static bool ConRailRoute(std::span<std::string_view> argv)
 {
 	if (argv.empty()) {
 		IConsolePrint(CC_HELP, "Build a rail trunk line of parallel one-way tracks from x1,y1 to x2,y2. Usage: 'rail_route <x1> <y1> <x2> <y2> <tracks 1-30> [<company> [<options>]]'.");
-		IConsolePrint(CC_HELP, "Options, comma separated: signals=<interval|0>, water=0|1, demolish=0|1, sea=0|1, rt=<rail type label>, type=<signal type 0-5>, semaphore, plan (only show the plan).");
+		IConsolePrint(CC_HELP, "Options, comma separated: start=x|y|ns|ew (fixed start orientation), signals=<interval|0>, water=0|1, demolish=0|1, sea=0|1, rt=<rail type label>, type=<signal type 0-5>, semaphore, plan (only show the plan).");
 		IConsolePrint(CC_HELP, "Company: 1-based; defaults to your company. Progress: 'blueprint_status'.");
 		return true;
 	}
@@ -3374,6 +3374,15 @@ static bool ConRailRoute(std::span<std::string_view> argv)
 			auto num = ParseType<uint>(val);
 			if (key == "plan") {
 				plan_only = true;
+			} else if (key == "start") {
+				if (val == "x") options.start = RailRouteStart::X;
+				else if (val == "y") options.start = RailRouteStart::Y;
+				else if (val == "ns") options.start = RailRouteStart::NS;
+				else if (val == "ew") options.start = RailRouteStart::EW;
+				else {
+					IConsolePrint(CC_ERROR, "Start must be x, y, ns or ew.");
+					return true;
+				}
 			} else if (key == "semaphore") {
 				options.signal_variant = SignalVariant::Semaphore;
 			} else if (key == "signals" && num.has_value()) {
@@ -3414,7 +3423,20 @@ static bool ConRailRoute(std::span<std::string_view> argv)
 		plan.length, plan.bends, plan.min_height, plan.max_height, plan.tracks.size(), plan.prepare.size(), plan.build.size(), ms);
 	IConsolePrint(CC_INFO, "Estimate: total {} (clearing {}, terraform {}, track {}); demolish {} houses, {} industries; fill {} water tiles; {} tiles cannot be cleared.",
 		static_cast<int64_t>(e.Total()), static_cast<int64_t>(e.clearing), static_cast<int64_t>(e.terraform), static_cast<int64_t>(e.track), e.houses, e.industries, e.water, e.blocked);
-	if (plan_only) return true;
+	if (plan.end != INVALID_TILE && plan.end != TileXY(*x2, *y2)) IConsolePrint(CC_INFO, "End moved into reach of the start: {},{}.", TileX(plan.end), TileY(plan.end));
+	if (plan_only) {
+		if (options.start != RailRouteStart::Auto) {
+			/* The track the plan lays on the tiles of the fixed start: the same for every end. */
+			std::string start_tiles;
+			for (auto [tile, bits] : GetRailRouteStartPieces(TileXY(*x1, *y1), options.start, options.tracks)) {
+				auto it = std::ranges::lower_bound(plan.tracks, tile, {}, [](const auto &p) { return p.first; });
+				uint8_t planned = (it != plan.tracks.end() && it->first == tile) ? it->second.base() : 0;
+				format_append(start_tiles, " {},{}:{:02x}/{:02x}", TileX(tile), TileY(tile), bits.base(), planned & bits.base());
+			}
+			IConsolePrint(CC_INFO, "Start (tile:template/planned):{}", start_tiles);
+		}
+		return true;
+	}
 
 	if (!Company::IsValidID(company)) {
 		IConsolePrint(CC_ERROR, "No company to build for; give one.");

@@ -151,8 +151,9 @@ class RoutePlanner {
 	RouteFrame frame;
 	int length; ///< L: number of steps.
 	int minor; ///< M: number of diagonal steps.
-	int k0; ///< Offset of the first track from the centre line.
-	int k1; ///< Offset of the last track.
+	int k0; ///< Lowest offset (canonical v) of a track.
+	int k1; ///< Highest offset of a track.
+	std::vector<std::pair<int, int>> tracks; ///< Every track: its offset, and how many leading pieces it skips to start on the fixed start pieces.
 	int hlo = 0; ///< Lowest height the corridor may get.
 	int hhi = 0; ///< Highest height.
 	int end_height = 0; ///< Height at the end of the last step.
@@ -163,6 +164,22 @@ public:
 	{
 		this->k0 = -static_cast<int>((options.tracks - 1) / 2);
 		this->k1 = this->k0 + options.tracks - 1;
+		for (int k = this->k0; k <= this->k1; k++) this->tracks.emplace_back(k, 0);
+	}
+
+	/**
+	 * Use these tracks instead of the ones centred on the line from the start to the end.
+	 * @param tracks Every track: offset and leading pieces to skip.
+	 */
+	void SetTracks(std::vector<std::pair<int, int>> &&tracks)
+	{
+		this->tracks = std::move(tracks);
+		this->k0 = INT_MAX;
+		this->k1 = INT_MIN;
+		for (auto [k, skip] : this->tracks) {
+			this->k0 = std::min(this->k0, k);
+			this->k1 = std::max(this->k1, k);
+		}
 	}
 
 	/** Height of a canonical corner, or -1 when it is off the map. */
@@ -375,6 +392,11 @@ public:
 		for (bool diagonal_first : {false, true}) {
 			/* Without a straight or without a diagonal part both orders are the same route. */
 			if (diagonal_first && (this->minor == 0 || this->minor == this->length)) break;
+			/* A fixed start orientation fixes the order: a straight start begins with the straight run, a diagonal one with the diagonal run. */
+			RailRouteStart start = this->options.start;
+			bool straight_start = start == RailRouteStart::X || start == RailRouteStart::Y;
+			bool diagonal_start = start == RailRouteStart::NS || start == RailRouteStart::EW;
+			if ((straight_start && diagonal_first) || (diagonal_start && !diagonal_first && this->minor != this->length)) continue;
 			std::vector<bool> diagonal(this->length);
 			for (int u = 0; u < this->length; u++) diagonal[u] = diagonal_first ? u < this->minor : u >= this->length - this->minor;
 			std::vector<RailRouteStep> candidate;
@@ -455,8 +477,9 @@ public:
 		std::map<TileIndex, TrackBits> track_tiles;
 		struct SignalPos { TileIndex tile; Track track; Trackdir trackdir; };
 		std::vector<SignalPos> signals;
-		for (int k = this->k0; k <= this->k1; k++) {
-			for (const RailRoutePiece &piece : pieces) {
+		for (auto [k, skip] : this->tracks) {
+			for (size_t pi = skip; pi < pieces.size(); pi++) {
+				const RailRoutePiece &piece = pieces[pi];
 				TileIndex tile = this->MapTile(piece.u, piece.v + k);
 				if (tile == INVALID_TILE) continue;
 				auto [e1, e2] = _route_track_edges[to_underlying(piece.track)];
@@ -545,7 +568,7 @@ public:
 			build.Commit();
 		}
 
-		this->Estimate(plan, tile_rows, margin, corner_rows, column_height, pieces.size() * this->options.tracks, signals.size());
+		this->Estimate(plan, tile_rows, margin, corner_rows, column_height, pieces.size() * this->tracks.size(), signals.size());
 	}
 
 	/** Estimate the costs of the route. */
@@ -642,7 +665,84 @@ private:
 };
 
 /**
+ * Get the first track piece of a track of a route in a frame, on the map.
+ * @param frame The frame.
+ * @param k Offset of the track.
+ * @param diagonal The route starts with a diagonal step.
+ * @param index 0 for the first piece, 1 for the second one.
+ * @return The tile (INVALID_TILE when off the map) and the track.
+ */
+static std::pair<TileIndex, Track> GetStartPiece(const RouteFrame &frame, int k, bool diagonal, int index)
+{
+	/* Canonical pieces: a straight step is X at (0, k) then X at (1, k); a diagonal step Right at (0, k), then Left at (0, k + 1). */
+	int u = (!diagonal && index == 1) ? 1 : 0;
+	int v = k + ((diagonal && index == 1) ? 1 : 0);
+	Track canonical = diagonal ? (index == 0 ? Track::Right : Track::Left) : Track::X;
+	auto [x, y] = frame.Tile(u, v);
+	auto [e1, e2] = _route_track_edges[to_underlying(canonical)];
+	Track track = TrackFromEdges(frame.Edge(e1), frame.Edge(e2));
+	if (x < 0 || y < 0 || x >= static_cast<int>(Map::SizeX()) || y >= static_cast<int>(Map::SizeY())) return {INVALID_TILE, track};
+	return {TileXY(x, y), track};
+}
+
+/**
+ * Get the reference frame of a start orientation: the start pieces are the first pieces of its tracks.
+ * @param from The start tile.
+ * @param start The orientation.
+ * @return The frame.
+ */
+static RouteFrame GetStartReferenceFrame(TileIndex from, RailRouteStart start)
+{
+	int ax = TileX(from), ay = TileY(from);
+	switch (start) {
+		case RailRouteStart::Y: return {ax, ay, 1, 1, true};
+		case RailRouteStart::EW: return {ax, ay, 1, -1, false};
+		default: return {ax, ay, 1, 1, false};
+	}
+}
+
+/**
+ * Get the fixed start of a trunk line: the first piece of every track. It only depends on the start tile,
+ * the orientation and the number of tracks, never on the end.
+ * @param from The start tile: the first tile of the centre track.
+ * @param start The orientation (not Auto).
+ * @param tracks Number of tracks.
+ * @return Tile and track piece of every track, from one side of the corridor to the other.
+ */
+static std::vector<std::pair<TileIndex, Track>> GetStartTemplate(TileIndex from, RailRouteStart start, uint8_t tracks)
+{
+	RouteFrame ref = GetStartReferenceFrame(from, start);
+	bool diagonal = start == RailRouteStart::NS || start == RailRouteStart::EW;
+	std::vector<std::pair<TileIndex, Track>> result;
+	int lo = -static_cast<int>((tracks - 1) / 2);
+	for (int k = lo; k < lo + tracks; k++) result.push_back(GetStartPiece(ref, k, diagonal, 0));
+	return result;
+}
+
+/**
+ * Get the track pieces at the start of a trunk line with a fixed start orientation, for the preview before the start is placed.
+ * @param from The start tile.
+ * @param start The orientation; Auto gives nothing.
+ * @param tracks Number of tracks.
+ * @return Tiles with their track pieces.
+ */
+std::vector<std::pair<TileIndex, TrackBits>> GetRailRouteStartPieces(TileIndex from, RailRouteStart start, uint8_t tracks)
+{
+	std::vector<std::pair<TileIndex, TrackBits>> result;
+	if (start == RailRouteStart::Auto || start >= RailRouteStart::End || from >= Map::Size() || tracks < 1) return result;
+	std::map<TileIndex, TrackBits> tiles;
+	for (auto [tile, track] : GetStartTemplate(from, start, tracks)) {
+		if (tile != INVALID_TILE) tiles[tile].Set(track);
+	}
+	result.assign(tiles.begin(), tiles.end());
+	return result;
+}
+
+/**
  * Plan a trunk line from one tile to another.
+ * With a fixed start orientation the route begins with a run in that orientation, the tracks at the start tile are
+ * always the same, and an end out of reach is moved: a straight start reaches at most 45 degrees sideways, a diagonal
+ * start the quarter between its diagonal and the axes.
  * @param from The start tile: the first tile of the centre track.
  * @param to The end tile: the last tile of the centre track.
  * @param options The options.
@@ -662,7 +762,41 @@ RailRoutePlan PlanRailRoute(TileIndex from, TileIndex to, const RailRouteOptions
 
 	int dx = static_cast<int>(TileX(to)) - static_cast<int>(TileX(from));
 	int dy = static_cast<int>(TileY(to)) - static_cast<int>(TileY(from));
-	RouteFrame frame{static_cast<int>(TileX(from)), static_cast<int>(TileY(from)), dx < 0 ? -1 : 1, dy < 0 ? -1 : 1, std::abs(dy) > std::abs(dx)};
+	bool swap = std::abs(dy) > std::abs(dx);
+
+	/* A fixed start: keep the end in reach of the start orientation. */
+	switch (options.start) {
+		case RailRouteStart::Auto: break;
+		case RailRouteStart::X:
+		case RailRouteStart::Y: {
+			int &major = options.start == RailRouteStart::X ? dx : dy;
+			int &side = options.start == RailRouteStart::X ? dy : dx;
+			if (major == 0) {
+				plan.error = "the end must lie in the direction of the start";
+				return plan;
+			}
+			/* At least one straight step: the start tile holds straight track. */
+			int reach = std::abs(major) - 1;
+			if (std::abs(side) > reach) side = side < 0 ? -reach : reach;
+			swap = options.start == RailRouteStart::Y;
+			break;
+		}
+		case RailRouteStart::NS:
+		case RailRouteStart::EW: {
+			bool same_sign = options.start == RailRouteStart::NS;
+			if (dx == 0 || dy == 0 || ((dx > 0) == (dy > 0)) != same_sign) {
+				plan.error = "the end must lie in the direction of the start";
+				return plan;
+			}
+			break;
+		}
+		default:
+			plan.error = "invalid start orientation";
+			return plan;
+	}
+	plan.end = TileXY(TileX(from) + dx, TileY(from) + dy);
+
+	RouteFrame frame{static_cast<int>(TileX(from)), static_cast<int>(TileY(from)), dx < 0 ? -1 : 1, dy < 0 ? -1 : 1, swap};
 	int length = std::max(std::abs(dx), std::abs(dy));
 	int minor = std::min(std::abs(dx), std::abs(dy));
 	if (length < 2) {
@@ -671,6 +805,27 @@ RailRoutePlan PlanRailRoute(TileIndex from, TileIndex to, const RailRouteOptions
 	}
 
 	RoutePlanner planner(options, frame, length, minor);
+	if (options.start != RailRouteStart::Auto) {
+		/* Find, for every piece of the fixed start, the track of this route that runs through it. */
+		bool diagonal = options.start == RailRouteStart::NS || options.start == RailRouteStart::EW;
+		std::vector<std::pair<int, int>> tracks;
+		for (auto [tile, track] : GetStartTemplate(from, options.start, options.tracks)) {
+			bool found = false;
+			for (int k = -static_cast<int>(options.tracks) - 3; k <= static_cast<int>(options.tracks) + 3 && !found; k++) {
+				for (int index = 0; index < 2 && !found; index++) {
+					if (GetStartPiece(frame, k, diagonal, index) == std::make_pair(tile, track)) {
+						tracks.emplace_back(k, index);
+						found = true;
+					}
+				}
+			}
+			if (!found) {
+				plan.error = "the route does not fit the start";
+				return plan;
+			}
+		}
+		planner.SetTracks(std::move(tracks));
+	}
 	planner.Plan(plan);
 	return plan;
 }
