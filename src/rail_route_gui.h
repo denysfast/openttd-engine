@@ -18,7 +18,8 @@
 struct RailRoutePreviewTile {
 	TrackBits tracks{}; ///< Planned track on the tile.
 	bool start = false; ///< The tile is the start tile of the route.
-	bool red = false; ///< Draw in red: the company cannot afford the route.
+	bool end = false; ///< The tile is the end tile of the route (where the line really ends, which may differ from the cursor).
+	bool red = false; ///< Draw in red: the route cannot be built here or the company cannot afford it.
 };
 
 Window *ShowRailRouteWindow();

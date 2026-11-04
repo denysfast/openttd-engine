@@ -2924,6 +2924,12 @@ STR_ERROR_BLUEPRINT_PASTE_RUNNING                               :{WHITE}... anot
 STR_RAIL_ROUTE_CAPTION                                          :{WHITE}Trunk Line
 STR_RAIL_ROUTE_TRACKS                                           :{BLACK}Tracks:
 STR_RAIL_ROUTE_TRACKS_TOOLTIP                                   :{BLACK}Number of parallel one-way tracks, 1 to 30. Hotkeys: comma and period
+STR_RAIL_ROUTE_START                                            :{BLACK}Start:
+STR_RAIL_ROUTE_START_TOOLTIP                                    :{BLACK}Orientation of the track at the start of the line; the start does not move when the end is chosen
+STR_RAIL_ROUTE_START_NS_TOOLTIP                                 :{BLACK}Start diagonally, north-south on the screen. The end lies in the quarter between this diagonal and the axes. Hotkey while placing: 1
+STR_RAIL_ROUTE_START_X_TOOLTIP                                  :{BLACK}Start straight along the X axis (north-east - south-west). The end lies at most 45 degrees to the side. Hotkey while placing: 2
+STR_RAIL_ROUTE_START_EW_TOOLTIP                                 :{BLACK}Start diagonally, east-west on the screen. The end lies in the quarter between this diagonal and the axes. Hotkey while placing: 3
+STR_RAIL_ROUTE_START_Y_TOOLTIP                                  :{BLACK}Start straight along the Y axis (north-west - south-east). The end lies at most 45 degrees to the side. Hotkey while placing: 4
 STR_RAIL_ROUTE_SIGNALS                                          :{BLACK}Signals, every (tiles):
 STR_RAIL_ROUTE_SIGNALS_TOOLTIP                                  :{BLACK}Build one-way path signals on every track, in the direction from the start to the end
 STR_RAIL_ROUTE_INTERVAL_TOOLTIP                                 :{BLACK}Distance between signals along the line, 1 to 20 tiles
@@ -2934,16 +2940,17 @@ STR_RAIL_ROUTE_DEMOLISH_TOOLTIP                                 :{BLACK}Demolish
 STR_RAIL_ROUTE_SEA                                              :{BLACK}Raise land at sea level
 STR_RAIL_ROUTE_SEA_TOOLTIP                                      :{BLACK}Keep the line at least one level above the sea, raising the land where needed
 STR_RAIL_ROUTE_BUILD                                            :{BLACK}Build
-STR_RAIL_ROUTE_BUILD_TOOLTIP                                    :{BLACK}Click the start tile on the map, then the end tile: the line follows the mouse as a preview and is built at the second click with the rail type of the railway toolbar. Stays active for more lines until Esc or right-click. Hotkey: K
+STR_RAIL_ROUTE_BUILD_TOOLTIP                                    :{BLACK}Choose the orientation of the start, then aim the start of the line with the mouse and click: the start is fixed. Then click the end: the line follows the mouse as a preview and is built at the second click with the rail type of the railway toolbar. Stays active for more lines until Esc or right-click. Hotkey: K
 STR_RAIL_ROUTE_ABORT                                            :{BLACK}Abort construction
 STR_RAIL_ROUTE_ABORT_TOOLTIP                                    :{BLACK}Stop the running construction; what was already built stays
 STR_RAIL_ROUTE_INFO_RAILTYPE                                    :{BLACK}Rail type: {GOLD}{STRING}{BLACK}, signals: {GOLD}{STRING}
 STR_RAIL_ROUTE_INFO_ELECTRIC                                    :electric
 STR_RAIL_ROUTE_INFO_SEMAPHORE                                   :semaphores
-STR_RAIL_ROUTE_INFO_IDLE                                        :{BLACK}Press "Build", then click the start and the end of the line
-STR_RAIL_ROUTE_INFO_PICK_START                                  :{YELLOW}Click the start tile of the line
+STR_RAIL_ROUTE_INFO_IDLE                                        :{BLACK}Choose the orientation of the start, press "Build", then click the start and the end of the line
+STR_RAIL_ROUTE_INFO_PICK_START                                  :{YELLOW}Aim the start of the line and click: the start stays fixed
 STR_RAIL_ROUTE_INFO_PICK_END                                    :{YELLOW}Click the end tile of the line (start {NUM},{NUM})
 STR_RAIL_ROUTE_INFO_ERROR                                       :{RED}Cannot build: {RAW_STRING}
+STR_RAIL_ROUTE_INFO_END_MOVED                                   :{YELLOW}End out of reach of the start, moved to {NUM},{NUM}
 STR_RAIL_ROUTE_INFO_LENGTH                                      :{BLACK}Length {GOLD}{COMMA}{BLACK}, {GOLD}{COMMA}{BLACK} bend{P "" s}, {GOLD}{COMMA}{BLACK} track tile{P "" s}, height {NUM}..{NUM}
 STR_RAIL_ROUTE_INFO_COST                                        :{BLACK}Estimated cost: {GOLD}{CURRENCY_LONG}
 STR_RAIL_ROUTE_INFO_COST_PARTS                                  :{BLACK}Clearing {CURRENCY_LONG}, terraforming {CURRENCY_LONG}, track {CURRENCY_LONG}
@@ -2958,6 +2965,9 @@ STR_RAIL_ROUTE_ERROR_INVALID_TRACKS                             :invalid number 
 STR_RAIL_ROUTE_ERROR_TOO_SHORT                                  :the route is too short
 STR_RAIL_ROUTE_ERROR_NO_ROUTE                                   :no route found
 STR_RAIL_ROUTE_ERROR_DOES_NOT_FIT                               :the corridor does not fit on the map
+STR_RAIL_ROUTE_ERROR_WRONG_DIRECTION                            :the end must lie in the direction of the start
+STR_RAIL_ROUTE_ERROR_START_MISMATCH                             :the route does not fit the start
+STR_RAIL_ROUTE_ERROR_INVALID_START                              :invalid start orientation
 
 STR_ERROR_RAIL_ROUTE_CAN_T_BUILD                                :{WHITE}Can't build the trunk line...
 STR_ERROR_RAIL_ROUTE_DETAIL                                     :{WHITE}... {RAW_STRING}

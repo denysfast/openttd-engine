@@ -694,8 +694,9 @@ struct BuildRailToolbarWindow : Window {
 		if (IsSpecialHotkey(hotkey)) return this->ChangeRailTypeOnHotkey(hotkey);
 		/* While a blueprint is placed, R and C rotate and copy in the blueprint window. */
 		if ((hotkey == WID_RAT_REMOVE || hotkey == WID_RAT_CONVERT_RAIL) && _thd.GetCallbackWnd() != nullptr && _thd.GetCallbackWnd()->window_class == WindowClass::Blueprints) return EventState::NotHandled;
-		/* While a trunk line is placed, K toggles the placement in the trunk line window. */
-		if (hotkey == WID_RAT_TRUNK_LINE && _thd.GetCallbackWnd() != nullptr && _thd.GetCallbackWnd()->window_class == WindowClass::RailRoute) return EventState::NotHandled;
+		/* While a trunk line is placed, K toggles the placement and 1-4 choose the start orientation in the trunk line window. */
+		if ((hotkey == WID_RAT_TRUNK_LINE || hotkey == WID_RAT_BUILD_NS || hotkey == WID_RAT_BUILD_X || hotkey == WID_RAT_BUILD_EW || hotkey == WID_RAT_BUILD_Y) &&
+				_thd.GetCallbackWnd() != nullptr && _thd.GetCallbackWnd()->window_class == WindowClass::RailRoute) return EventState::NotHandled;
 		MarkTileDirtyByTile(TileVirtXY(_thd.pos.x, _thd.pos.y)); // redraw tile selection
 		return Window::OnHotkey(hotkey);
 	}

@@ -8,11 +8,14 @@
 /**
  * @file rail_route_gui.cpp GUI of the rail trunk line tool.
  *
- * The trunk line window holds the options of the route (number of tracks, signals, what may be cleared) and the
- * placement tool: the first click on the map picks the start tile, the second one the end tile, which plans the
- * route and starts building it. While the end tile is being chosen, the route to the tile under the cursor is
- * planned again whenever that tile changes, but not more often than every #PREVIEW_MIN_INTERVAL (longer for routes
- * that take long to plan), and the viewport draws its track pieces from #GetRailRoutePreviewTile.
+ * The trunk line window holds the options of the route (orientation of the start, number of tracks, signals, what
+ * may be cleared) and the placement tool. Before the first click the start pieces of all tracks (#GetRailRouteStartPieces)
+ * follow the cursor; the first click fixes the start, which never moves afterwards (the orientation is always fixed,
+ * so the planner keeps the tracks at the start tile whatever the end). While the end tile is being chosen, the route
+ * to the tile under the cursor is planned again whenever that tile changes, but not more often than every
+ * #PREVIEW_MIN_INTERVAL (longer for routes that take long to plan); an end out of reach of the start is moved into
+ * reach by the planner and marked. The second click builds the route. The viewport draws the preview from
+ * #GetRailRoutePreviewTile.
  *
  * The window changes the game only through #StartConstructionJob, which sends network commands.
  */
@@ -50,15 +53,33 @@ static constexpr std::chrono::milliseconds PREVIEW_MAX_INTERVAL{2000};
 /** Largest distance between signals that can be chosen. */
 static constexpr uint8_t MAX_SIGNAL_INTERVAL = 20;
 
-/** Options of the trunk line window; the rail type and the signal variant are taken from the rail GUI when planning. Remembered while the game runs. */
-static RailRouteOptions _rail_route_options;
+/**
+ * Get the default options of the trunk line window: those of the planner with a straight start along the x axis.
+ * @return The options.
+ */
+static RailRouteOptions GetDefaultRailRouteOptions()
+{
+	RailRouteOptions options;
+	options.start = RailRouteStart::X;
+	return options;
+}
+
+/**
+ * Options of the trunk line window; the rail type and the signal variant are taken from the rail GUI when planning.
+ * The start orientation is never Auto here. Remembered while the game runs.
+ */
+static RailRouteOptions _rail_route_options = GetDefaultRailRouteOptions();
+
+/** The start orientation of each orientation button, in the order of the widgets (as in the rail toolbar). */
+static constexpr RailRouteStart RAIL_ROUTE_START_BUTTONS[] = {RailRouteStart::NS, RailRouteStart::X, RailRouteStart::EW, RailRouteStart::Y};
 
 /** The route preview shown while the end tile is chosen. */
 struct RailRoutePreview {
-	bool active = false; ///< The trunk line window is choosing the end tile.
-	TileIndex start = INVALID_TILE; ///< Start tile of the route.
-	std::vector<std::pair<TileIndex, TrackBits>> tracks{}; ///< Planned track per tile, sorted by tile.
-	bool red = false; ///< The company cannot afford the planned route.
+	bool active = false; ///< The trunk line window is placing a route.
+	TileIndex start = INVALID_TILE; ///< Start tile of the route (under the cursor until the start is fixed).
+	TileIndex end = INVALID_TILE; ///< Tile where the planned route ends, or INVALID_TILE.
+	std::vector<std::pair<TileIndex, TrackBits>> tracks{}; ///< Planned track (or only the start pieces) per tile, sorted by tile.
+	bool red = false; ///< The route cannot be built towards the cursor, or the company cannot afford it.
 };
 
 static RailRoutePreview _rail_route_preview; ///< The route preview.
@@ -81,6 +102,7 @@ RailRoutePreviewTile GetRailRoutePreviewTile(TileIndex tile)
 {
 	RailRoutePreviewTile result;
 	result.start = tile == _rail_route_preview.start;
+	result.end = tile == _rail_route_preview.end;
 	result.red = _rail_route_preview.red;
 	const auto &tracks = _rail_route_preview.tracks;
 	auto it = std::ranges::lower_bound(tracks, tile, {}, &std::pair<TileIndex, TrackBits>::first);
@@ -101,6 +123,9 @@ static std::string GetRailRouteErrorText(const std::string &error)
 		{"the route is too short", STR_RAIL_ROUTE_ERROR_TOO_SHORT},
 		{"no route found", STR_RAIL_ROUTE_ERROR_NO_ROUTE},
 		{"the corridor does not fit on the map", STR_RAIL_ROUTE_ERROR_DOES_NOT_FIT},
+		{"the end must lie in the direction of the start", STR_RAIL_ROUTE_ERROR_WRONG_DIRECTION},
+		{"the route does not fit the start", STR_RAIL_ROUTE_ERROR_START_MISMATCH},
+		{"invalid start orientation", STR_RAIL_ROUTE_ERROR_INVALID_START},
 	};
 	for (const auto &[text, string] : known) {
 		if (error == text) return GetString(string);
@@ -113,13 +138,15 @@ struct RailRouteWindow : Window {
 	/** What the window is doing with the mouse on the map. */
 	enum class Mode : uint8_t {
 		None, ///< Nothing.
-		PickStart, ///< Waiting for the click on the start tile.
-		PickEnd, ///< Waiting for the click on the end tile, showing the preview.
+		PickStart, ///< Waiting for the click on the start tile; the start pieces follow the cursor.
+		PickEnd, ///< The start is fixed; waiting for the click on the end tile, showing the route to the cursor.
 	};
 
 	/** What is known about the last planned route, without its commands. */
 	struct Summary {
 		bool valid = false; ///< A route was planned.
+		TileIndex requested_end = INVALID_TILE; ///< End tile the route was planned to.
+		TileIndex end = INVALID_TILE; ///< End tile of the plan; differs from the requested one when that was out of reach.
 		std::string error{}; ///< Error of the planner, untranslated; empty when the route can be built.
 		RailRouteEstimate estimate{}; ///< Estimated costs.
 		uint length = 0; ///< Length in steps.
@@ -130,18 +157,32 @@ struct RailRouteWindow : Window {
 	};
 
 	Mode mode = Mode::None; ///< Current map tool.
-	TileIndex start_tile = INVALID_TILE; ///< Start tile, when choosing the end tile.
-	TileIndex planned_end = INVALID_TILE; ///< End tile of the plan of the preview.
-	bool plan_stale = false; ///< The options changed since the preview was planned.
+	TileIndex start_tile = INVALID_TILE; ///< The fixed start tile, when choosing the end tile.
+	TileIndex planned_end = INVALID_TILE; ///< Tile under the cursor the preview was made for (the start tile before the start is fixed).
+	bool plan_stale = false; ///< The options changed since the preview was made.
 	RailType planned_railtype = INVALID_RAILTYPE; ///< Rail type the preview was planned with.
 	Summary summary{}; ///< The last planned route (preview or built).
 	std::chrono::steady_clock::time_point last_plan{}; ///< When the preview was planned last.
 	std::chrono::milliseconds last_plan_duration{0}; ///< How long planning the preview took last.
+	RailType sprites_railtype = INVALID_RAILTYPE; ///< Rail type of the sprites on the orientation buttons.
 
 	RailRouteWindow(WindowDesc &desc, WindowNumber window_number) : Window(desc)
 	{
 		this->InitNested(window_number);
+		this->UpdateOrientationSprites();
 		this->UpdateButtons();
+	}
+
+	/** Show the track sprites of the rail type selected in the rail toolbar on the orientation buttons. */
+	void UpdateOrientationSprites()
+	{
+		RailType rt = GetSelectedRailType();
+		const RailTypeInfo *rti = GetRailTypeInfo(rt == INVALID_RAILTYPE ? RAILTYPE_RAIL : rt);
+		this->GetWidget<NWidgetCore>(WID_RR_START_NS)->SetSprite(rti->gui_sprites.build_ns_rail);
+		this->GetWidget<NWidgetCore>(WID_RR_START_X)->SetSprite(rti->gui_sprites.build_x_rail);
+		this->GetWidget<NWidgetCore>(WID_RR_START_EW)->SetSprite(rti->gui_sprites.build_ew_rail);
+		this->GetWidget<NWidgetCore>(WID_RR_START_Y)->SetSprite(rti->gui_sprites.build_y_rail);
+		this->sprites_railtype = rt;
 	}
 
 	void Close([[maybe_unused]] int data = 0) override
@@ -181,6 +222,9 @@ struct RailRouteWindow : Window {
 		const RailRouteOptions &o = _rail_route_options;
 		this->SetWidgetDisabledState(WID_RR_BUILD, !Company::IsValidID(_local_company));
 		this->SetWidgetLoweredState(WID_RR_BUILD, this->mode != Mode::None);
+		for (WidgetID widget = WID_RR_START_NS; widget <= WID_RR_START_Y; widget++) {
+			this->SetWidgetLoweredState(widget, RAIL_ROUTE_START_BUTTONS[widget - WID_RR_START_NS] == o.start);
+		}
 		this->SetWidgetDisabledState(WID_RR_TRACKS_DECREASE, o.tracks <= 1);
 		this->SetWidgetDisabledState(WID_RR_TRACKS_INCREASE, o.tracks >= RailRouteOptions::MAX_TRACKS);
 		this->SetWidgetLoweredState(WID_RR_SIGNALS, o.signals);
@@ -205,9 +249,11 @@ struct RailRouteWindow : Window {
 	 * Remember what is shown about a plan.
 	 * @param plan The plan.
 	 */
-	void Summarise(const RailRoutePlan &plan)
+	void Summarise(const RailRoutePlan &plan, TileIndex requested_end)
 	{
 		this->summary.valid = true;
+		this->summary.requested_end = requested_end;
+		this->summary.end = plan.end;
 		this->summary.error = plan.error;
 		this->summary.estimate = plan.estimate;
 		this->summary.length = plan.length;
@@ -226,29 +272,78 @@ struct RailRouteWindow : Window {
 	}
 
 	/**
-	 * Plan the route from the start tile to a tile and show it as the preview.
-	 * @param end The end tile.
+	 * Show only the start pieces of all tracks at a start tile as the preview.
+	 * @param start The start tile.
+	 * @param red Draw them in red: the route cannot be built towards the cursor.
+	 */
+	void ShowStartPreview(TileIndex start, bool red)
+	{
+		_rail_route_preview.active = true;
+		_rail_route_preview.start = start;
+		_rail_route_preview.end = INVALID_TILE;
+		_rail_route_preview.red = red;
+		_rail_route_preview.tracks = GetRailRouteStartPieces(start, _rail_route_options.start, _rail_route_options.tracks);
+	}
+
+	/**
+	 * Before the start is fixed: show the start pieces at the tile under the cursor.
+	 * @param tile The tile under the cursor.
+	 */
+	void PreviewStart(TileIndex tile)
+	{
+		this->planned_end = tile;
+		this->plan_stale = false;
+		this->ShowStartPreview(tile, false);
+		/* The start of many tracks covers many tiles; it is cheap to redraw. */
+		MarkWholeScreenDirty();
+	}
+
+	/**
+	 * After the start is fixed: plan the route from the start tile to a tile and show it as the preview.
+	 * @param end The end tile (under the cursor).
 	 */
 	void PlanPreview(TileIndex end)
 	{
 		RailRouteOptions options = GetOptions();
-		auto begin = std::chrono::steady_clock::now();
-		RailRoutePlan plan = PlanRailRoute(this->start_tile, end, options);
-		auto now = std::chrono::steady_clock::now();
-		this->last_plan = now;
-		this->last_plan_duration = std::chrono::duration_cast<std::chrono::milliseconds>(now - begin);
 		this->planned_end = end;
 		this->planned_railtype = options.railtype;
 		this->plan_stale = false;
 
-		this->Summarise(plan);
-		_rail_route_preview.active = true;
-		_rail_route_preview.start = this->start_tile;
-		_rail_route_preview.red = !CanAfford(plan.estimate);
-		_rail_route_preview.tracks = std::move(plan.tracks);
+		if (end == this->start_tile) {
+			/* Nothing to plan; show the fixed start. */
+			this->summary = {};
+			this->ShowStartPreview(this->start_tile, false);
+		} else {
+			auto begin = std::chrono::steady_clock::now();
+			RailRoutePlan plan = PlanRailRoute(this->start_tile, end, options);
+			auto now = std::chrono::steady_clock::now();
+			this->last_plan = now;
+			this->last_plan_duration = std::chrono::duration_cast<std::chrono::milliseconds>(now - begin);
+
+			this->Summarise(plan, end);
+			if (!plan.error.empty() || plan.tracks.empty()) {
+				/* Wrong direction or no route: only the fixed start, in red. */
+				this->ShowStartPreview(this->start_tile, true);
+			} else {
+				_rail_route_preview.active = true;
+				_rail_route_preview.start = this->start_tile;
+				_rail_route_preview.end = plan.end;
+				_rail_route_preview.red = !CanAfford(plan.estimate);
+				_rail_route_preview.tracks = std::move(plan.tracks);
+			}
+		}
 		/* The route can be anywhere on the screen. */
 		MarkWholeScreenDirty();
 		this->SetWidgetDirty(WID_RR_INFO);
+	}
+
+	/** Release the fixed start: the start pieces follow the cursor again. */
+	void ReleaseStart()
+	{
+		this->mode = Mode::PickStart;
+		this->start_tile = INVALID_TILE;
+		this->summary = {};
+		this->plan_stale = true;
 	}
 
 	/**
@@ -266,7 +361,7 @@ struct RailRouteWindow : Window {
 		}
 
 		RailRoutePlan plan = PlanRailRoute(this->start_tile, end, GetOptions());
-		this->Summarise(plan);
+		this->Summarise(plan, end);
 		this->SetWidgetDirty(WID_RR_INFO);
 		if (!plan.error.empty()) {
 			ShowErrorMessage(GetEncodedString(STR_ERROR_RAIL_ROUTE_CAN_T_BUILD), GetEncodedString(STR_ERROR_RAIL_ROUTE_DETAIL, GetRailRouteErrorText(plan.error)), WarningLevel::Info, x, y);
@@ -278,7 +373,7 @@ struct RailRouteWindow : Window {
 			ShowErrorMessage(GetEncodedString(STR_ERROR_RAIL_ROUTE_CAN_T_BUILD), GetEncodedString(STR_ERROR_RAIL_ROUTE_NOT_ENOUGH_MONEY, needed, available), WarningLevel::Info, x, y);
 			return;
 		}
-		std::string name = fmt::format("{},{} - {},{}", TileX(this->start_tile), TileY(this->start_tile), TileX(end), TileY(end));
+		std::string name = fmt::format("{},{} - {},{}", TileX(this->start_tile), TileY(this->start_tile), TileX(plan.end), TileY(plan.end));
 		if (!StartConstructionJob(name, plan.origin, std::move(plan.prepare), std::move(plan.build), _local_company, true)) {
 			ShowErrorMessage(GetEncodedString(STR_ERROR_RAIL_ROUTE_CAN_T_BUILD), GetEncodedString(STR_ERROR_RAIL_ROUTE_JOB_RUNNING), WarningLevel::Info, x, y);
 		}
@@ -310,6 +405,7 @@ struct RailRouteWindow : Window {
 			return lines;
 		}
 		const RailRouteEstimate &e = s.estimate;
+		if (s.end != s.requested_end && s.end != INVALID_TILE) lines.push_back(GetString(STR_RAIL_ROUTE_INFO_END_MOVED, TileX(s.end), TileY(s.end)));
 		lines.push_back(GetString(STR_RAIL_ROUTE_INFO_LENGTH, s.length, s.bends, s.track_tiles, s.min_height, s.max_height));
 		lines.push_back(GetString(STR_RAIL_ROUTE_INFO_COST, e.Total()));
 		lines.push_back(GetString(STR_RAIL_ROUTE_INFO_COST_PARTS, e.clearing, e.terraform, e.track));
@@ -343,7 +439,7 @@ struct RailRouteWindow : Window {
 	}
 
 	/** Number of lines reserved for the info panel. */
-	static constexpr uint INFO_LINES = 9;
+	static constexpr uint INFO_LINES = 10;
 	/** Number of lines reserved for the construction job panel. */
 	static constexpr uint STATUS_LINES = 5;
 
@@ -400,6 +496,19 @@ struct RailRouteWindow : Window {
 	{
 		RailRouteOptions &o = _rail_route_options;
 		switch (widget) {
+			case WID_RR_START_NS:
+			case WID_RR_START_X:
+			case WID_RR_START_EW:
+			case WID_RR_START_Y: {
+				RailRouteStart start = RAIL_ROUTE_START_BUTTONS[widget - WID_RR_START_NS];
+				if (start == o.start) break;
+				o.start = start;
+				/* The fixed start was placed for the old orientation: place it again. */
+				if (this->mode == Mode::PickEnd) this->ReleaseStart();
+				this->OnOptionsChanged();
+				break;
+			}
+
 			case WID_RR_TRACKS_DECREASE:
 				if (o.tracks > 1) o.tracks--;
 				this->OnOptionsChanged();
@@ -464,23 +573,20 @@ struct RailRouteWindow : Window {
 	{
 		switch (this->mode) {
 			case Mode::PickStart:
-				/* Nothing to plan yet; the preview starts when the cursor leaves the start tile. */
+				/* The start is fixed now; the route is planned when the cursor leaves the start tile. */
 				this->start_tile = tile;
-				this->planned_end = tile;
-				this->plan_stale = false;
 				this->summary = {};
 				this->mode = Mode::PickEnd;
-				_rail_route_preview = {};
-				_rail_route_preview.active = true;
-				_rail_route_preview.start = tile;
-				MarkTileDirtyByTile(tile);
+				this->PlanPreview(tile);
 				break;
 
 			case Mode::PickEnd:
+				this->BuildRoute(tile);
+				/* Wait for the next start; the start pieces follow the cursor again. */
 				this->ClearPreview();
 				this->mode = Mode::PickStart;
-				this->BuildRoute(tile);
 				this->start_tile = INVALID_TILE;
+				this->plan_stale = true;
 				break;
 
 			case Mode::None:
@@ -500,19 +606,33 @@ struct RailRouteWindow : Window {
 
 	void OnRealtimeTick([[maybe_unused]] uint delta_ms) override
 	{
-		if (this->mode != Mode::PickEnd || _thd.GetCallbackWnd() != this) return;
-
-		/* The money changes all the time; keep the colour of the preview up to date. */
-		bool red = !CanAfford(this->summary.estimate);
-		if (red != _rail_route_preview.red) {
-			_rail_route_preview.red = red;
-			MarkWholeScreenDirty();
-			this->SetWidgetDirty(WID_RR_INFO);
+		RailType rt = GetSelectedRailType();
+		if (rt != this->sprites_railtype) {
+			this->UpdateOrientationSprites();
+			this->SetDirty();
 		}
 
+		if (this->mode == Mode::None || _thd.GetCallbackWnd() != this) return;
 		if ((_thd.drawstyle & HT_DRAG_MASK) == HT_NONE) return;
 		TileIndex tile = TileVirtXY(_thd.pos.x, _thd.pos.y);
 		if (tile >= Map::Size()) return;
+
+		if (this->mode == Mode::PickStart) {
+			/* Cheap: no planning, so follow the cursor at once. */
+			if (tile != this->planned_end || this->plan_stale || !_rail_route_preview.active) this->PreviewStart(tile);
+			return;
+		}
+
+		/* The money changes all the time; keep the colour of a buildable preview up to date. */
+		if (this->summary.valid && this->summary.error.empty()) {
+			bool red = !CanAfford(this->summary.estimate);
+			if (red != _rail_route_preview.red) {
+				_rail_route_preview.red = red;
+				MarkWholeScreenDirty();
+				this->SetWidgetDirty(WID_RR_INFO);
+			}
+		}
+
 		if (GetOptions().railtype != this->planned_railtype) this->plan_stale = true;
 		if (tile == this->planned_end && !this->plan_stale) return;
 
@@ -536,8 +656,19 @@ struct RailRouteWindow : Window {
 		this->SetWidgetDirty(WID_RR_BUILD);
 	}
 
+	EventState OnHotkey(int hotkey) override
+	{
+		/* The number keys choose the orientation only while placing; otherwise they belong to the rail toolbar. */
+		if (hotkey >= WID_RR_START_NS && hotkey <= WID_RR_START_Y && (this->mode == Mode::None || _thd.GetCallbackWnd() != this)) return EventState::NotHandled;
+		return this->Window::OnHotkey(hotkey);
+	}
+
 	static inline HotkeyList hotkeys{"trunk_line", {
 		Hotkey('K', "build", WID_RR_BUILD),
+		Hotkey('1', "start_ns", WID_RR_START_NS),
+		Hotkey('2', "start_x", WID_RR_START_X),
+		Hotkey('3', "start_ew", WID_RR_START_EW),
+		Hotkey('4', "start_y", WID_RR_START_Y),
 		Hotkey(WKC_COMMA, "fewer_tracks", WID_RR_TRACKS_DECREASE),
 		Hotkey(WKC_PERIOD, "more_tracks", WID_RR_TRACKS_INCREASE),
 	}};
@@ -552,6 +683,15 @@ static constexpr std::initializer_list<NWidgetPart> _nested_rail_route_widgets =
 	EndContainer(),
 	NWidget(WWT_PANEL, Colours::DarkGreen),
 		NWidget(NWID_VERTICAL), SetPadding(WidgetDimensions::unscaled.picker), SetPIP(0, WidgetDimensions::unscaled.vsep_normal, 0),
+			NWidget(NWID_HORIZONTAL), SetPIP(0, WidgetDimensions::unscaled.hsep_wide, 0),
+				NWidget(WWT_TEXT, Colours::Invalid), SetFill(1, 0), SetResize(1, 0), SetStringTip(STR_RAIL_ROUTE_START, STR_RAIL_ROUTE_START_TOOLTIP),
+				NWidget(NWID_HORIZONTAL),
+					NWidget(WWT_IMGBTN, Colours::DarkGreen, WID_RR_START_NS), SetToolbarMinimalSize(1), SetSpriteTip(SPR_IMG_RAIL_NS, STR_RAIL_ROUTE_START_NS_TOOLTIP),
+					NWidget(WWT_IMGBTN, Colours::DarkGreen, WID_RR_START_X), SetToolbarMinimalSize(1), SetSpriteTip(SPR_IMG_RAIL_NE, STR_RAIL_ROUTE_START_X_TOOLTIP),
+					NWidget(WWT_IMGBTN, Colours::DarkGreen, WID_RR_START_EW), SetToolbarMinimalSize(1), SetSpriteTip(SPR_IMG_RAIL_EW, STR_RAIL_ROUTE_START_EW_TOOLTIP),
+					NWidget(WWT_IMGBTN, Colours::DarkGreen, WID_RR_START_Y), SetToolbarMinimalSize(1), SetSpriteTip(SPR_IMG_RAIL_NW, STR_RAIL_ROUTE_START_Y_TOOLTIP),
+				EndContainer(),
+			EndContainer(),
 			NWidget(NWID_HORIZONTAL), SetPIP(0, WidgetDimensions::unscaled.hsep_wide, 0),
 				NWidget(WWT_TEXT, Colours::Invalid), SetFill(1, 0), SetResize(1, 0), SetStringTip(STR_RAIL_ROUTE_TRACKS, STR_RAIL_ROUTE_TRACKS_TOOLTIP),
 				NWidget(NWID_HORIZONTAL),

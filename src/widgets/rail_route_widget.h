@@ -13,6 +13,10 @@
 /** Widgets of the #RailRouteWindow class. */
 enum RailRouteWidgets : WidgetID {
 	WID_RR_CAPTION, ///< Caption of the window.
+	WID_RR_START_NS, ///< Start orientation: diagonal, north-south on the screen.
+	WID_RR_START_X, ///< Start orientation: straight along the x axis.
+	WID_RR_START_EW, ///< Start orientation: diagonal, east-west on the screen.
+	WID_RR_START_Y, ///< Start orientation: straight along the y axis.
 	WID_RR_TRACKS_DECREASE, ///< One track less.
 	WID_RR_TRACKS, ///< Number of tracks.
 	WID_RR_TRACKS_INCREASE, ///< One track more.

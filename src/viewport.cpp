@@ -1038,8 +1038,8 @@ static void DrawBlueprintPreviewTile(const TileInfo *ti)
 }
 
 /**
- * Draw the preview of a rail trunk line on a tile: the planned track pieces as autorail highlights (red when the
- * company cannot afford the route) and a blue rectangle on the start tile.
+ * Draw the preview of a rail trunk line on a tile: the planned track pieces as autorail highlights and a blue
+ * rectangle on the start and the end tile; all in red when the route cannot be built or the company cannot afford it.
  * @param ti The tile being drawn.
  */
 static void DrawRailRoutePreviewTile(const TileInfo *ti)
@@ -1049,7 +1049,7 @@ static void DrawRailRoutePreviewTile(const TileInfo *ti)
 	RailRoutePreviewTile preview = GetRailRoutePreviewTile(ti->tile);
 	/* HighLightStyle directions are in the same order as tracks. */
 	for (Track track : preview.tracks) DrawAutorailSelection(ti, static_cast<HighLightStyle>(to_underlying(track)), preview.red);
-	if (preview.start) DrawTileSelectionRect(ti, PALETTE_SEL_TILE_BLUE);
+	if (preview.start || preview.end) DrawTileSelectionRect(ti, preview.red ? PALETTE_SEL_TILE_RED : PALETTE_SEL_TILE_BLUE);
 }
 
 /** Types of tile highlight. */

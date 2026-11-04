@@ -3087,6 +3087,12 @@ STR_ERROR_BLUEPRINT_PASTE_RUNNING                               :{WHITE}... ещ
 STR_RAIL_ROUTE_CAPTION                                          :{WHITE}Магистраль
 STR_RAIL_ROUTE_TRACKS                                           :{BLACK}Путей:
 STR_RAIL_ROUTE_TRACKS_TOOLTIP                                   :{BLACK}Число параллельных односторонних путей, от 1 до 30. Клавиши: запятая и точка
+STR_RAIL_ROUTE_START                                            :{BLACK}Начало:
+STR_RAIL_ROUTE_START_TOOLTIP                                    :{BLACK}Направление рельсов в начале линии; при выборе конца начало не сдвигается
+STR_RAIL_ROUTE_START_NS_TOOLTIP                                 :{BLACK}Начать по диагонали, север-юг на экране. Конец — в четверти между этой диагональю и осями. Клавиша при укладке: 1
+STR_RAIL_ROUTE_START_X_TOOLTIP                                  :{BLACK}Начать прямо вдоль оси X (северо-восток - юго-запад). Конец — не дальше 45 градусов в сторону. Клавиша при укладке: 2
+STR_RAIL_ROUTE_START_EW_TOOLTIP                                 :{BLACK}Начать по диагонали, восток-запад на экране. Конец — в четверти между этой диагональю и осями. Клавиша при укладке: 3
+STR_RAIL_ROUTE_START_Y_TOOLTIP                                  :{BLACK}Начать прямо вдоль оси Y (северо-запад - юго-восток). Конец — не дальше 45 градусов в сторону. Клавиша при укладке: 4
 STR_RAIL_ROUTE_SIGNALS                                          :{BLACK}Сигналы, через (клеток):
 STR_RAIL_ROUTE_SIGNALS_TOOLTIP                                  :{BLACK}Поставить односторонние маршрутные сигналы на всех путях, по направлению от начала к концу
 STR_RAIL_ROUTE_INTERVAL_TOOLTIP                                 :{BLACK}Расстояние между сигналами вдоль линии, от 1 до 20 клеток
@@ -3097,16 +3103,17 @@ STR_RAIL_ROUTE_DEMOLISH_TOOLTIP                                 :{BLACK}Снос
 STR_RAIL_ROUTE_SEA                                              :{BLACK}Поднимать землю на уровне моря
 STR_RAIL_ROUTE_SEA_TOOLTIP                                      :{BLACK}Держать линию хотя бы на один уровень выше моря, поднимая землю где нужно
 STR_RAIL_ROUTE_BUILD                                            :{BLACK}Строить
-STR_RAIL_ROUTE_BUILD_TOOLTIP                                    :{BLACK}Щёлкните на карте начальную клетку, затем конечную: линия следует за мышью как предпросмотр и строится по второму щелчку с типом рельсов из панели ж/д строительства. Инструмент остаётся включённым для следующих линий до Esc или правого щелчка. Клавиша: K
+STR_RAIL_ROUTE_BUILD_TOOLTIP                                    :{BLACK}Выберите направление начала, наведите мышью начало линии и щёлкните: начало закреплено. Затем щёлкните конец: линия следует за мышью как предпросмотр и строится по второму щелчку с типом рельсов из панели ж/д строительства. Инструмент остаётся включённым для следующих линий до Esc или правого щелчка. Клавиша: K
 STR_RAIL_ROUTE_ABORT                                            :{BLACK}Прервать стройку
 STR_RAIL_ROUTE_ABORT_TOOLTIP                                    :{BLACK}Остановить идущую стройку; уже построенное остаётся
 STR_RAIL_ROUTE_INFO_RAILTYPE                                    :{BLACK}Тип рельсов: {GOLD}{STRING}{BLACK}, сигналы: {GOLD}{STRING}
 STR_RAIL_ROUTE_INFO_ELECTRIC                                    :светофоры
 STR_RAIL_ROUTE_INFO_SEMAPHORE                                   :семафоры
-STR_RAIL_ROUTE_INFO_IDLE                                        :{BLACK}Нажмите «Строить», затем щёлкните начало и конец линии
-STR_RAIL_ROUTE_INFO_PICK_START                                  :{YELLOW}Щёлкните начальную клетку линии
+STR_RAIL_ROUTE_INFO_IDLE                                        :{BLACK}Выберите направление начала, нажмите «Строить», затем щёлкните начало и конец линии
+STR_RAIL_ROUTE_INFO_PICK_START                                  :{YELLOW}Наведите начало линии и щёлкните: начало больше не сдвинется
 STR_RAIL_ROUTE_INFO_PICK_END                                    :{YELLOW}Щёлкните конечную клетку линии (начало {NUM},{NUM})
 STR_RAIL_ROUTE_INFO_ERROR                                       :{RED}Построить нельзя: {STRING}
+STR_RAIL_ROUTE_INFO_END_MOVED                                   :{YELLOW}Конец недостижим от начала, перенесён в {NUM},{NUM}
 STR_RAIL_ROUTE_INFO_LENGTH                                      :{BLACK}Длина {GOLD}{COMMA}{BLACK}, {GOLD}{COMMA}{BLACK} поворот{P "" а ов}, {GOLD}{COMMA}{BLACK} клет{P ка ки ок} с рельсами, высота {NUM}..{NUM}
 STR_RAIL_ROUTE_INFO_COST                                        :{BLACK}Примерная стоимость: {GOLD}{CURRENCY_LONG}
 STR_RAIL_ROUTE_INFO_COST_PARTS                                  :{BLACK}Расчистка {CURRENCY_LONG}, грунт {CURRENCY_LONG}, пути {CURRENCY_LONG}
@@ -3121,6 +3128,9 @@ STR_RAIL_ROUTE_ERROR_INVALID_TRACKS                             :неверно�
 STR_RAIL_ROUTE_ERROR_TOO_SHORT                                  :линия слишком короткая
 STR_RAIL_ROUTE_ERROR_NO_ROUTE                                   :путь не найден
 STR_RAIL_ROUTE_ERROR_DOES_NOT_FIT                               :коридор не помещается на карте
+STR_RAIL_ROUTE_ERROR_WRONG_DIRECTION                            :конец должен лежать в направлении начала
+STR_RAIL_ROUTE_ERROR_START_MISMATCH                             :линия не сходится с началом
+STR_RAIL_ROUTE_ERROR_INVALID_START                              :неверное направление начала
 
 STR_ERROR_RAIL_ROUTE_CAN_T_BUILD                                :{WHITE}Невозможно построить магистраль...
 STR_ERROR_RAIL_ROUTE_DETAIL                                     :{WHITE}... {STRING}
