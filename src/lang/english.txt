@@ -3994,7 +3994,7 @@ STR_TOWN_INVEST_AMOUNT                                          :{BLACK}Invested
 STR_TOWN_INVEST_BONUS                                           :{BLACK}Growth bonus: {GOLD}x{DECIMAL}
 STR_TOWN_INVEST_TALL                                            :{BLACK}Chance to rebuild into taller buildings first: {GOLD}{NUM}%
 STR_TOWN_INVEST_RULES                                           :{BLACK}Investments add up; 1/{NUM} of them runs out every month
-STR_TOWN_INVEST_BUTTON                                          :{BLACK}{CURRENCY_SHORT}
+STR_TOWN_INVEST_BUTTON                                          :{BLACK}{CURRENCY_LONG}
 STR_TOWN_INVEST_BUTTON_TOOLTIP                                  :{BLACK}Invest {CURRENCY_LONG} into the town. Click again to invest more
 STR_ERROR_CAN_T_INVEST_IN_TOWN                                  :{WHITE}Can't invest in this town...
 

@@ -67,6 +67,8 @@ namespace TownGrowthBalance {
 	static constexpr int64_t INVESTMENT_BONUS_UNIT = 50'000'000;
 	/** Growth bonus per doubling of 1 + investment / #INVESTMENT_BONUS_UNIT, per mille (50M: x1.6, 1G: x3.6, 5G: x5.0, 100G: x7.6). */
 	static constexpr uint32_t INVESTMENT_BONUS_PER_DOUBLING = 600;
+	/** While a town has investments, an unlocked need below this level counts as this level (it does not block growth). */
+	static constexpr uint8_t INVESTMENT_MIN_LEVEL = 2;
 	/** Every month 1/this of the invested money runs out (about two years for most of it). */
 	static constexpr int64_t INVESTMENT_MONTHS = 24;
 	/** The last of an investment runs out at once when less than this is left. */

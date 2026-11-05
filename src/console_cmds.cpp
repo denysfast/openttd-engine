@@ -56,6 +56,7 @@
 #include "town_cmd.h"
 #include "town_growth.h"
 #include "station_base.h"
+#include "station_func.h"
 #include "station_cmd.h"
 #include "core/backup_type.hpp"
 
@@ -3644,6 +3645,42 @@ static bool ConRailRouteWindow(std::span<std::string_view> argv)
 	return true;
 }
 
+/** Open the window of a town or of a station (for screenshots on a dedicated server). @copydoc IConsoleCmdProc */
+static bool ConOpenWindow(std::span<std::string_view> argv)
+{
+	if (argv.empty()) {
+		IConsolePrint(CC_HELP, "Open a window. Usage: 'open_window town <town id> [supply|invest]' or 'open_window station <station id>'.");
+		return true;
+	}
+	if (argv.size() < 3 || argv.size() > 4) return false;
+	if (_game_mode != GameMode::Normal) {
+		IConsolePrint(CC_ERROR, "Only available in a game.");
+		return true;
+	}
+
+	if (argv[1] == "town") {
+		auto id = ParseType<TownID>(argv[2]);
+		if (!id.has_value() || !Town::IsValidID(*id)) {
+			IConsolePrint(CC_ERROR, "Unknown town '{}'.", argv[2]);
+			return true;
+		}
+		ShowTownViewWindow(*id);
+		if (argv.size() == 4 && argv[3] == "supply") ShowTownSupplyWindow(*id);
+		if (argv.size() == 4 && argv[3] == "invest") ShowTownInvestWindow(*id);
+		return true;
+	}
+	if (argv[1] == "station") {
+		auto id = ParseType<StationID>(argv[2]);
+		if (!id.has_value() || !Station::IsValidID(*id)) {
+			IConsolePrint(CC_ERROR, "Unknown station '{}'.", argv[2]);
+			return true;
+		}
+		ShowStationViewWindow(*id);
+		return true;
+	}
+	return false;
+}
+
 /** List all road types and their configuration. */
 static void ConDumpRoadTypes()
 {
@@ -3966,6 +4003,7 @@ void IConsoleStdLibRegister()
 	IConsole::CmdRegister("rail_route",              ConRailRoute);
 	IConsole::CmdRegister("blueprint_window",        ConBlueprintWindow);
 	IConsole::CmdRegister("rail_route_window",       ConRailRouteWindow);
+	IConsole::CmdRegister("open_window",             ConOpenWindow);
 
 	/* NewGRF development stuff */
 	IConsole::CmdRegister("reload_newgrfs",          ConNewGRFReload,     ConHookNewGRFDeveloperTool);

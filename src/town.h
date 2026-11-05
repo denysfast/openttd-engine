@@ -257,6 +257,8 @@ uint32_t GetWorldPopulation();
 void UpdateAllTownVirtCoords();
 void ClearAllTownCachedNames();
 void ShowTownViewWindow(TownID town);
+void ShowTownSupplyWindow(TownID town);
+void ShowTownInvestWindow(TownID town);
 void ExpandTown(Town *t);
 
 void RebuildTownKdtree();

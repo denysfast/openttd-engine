@@ -4169,7 +4169,7 @@ STR_TOWN_INVEST_AMOUNT                                          :{BLACK}Влож
 STR_TOWN_INVEST_BONUS                                           :{BLACK}Ускорение роста: {GOLD}x{DECIMAL}
 STR_TOWN_INVEST_TALL                                            :{BLACK}Шанс сперва перестроить дома в высотные: {GOLD}{NUM}%
 STR_TOWN_INVEST_RULES                                           :{BLACK}Вложения складываются; каждый месяц расходуется 1/{NUM} от них
-STR_TOWN_INVEST_BUTTON                                          :{BLACK}{CURRENCY_SHORT}
+STR_TOWN_INVEST_BUTTON                                          :{BLACK}{CURRENCY_LONG}
 STR_TOWN_INVEST_BUTTON_TOOLTIP                                  :{BLACK}Вложить в город {CURRENCY_LONG}. Ещё щелчок - вложить ещё
 STR_ERROR_CAN_T_INVEST_IN_TOWN                                  :{WHITE}Не удаётся вложить деньги в город...
 

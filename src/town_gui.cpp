@@ -1462,9 +1462,10 @@ struct TownInvestWindow : Window {
 	 */
 	static std::vector<std::string> GetInfoLines(const Town *t)
 	{
+		auto [bonus, decimals] = GetMultiplierDecimal(1000 + GetTownInvestmentBonus(t));
 		return {
 			GetString(STR_TOWN_INVEST_AMOUNT, t->growth.investment),
-			GetString(STR_TOWN_INVEST_BONUS, 1000 + GetTownInvestmentBonus(t), 2),
+			GetString(STR_TOWN_INVEST_BONUS, bonus, decimals),
 			GetString(STR_TOWN_INVEST_TALL, GetTownDensifyFirstChance(t)),
 			GetString(STR_TOWN_INVEST_RULES, TownGrowthBalance::INVESTMENT_MONTHS),
 		};

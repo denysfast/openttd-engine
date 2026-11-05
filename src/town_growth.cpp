@@ -565,7 +565,7 @@ uint32_t GetTownGrowthMultiplier(const Town *t)
 	for (TownNeed need : EnumRange(TownNeed::End)) {
 		uint8_t level = GetTownNeedEffectiveLevel(t, need);
 		/* Investments keep a town growing even when a need is not supplied at all. */
-		if (invested && level == 0 && !IsTownNeedBonus(need)) level = 1;
+		if (invested && !IsTownNeedBonus(need)) level = std::max(level, TownGrowthBalance::INVESTMENT_MIN_LEVEL);
 		levels[to_underlying(need)] = level;
 	}
 	uint64_t multiplier = CalcTownGrowthMultiplier(levels, t->fund_buildings_months != 0, _settings_game.economy.town_growth_rate);
