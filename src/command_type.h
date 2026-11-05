@@ -310,6 +310,7 @@ enum class Commands : uint8_t {
 	SetTownInvestment, ///< set the invested money of a town (debugging and game scripts)
 	PasteBlueprint, ///< build one chunk of a rail blueprint
 	PrepareRailRoute, ///< clear and level a part of the corridor of a rail trunk line
+	UpgradeStationCatchment, ///< buy one catchment radius level of a station
 
 	OrderRefit, ///< change the refit information of an order (for "goto depot" )
 	CloneOrder, ///< clone (and share) an order

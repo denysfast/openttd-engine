@@ -4206,6 +4206,10 @@ STR_STATION_VIEW_EDIT_STATION_SIGN                              :{WHITE}Edit sta
 
 STR_STATION_VIEW_CLOSE_AIRPORT                                  :{BLACK}Close airport
 STR_STATION_VIEW_CLOSE_AIRPORT_TOOLTIP                          :{BLACK}Prevent aircraft from landing on this airport
+STR_STATION_VIEW_CATCHMENT_LEVEL                                :{BLACK}Catchment radius: level {NUM}/{NUM}, {NUM} tile{P "" s}
+STR_STATION_VIEW_CATCHMENT_UPGRADE                              :{BLACK}Radius +1
+STR_STATION_VIEW_CATCHMENT_UPGRADE_TOOLTIP                      :{BLACK}Increase the catchment radius of the station by 1 tile for {CURRENCY_LONG}
+STR_STATION_VIEW_CATCHMENT_UPGRADE_MAX_TOOLTIP                  :{BLACK}The catchment radius of the station is already at the maximum level
 
 # Waypoint/buoy view window
 STR_WAYPOINT_VIEW_CAPTION                                       :{WHITE}{WAYPOINT}
@@ -5456,6 +5460,8 @@ STR_ERROR_TOO_CLOSE_TO_ANOTHER_DOCK                             :too close to an
 STR_ERROR_TOO_CLOSE_TO_ANOTHER_AIRPORT                          :too close to another airport
 STR_ERROR_CAN_T_RENAME_STATION                                  :Can't rename station...
 STR_ERROR_CAN_T_MOVE_STATION_NAME                               :Can't move station sign...
+STR_ERROR_CAN_T_UPGRADE_STATION_CATCHMENT                       :Can't increase the catchment radius of the station...
+STR_ERROR_STATION_CATCHMENT_MAX_LEVEL                           :catchment radius already at the maximum level
 STR_ERROR_DRIVE_THROUGH_ON_TOWN_ROAD                            :road owned by a town
 STR_ERROR_DRIVE_THROUGH_DIRECTION                               :road facing in the wrong direction
 STR_ERROR_DRIVE_THROUGH_CORNER                                  :drive through stops can't have corners

@@ -55,6 +55,9 @@
 #include "town.h"
 #include "town_cmd.h"
 #include "town_growth.h"
+#include "station_base.h"
+#include "station_cmd.h"
+#include "core/backup_type.hpp"
 
 #if defined(WITH_ZLIB)
 #include "network/network_content.h"
@@ -2386,6 +2389,78 @@ static bool ConPowerAddFuel(std::span<std::string_view> argv)
 	return true;
 }
 
+/** Show or buy catchment levels of a station. @copydoc IConsoleCmdProc */
+static bool ConStationCatchment(std::span<std::string_view> argv)
+{
+	if (argv.empty()) {
+		IConsolePrint(CC_HELP, "Show or buy catchment radius levels of a station. Usage: 'station_catchment <station id> [<levels>]'.");
+		IConsolePrint(CC_HELP, "Every level adds one tile to the catchment radius and is paid by the owner of the station, up to {} levels.", MAX_STATION_CATCHMENT_LEVEL);
+		return true;
+	}
+
+	if (argv.size() != 2 && argv.size() != 3) return false;
+
+	if (_game_mode == GameMode::Menu) {
+		IConsolePrint(CC_ERROR, "There is no game running.");
+		return true;
+	}
+
+	auto id = ParseType<StationID>(argv[1]);
+	const Station *st = id.has_value() ? Station::GetIfValid(*id) : nullptr;
+	if (st == nullptr) {
+		IConsolePrint(CC_ERROR, "Station '{}' does not exist.", argv[1]);
+		return true;
+	}
+
+	auto print_state = [st]() {
+		if (st->catchment_level >= MAX_STATION_CATCHMENT_LEVEL) {
+			IConsolePrint(CC_INFO, "Station {}: catchment level {}/{}, radius {}, maximum level reached.", st->index, st->catchment_level, MAX_STATION_CATCHMENT_LEVEL, st->GetCatchmentRadius());
+		} else {
+			IConsolePrint(CC_INFO, "Station {}: catchment level {}/{}, radius {}, next level costs {}.", st->index, st->catchment_level, MAX_STATION_CATCHMENT_LEVEL, st->GetCatchmentRadius(),
+				static_cast<int64_t>(GetStationCatchmentUpgradeCost(st->catchment_level + 1)));
+		}
+	};
+
+	if (argv.size() == 2) {
+		print_state();
+		return true;
+	}
+
+	auto levels = ParseInteger(argv[2], 10, true);
+	if (!levels.has_value() || *levels == 0 || *levels > MAX_STATION_CATCHMENT_LEVEL) {
+		IConsolePrint(CC_ERROR, "Levels must be a number from 1 to {}.", MAX_STATION_CATCHMENT_LEVEL);
+		return true;
+	}
+
+	if (!Company::IsValidID(st->owner) || (!_network_server && st->owner != _local_company)) {
+		IConsolePrint(CC_ERROR, "Station {} is not owned by a company that can be acted for here.", st->index);
+		return true;
+	}
+
+	/* Over the network the purchases are executed later, so do not send more than can be bought. */
+	uint wanted = std::min<uint>(*levels, MAX_STATION_CATCHMENT_LEVEL - st->catchment_level);
+
+	Backup<CompanyID> cur_company(_current_company, st->owner);
+	uint sent = 0;
+	for (uint i = 0; i < wanted; i++) {
+		if (!Command<Commands::UpgradeStationCatchment>::Post(STR_ERROR_CAN_T_UPGRADE_STATION_CATCHMENT, CcUpgradeStationCatchment, st->index)) break;
+		sent++;
+	}
+	cur_company.Restore();
+
+	if (sent < *levels) {
+		IConsolePrint(CC_WARNING, "Only {} of {} purchase(s) could be made: {}.", sent, *levels,
+			sent == wanted ? "the maximum level is reached" : "the company does not have enough money");
+	}
+
+	if (_networking) {
+		IConsolePrint(CC_INFO, "Sent {} purchase(s); they are executed with the next tick.", sent);
+	} else {
+		print_state();
+	}
+	return true;
+}
+
 /** Write the simulation line of every town to the debug output now. @copydoc IConsoleCmdProc */
 static bool ConTownSimLog(std::span<std::string_view> argv)
 {
@@ -3813,6 +3888,7 @@ void IConsoleStdLibRegister()
 	IConsole::CmdRegister("power_grid",              ConPowerGrid);
 	IConsole::CmdRegister("power_add_fuel",          ConPowerAddFuel,     ConHookServerOrNoNetwork);
 	IConsole::CmdRegister("townsim_log",             ConTownSimLog);
+	IConsole::CmdRegister("station_catchment",       ConStationCatchment, ConHookServerOrNoNetwork);
 
 	/* networking functions */
 

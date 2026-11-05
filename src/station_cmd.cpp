@@ -75,6 +75,9 @@
 #include "tilearea_airportlayout.h"
 
 #include "widgets/station_widget.h"
+#include "texteff.hpp"
+#include "console_func.h"
+#include "network/network.h"
 
 #include "table/strings.h"
 #include "table/station_land.h"
@@ -2846,6 +2849,57 @@ CommandCost CmdOpenCloseAirport(DoCommandFlags flags, StationID station_id)
 		SetWindowWidgetDirty(WindowClass::StationView, st->index, WID_SV_CLOSE_AIRPORT);
 	}
 	return CommandCost();
+}
+
+/**
+ * Buy one catchment radius level of a station.
+ * Every level adds one tile to the catchment radius of every part of the station.
+ * @param flags operation to perform
+ * @param station_id the station to upgrade
+ * @return the cost of this operation (the cost of the next level, see #GetStationCatchmentUpgradeCost) or an error
+ */
+CommandCost CmdUpgradeStationCatchment(DoCommandFlags flags, StationID station_id)
+{
+	Station *st = Station::GetIfValid(station_id);
+	if (st == nullptr || st->owner == OWNER_NONE || st->facilities.None()) return CMD_ERROR;
+
+	CommandCost ret = CheckOwnership(st->owner);
+	if (ret.Failed()) return ret;
+
+	if (st->catchment_level >= MAX_STATION_CATCHMENT_LEVEL) return CommandCost(STR_ERROR_STATION_CATCHMENT_MAX_LEVEL);
+
+	CommandCost cost(ExpensesType::Construction, GetStationCatchmentUpgradeCost(st->catchment_level + 1));
+
+	if (flags.Test(DoCommandFlag::Execute)) {
+		st->catchment_level++;
+		st->RecomputeCatchment();
+		MarkCatchmentTilesDirty();
+		UpdateStationAcceptance(st, true);
+		SetWindowDirty(WindowClass::StationView, st->index);
+		InvalidateWindowData(WindowClass::StationList, st->owner, 0);
+	}
+	return cost;
+}
+
+/**
+ * Callback function that is called after a catchment level of a station is bought.
+ * Shows the cost at the station sign and reports the new level in the console.
+ * @param result of the operation
+ * @param station_id ID of the upgraded station
+ */
+void CcUpgradeStationCatchment(Commands, const CommandCost &result, StationID station_id)
+{
+	if (result.Failed()) return;
+
+	const Station *st = Station::GetIfValid(station_id);
+	if (st == nullptr) return;
+
+	if (!_network_dedicated) {
+		int x = TileX(st->xy) * TILE_SIZE + TILE_SIZE / 2;
+		int y = TileY(st->xy) * TILE_SIZE + TILE_SIZE / 2;
+		ShowCostOrIncomeAnimation(x, y, GetSlopePixelZ(x, y), result.GetCost());
+	}
+	IConsolePrint(CC_INFO, "Station {}: catchment level {}/{}, radius {}, paid {}.", st->index, st->catchment_level, MAX_STATION_CATCHMENT_LEVEL, st->GetCatchmentRadius(), static_cast<int64_t>(result.GetCost()));
 }
 
 /**

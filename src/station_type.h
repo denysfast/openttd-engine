@@ -130,7 +130,9 @@ static constexpr uint CA_DOCK = 5 * CATCHMENT_SCALE; ///< Catchment for docks wi
 static constexpr uint CA_UNMODIFIED = 4 * CATCHMENT_SCALE; ///< Catchment for all stations with "modified catchment" disabled
 
 static constexpr uint MAX_AIRPORT_CATCHMENT_SPEC = 10; ///< Maximum catchment of an airport spec (before #CATCHMENT_SCALE).
-static constexpr uint MAX_CATCHMENT = MAX_AIRPORT_CATCHMENT_SPEC * CATCHMENT_SCALE; ///< Maximum catchment for airports with "modified catchment" enabled
+static constexpr uint MAX_STATION_CATCHMENT_LEVEL = 50; ///< Fork: maximum number of bought catchment levels of a station, each adds one tile to the radius.
+static constexpr uint MAX_CATCHMENT = MAX_AIRPORT_CATCHMENT_SPEC * CATCHMENT_SCALE + MAX_STATION_CATCHMENT_LEVEL; ///< Maximum catchment of any station with "modified catchment" enabled, bought levels included
+static constexpr uint MAX_CATCHMENT_UNMODIFIED = CA_UNMODIFIED + MAX_STATION_CATCHMENT_LEVEL; ///< Maximum catchment of any station with "modified catchment" disabled, bought levels included
 
 static const uint MAX_LENGTH_STATION_NAME_CHARS = 32; ///< The maximum length of a station name in characters including '\0'
 

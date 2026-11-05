@@ -305,13 +305,13 @@ void Station::MarkTilesDirty(bool cargo_change) const
 }
 
 /**
- * Get the catchment size of an individual station tile.
+ * Get the catchment size of an individual station tile, without the bought catchment levels.
  * @param tile Station tile to get catchment size of.
  * @param st Associated station of station tile.
  * @pre IsTileType(tile, TileType::Station)
  * @return The catchment size of the station tile.
  */
-static uint GetTileCatchmentRadius(TileIndex tile, const Station *st)
+static uint GetTileBaseCatchmentRadius(TileIndex tile, const Station *st)
 {
 	assert(IsTileType(tile, TileType::Station));
 
@@ -340,7 +340,20 @@ static uint GetTileCatchmentRadius(TileIndex tile, const Station *st)
 }
 
 /**
- * Determines the catchment radius of the station
+ * Get the catchment size of an individual station tile, including the bought catchment levels of the station.
+ * @param tile Station tile to get catchment size of.
+ * @param st Associated station of station tile.
+ * @pre IsTileType(tile, TileType::Station)
+ * @return The catchment size of the station tile.
+ */
+static uint GetTileCatchmentRadius(TileIndex tile, const Station *st)
+{
+	uint r = GetTileBaseCatchmentRadius(tile, st);
+	return r == CA_NONE ? CA_NONE : r + st->catchment_level;
+}
+
+/**
+ * Determines the catchment radius of the station, including the bought catchment levels.
  * @return The radius
  */
 uint Station::GetCatchmentRadius() const
@@ -359,7 +372,23 @@ uint Station::GetCatchmentRadius() const
 		}
 	}
 
-	return ret;
+	return ret == CA_NONE ? CA_NONE : ret + this->catchment_level;
+}
+
+/**
+ * Get the cost of buying a catchment level of a station.
+ * The first level costs 500 000 000, every next one 10% more than the previous one (rounded down),
+ * in base currency and not affected by inflation.
+ * @param level The level being bought, 1-based (1..#MAX_STATION_CATCHMENT_LEVEL).
+ * @return The cost of that level.
+ */
+Money GetStationCatchmentUpgradeCost(uint level)
+{
+	assert(level >= 1 && level <= MAX_STATION_CATCHMENT_LEVEL);
+
+	Money cost = 500'000'000;
+	for (uint i = 1; i < level; i++) cost = cost * 11 / 10;
+	return cost;
 }
 
 /**

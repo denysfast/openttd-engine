@@ -860,6 +860,14 @@ static constexpr std::initializer_list<NWidgetPart> _nested_station_view_widgets
 		NWidget(NWID_VSCROLLBAR, Colours::Grey, WID_SV_SCROLLBAR),
 	EndContainer(),
 	NWidget(WWT_PANEL, Colours::Grey, WID_SV_ACCEPT_RATING_LIST), SetMinimalSize(249, 23), SetResize(1, 0), EndContainer(),
+	NWidget(NWID_HORIZONTAL),
+		NWidget(WWT_PANEL, Colours::Grey),
+			NWidget(WWT_TEXT, Colours::Invalid, WID_SV_CATCHMENT_LEVEL), SetPadding(WidgetDimensions::unscaled.frametext), SetFill(1, 1), SetResize(1, 0),
+					SetStringTip(STR_STATION_VIEW_CATCHMENT_LEVEL),
+		EndContainer(),
+		NWidget(WWT_PUSHTXTBTN, Colours::Grey, WID_SV_CATCHMENT_UPGRADE), SetMinimalSize(60, 12), SetFill(0, 1),
+				SetStringTip(STR_STATION_VIEW_CATCHMENT_UPGRADE, STR_STATION_VIEW_CATCHMENT_UPGRADE_TOOLTIP),
+	EndContainer(),
 	NWidget(NWID_HORIZONTAL, NWidContainerFlag::EqualSize),
 		NWidget(WWT_PUSHTXTBTN, Colours::Grey, WID_SV_ACCEPTS_RATINGS), SetMinimalSize(46, 12), SetResize(1, 0), SetFill(1, 1),
 				SetStringTip(STR_STATION_VIEW_RATINGS_BUTTON, STR_STATION_VIEW_RATINGS_TOOLTIP),
@@ -1448,6 +1456,13 @@ struct StationViewWindow : public Window {
 			case WID_SV_ACCEPT_RATING_LIST:
 				size.height = ((this->GetWidget<NWidgetCore>(WID_SV_ACCEPTS_RATINGS)->GetString() == STR_STATION_VIEW_RATINGS_BUTTON) ? this->accepts_lines : this->rating_lines) * GetCharacterHeight(FontSize::Normal) + padding.height;
 				break;
+
+			case WID_SV_CATCHMENT_LEVEL: {
+				/* Reserve the space of the longest text, so the window does not grow while levels are bought. */
+				uint64_t max_radius = MAX_CATCHMENT;
+				size.width = std::max(size.width, GetStringBoundingBox(GetString(STR_STATION_VIEW_CATCHMENT_LEVEL, MAX_STATION_CATCHMENT_LEVEL, MAX_STATION_CATCHMENT_LEVEL, max_radius)).width + padding.width);
+				break;
+			}
 		}
 	}
 
@@ -1470,6 +1485,7 @@ struct StationViewWindow : public Window {
 
 		extern const Station *_viewport_highlight_station;
 		this->SetWidgetDisabledState(WID_SV_CATCHMENT, st->facilities.None());
+		this->SetWidgetDisabledState(WID_SV_CATCHMENT_UPGRADE, st->owner != _local_company || st->owner == OWNER_NONE || st->facilities.None() || st->catchment_level >= MAX_STATION_CATCHMENT_LEVEL);
 		this->SetWidgetLoweredState(WID_SV_CATCHMENT, _viewport_highlight_station == st);
 
 		this->DrawWidgets();
@@ -1516,6 +1532,11 @@ struct StationViewWindow : public Window {
 		if (widget == WID_SV_CAPTION) {
 			const Station *st = Station::Get(this->window_number);
 			return GetString(STR_STATION_VIEW_CAPTION, st->index, st->facilities);
+		}
+
+		if (widget == WID_SV_CATCHMENT_LEVEL) {
+			const Station *st = Station::Get(this->window_number);
+			return GetString(STR_STATION_VIEW_CATCHMENT_LEVEL, st->catchment_level, MAX_STATION_CATCHMENT_LEVEL, st->GetCatchmentRadius());
 		}
 
 		return this->Window::GetWidgetString(widget, stringid);
@@ -1987,6 +2008,19 @@ struct StationViewWindow : public Window {
 		this->SetWidgetDirty(WID_SV_SCROLLBAR);
 	}
 
+	bool OnTooltip([[maybe_unused]] Point pt, WidgetID widget, TooltipCloseCondition close_cond) override
+	{
+		if (widget != WID_SV_CATCHMENT_UPGRADE) return false;
+
+		const Station *st = Station::Get(this->window_number);
+		if (st->catchment_level >= MAX_STATION_CATCHMENT_LEVEL) {
+			GuiShowTooltips(this, GetEncodedString(STR_STATION_VIEW_CATCHMENT_UPGRADE_MAX_TOOLTIP), close_cond);
+		} else {
+			GuiShowTooltips(this, GetEncodedString(STR_STATION_VIEW_CATCHMENT_UPGRADE_TOOLTIP, GetStationCatchmentUpgradeCost(st->catchment_level + 1)), close_cond);
+		}
+		return true;
+	}
+
 	void OnClick([[maybe_unused]] Point pt, WidgetID widget, [[maybe_unused]] int click_count) override
 	{
 		Window *w = FindWindowByClass(WindowClass::QueryString);
@@ -2035,6 +2069,10 @@ struct StationViewWindow : public Window {
 
 			case WID_SV_CLOSE_AIRPORT:
 				Command<Commands::OpenCloseAirport>::Post(this->window_number);
+				break;
+
+			case WID_SV_CATCHMENT_UPGRADE:
+				Command<Commands::UpgradeStationCatchment>::Post(STR_ERROR_CAN_T_UPGRADE_STATION_CATCHMENT, CcUpgradeStationCatchment, this->window_number);
 				break;
 
 			case WID_SV_TRAINS:   // Show list of scheduled trains to this station

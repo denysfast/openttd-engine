@@ -30,6 +30,8 @@ enum StationViewWidgets : WidgetID {
 	WID_SV_SHIPS,              ///< List of scheduled ships button.
 	WID_SV_PLANES,             ///< List of scheduled planes button.
 	WID_SV_CATCHMENT,          ///< Toggle catchment area highlight.
+	WID_SV_CATCHMENT_LEVEL,    ///< Text with the bought catchment level and the catchment radius.
+	WID_SV_CATCHMENT_UPGRADE,  ///< 'Radius +1' button: buy the next catchment level.
 };
 
 /** Widgets of the #CompanyStationsWindow class. */

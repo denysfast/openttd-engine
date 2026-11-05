@@ -657,6 +657,7 @@ public:
 		SaveLoad::Variable<VarFileType::U64>("always_accepted", SLE_OBJECT_ADDRESS(Station, always_accepted), SaveLoadVersion::ExtendCargotypes),
 		SaveLoad::StructList<SlRoadStopTileData>("speclist", SaveLoadVersion::NewGRFRoadStops, SaveLoadVersion::RoadStopTileData),
 		SaveLoad::StructList<SlStationGoods>("goods"),
+		SaveLoad::Variable<VarFileType::U8>("catchment_level", SLE_OBJECT_ADDRESS(Station, catchment_level), SaveLoadVersion::StationCatchmentUpgrade),
 	};
 	static inline const SaveLoadCompatTable compat_description = _station_normal_sl_compat;
 

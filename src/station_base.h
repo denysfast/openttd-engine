@@ -546,6 +546,8 @@ public:
 
 	IndustryType indtype = IT_INVALID; ///< Industry type to get the name from
 
+	uint8_t catchment_level = 0; ///< Bought catchment levels (0..#MAX_STATION_CATCHMENT_LEVEL), each adds one tile to the catchment radius of every part of the station.
+
 	BitmapTileArea catchment_tiles{}; ///< NOSAVE: Set of individual tiles covered by catchment area
 
 	StationVehicleTypes had_vehicle_of_type{};
@@ -611,6 +613,7 @@ public:
 };
 
 void RebuildStationKdtree();
+Money GetStationCatchmentUpgradeCost(uint level);
 
 /**
  * Call a function on all stations that have any part of the requested area within their catchment.
@@ -630,7 +633,7 @@ void ForAllStationsAroundTiles(const TileArea &ta, Func func)
 
 	/* Scan an area around the building covering the maximum possible station
 	 * to find the possible nearby stations. */
-	uint max_c = _settings_game.station.modified_catchment ? MAX_CATCHMENT : CA_UNMODIFIED;
+	uint max_c = _settings_game.station.modified_catchment ? MAX_CATCHMENT : MAX_CATCHMENT_UNMODIFIED;
 	TileArea ta_ext = TileArea(ta).Expand(max_c);
 	for (TileIndex tile : ta_ext) {
 		if (!IsTileType(tile, TileType::Station)) continue;

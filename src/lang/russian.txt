@@ -4381,6 +4381,10 @@ STR_STATION_VIEW_EDIT_STATION_SIGN                              :{WHITE}Реда
 
 STR_STATION_VIEW_CLOSE_AIRPORT                                  :{BLACK}Закрыть аэропорт
 STR_STATION_VIEW_CLOSE_AIRPORT_TOOLTIP                          :{BLACK}Запретить воздушным судам садиться в этом аэропорту
+STR_STATION_VIEW_CATCHMENT_LEVEL                                :{BLACK}Радиус покрытия: уровень {NUM}/{NUM}, {NUM} клет{P ка ки ок}
+STR_STATION_VIEW_CATCHMENT_UPGRADE                              :{BLACK}Радиус +1
+STR_STATION_VIEW_CATCHMENT_UPGRADE_TOOLTIP                      :{BLACK}Увеличить радиус покрытия станции на 1 клетку за {CURRENCY_LONG}
+STR_STATION_VIEW_CATCHMENT_UPGRADE_MAX_TOOLTIP                  :{BLACK}Радиус покрытия станции уже максимальный
 
 # Waypoint/buoy view window
 STR_WAYPOINT_VIEW_CAPTION                                       :{WHITE}{WAYPOINT}
@@ -5643,6 +5647,8 @@ STR_ERROR_TOO_CLOSE_TO_ANOTHER_DOCK                             :слишком 
 STR_ERROR_TOO_CLOSE_TO_ANOTHER_AIRPORT                          :слишком близко к другому аэропорту
 STR_ERROR_CAN_T_RENAME_STATION                                  :Невозможно переименовать станцию...
 STR_ERROR_CAN_T_MOVE_STATION_NAME                               :Невозможно переместить метку станции...
+STR_ERROR_CAN_T_UPGRADE_STATION_CATCHMENT                       :Невозможно увеличить радиус покрытия станции...
+STR_ERROR_STATION_CATCHMENT_MAX_LEVEL                           :радиус покрытия уже максимальный
 STR_ERROR_DRIVE_THROUGH_ON_TOWN_ROAD                            :этот участок дороги принадлежит городу
 STR_ERROR_DRIVE_THROUGH_DIRECTION                               :неверное направление дороги
 STR_ERROR_DRIVE_THROUGH_CORNER                                  :на сквозных остановках нельзя делать повороты
