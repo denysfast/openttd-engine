@@ -296,3 +296,22 @@ TEST_CASE("TownNeedDemandScale")
 		prev = d;
 	}
 }
+
+TEST_CASE("TownInvestmentBonus")
+{
+	CHECK(CalcTownInvestmentBonus(0) == 0);
+	CHECK(CalcTownInvestmentBonus(-5) == 0);
+	/* 50M: log2(2) = 1 doubling. */
+	CHECK(CalcTownInvestmentBonus(50'000'000) == TownGrowthBalance::INVESTMENT_BONUS_PER_DOUBLING);
+	/* 1G: log2(21) = 4.39; the fraction is interpolated linearly, so a little less. */
+	uint32_t g1 = CalcTownInvestmentBonus(1'000'000'000);
+	CHECK(g1 > 2500);
+	CHECK(g1 < 2650);
+	/* 5G: log2(101) = 6.66. */
+	uint32_t g5 = CalcTownInvestmentBonus(5'000'000'000);
+	CHECK(g5 > 3900);
+	CHECK(g5 < 4000);
+	/* More money always helps, but less and less; huge amounts do not overflow. */
+	CHECK(CalcTownInvestmentBonus(10'000'000'000) > g5);
+	CHECK(CalcTownInvestmentBonus(INT64_MAX) < 30000);
+}
