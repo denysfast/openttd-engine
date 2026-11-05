@@ -422,6 +422,7 @@ static const SaveLoad _town_desc[] = {
 	SaveLoad::Variable<VarFileType::U16>("growth_retry_ticks", SLE_OBJECT_ADDRESS(Town, growth.retry_ticks), SaveLoadVersion::TownNeedsGrowth),
 	SaveLoad::Variable<VarFileType::U8>("growth_builder_failures", SLE_OBJECT_ADDRESS(Town, growth.builder_failures), SaveLoadVersion::TownNeedsGrowth),
 	SaveLoad::Variable<VarFileType::U32>("growth_valuables_received", SLE_OBJECT_ADDRESS(Town, growth.valuables_received), SaveLoadVersion::TownValuablesBonus),
+	SaveLoad::Variable<VarFileType::I64>("growth_investment", SLE_OBJECT_ADDRESS(Town, growth.investment), SaveLoadVersion::TownInvestment),
 	SaveLoad::StructList<SlTownNeeds>("needs", SaveLoadVersion::TownNeedsGrowth),
 	SaveLoad::StructList<SlTownPowerLinks>("power_links", SaveLoadVersion::TownNeedsGrowth),
 };

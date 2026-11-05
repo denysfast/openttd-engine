@@ -4162,6 +4162,16 @@ STR_TOWN_SUPPLY_PLANT_NO_COAL                                   :{RED}нет у�
 STR_TOWN_SUPPLY_PLANT_DELIVERED                                 :{BLACK}{COMMA} МВт·ч
 STR_TOWN_SUPPLY_PLANTS_NONE                                     :{BLACK}Город не снабжает ни одна электростанция. Постройте или профинансируйте электростанцию не дальше {COMMA} клет{P ки ок ок} от центра города и возите на неё уголь
 STR_TOWN_SUPPLY_PLANTS_TOOLTIP                                  :{BLACK}Электростанции, которые снабжают город электричеством. Щелчок - показать электростанцию в основном окне. Ctrl+щелчок - открыть её окно
+STR_TOWN_VIEW_INVEST_BUTTON                                     :{BLACK}Инвестировать
+STR_TOWN_VIEW_INVEST_TOOLTIP                                    :{BLACK}Вложить деньги в город: он растёт быстрее, прежде всего вверх (высотные здания)
+STR_TOWN_INVEST_CAPTION                                         :{WHITE}{TOWN}: инвестиции
+STR_TOWN_INVEST_AMOUNT                                          :{BLACK}Вложено и ещё работает: {GOLD}{CURRENCY_LONG}
+STR_TOWN_INVEST_BONUS                                           :{BLACK}Ускорение роста: {GOLD}x{DECIMAL}
+STR_TOWN_INVEST_TALL                                            :{BLACK}Шанс сперва перестроить дома в высотные: {GOLD}{NUM}%
+STR_TOWN_INVEST_RULES                                           :{BLACK}Вложения складываются; каждый месяц расходуется 1/{NUM} от них
+STR_TOWN_INVEST_BUTTON                                          :{BLACK}{CURRENCY_SHORT}
+STR_TOWN_INVEST_BUTTON_TOOLTIP                                  :{BLACK}Вложить в город {CURRENCY_LONG}. Ещё щелчок - вложить ещё
+STR_ERROR_CAN_T_INVEST_IN_TOWN                                  :{WHITE}Не удаётся вложить деньги в город...
 
 STR_INDUSTRY_VIEW_POWER_COAL_STOCK                              :{BLACK}Запас угля: {YELLOW}{CARGO_SHORT}
 STR_INDUSTRY_VIEW_POWER_OUTPUT                                  :{BLACK}Выработано за месяц: {YELLOW}{COMMA} МВт·ч

@@ -32,6 +32,8 @@ CommandCost CmdPlaceHouse(DoCommandFlags flags, TileIndex tile, HouseID house, b
 CommandCost CmdPlaceHouseArea(DoCommandFlags flags, TileIndex tile, TileIndex start_tile, HouseID house, bool is_protected, bool replace, bool diagonal);
 CommandCost CmdTownForceNeedLevel(DoCommandFlags flags, TownID town_id, TownNeed need, uint8_t level);
 CommandCost CmdPowerPlantAddFuel(DoCommandFlags flags, IndustryID industry_id, uint16_t amount);
+CommandCost CmdInvestInTown(DoCommandFlags flags, TownID town_id, uint8_t amount_index);
+CommandCost CmdSetTownInvestment(DoCommandFlags flags, TownID town_id, Money amount, bool add);
 
 DEF_CMD_TRAIT(Commands::FoundTown, CmdFoundTown, CommandFlags({CommandFlag::Deity, CommandFlag::NoTest}), CommandType::LandscapeConstruction) // founding random town can fail only in exec run
 DEF_CMD_TRAIT(Commands::RenameTown, CmdRenameTown, CommandFlags({CommandFlag::Deity, CommandFlag::Server}), CommandType::OtherManagement)
@@ -46,6 +48,8 @@ DEF_CMD_TRAIT(Commands::PlaceHouse, CmdPlaceHouse, CommandFlags({CommandFlag::De
 DEF_CMD_TRAIT(Commands::PlaceHouseArea, CmdPlaceHouseArea, CommandFlags({ CommandFlag::Deity }), CommandType::OtherManagement)
 DEF_CMD_TRAIT(Commands::TownForceNeedLevel, CmdTownForceNeedLevel, CommandFlags({CommandFlag::Deity, CommandFlag::Server}), CommandType::OtherManagement)
 DEF_CMD_TRAIT(Commands::PowerPlantAddFuel, CmdPowerPlantAddFuel, CommandFlags({CommandFlag::Deity, CommandFlag::Server}), CommandType::OtherManagement)
+DEF_CMD_TRAIT(Commands::InvestInTown, CmdInvestInTown, CommandFlags({}), CommandType::MoneyManagement)
+DEF_CMD_TRAIT(Commands::SetTownInvestment, CmdSetTownInvestment, CommandFlags({CommandFlag::Deity, CommandFlag::Server}), CommandType::OtherManagement)
 
 
 CommandCallback CcFoundTown;

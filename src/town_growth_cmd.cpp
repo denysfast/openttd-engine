@@ -9,6 +9,8 @@
 
 #include "stdafx.h"
 #include "command_func.h"
+#include "company_base.h"
+#include "company_func.h"
 #include "debug.h"
 #include "industry.h"
 #include "town.h"
@@ -19,6 +21,53 @@
 #include "timer/timer_game_economy.h"
 
 #include "safeguards.h"
+
+/**
+ * A company invests money into a town: the growth of the town speeds up, more so for tall buildings, while the money
+ * works; a part of it runs out every month. Investments add up, so they can be bought any number of times.
+ * @param flags Type of operation.
+ * @param town_id The town.
+ * @param amount_index Index into #TownGrowthBalance::INVESTMENT_AMOUNTS.
+ * @return The cost or an error.
+ */
+CommandCost CmdInvestInTown(DoCommandFlags flags, TownID town_id, uint8_t amount_index)
+{
+	Town *t = Town::GetIfValid(town_id);
+	if (t == nullptr || amount_index >= TownGrowthBalance::INVESTMENT_AMOUNTS.size()) return CMD_ERROR;
+	if (!Company::IsValidID(_current_company)) return CMD_ERROR;
+
+	int64_t amount = TownGrowthBalance::INVESTMENT_AMOUNTS[amount_index];
+	if (flags.Test(DoCommandFlag::Execute)) AddTownInvestment(t, amount);
+	return CommandCost(ExpensesType::Other, amount);
+}
+
+/**
+ * Set or add to the money invested into a town, without paying for it.
+ * Used by the console and game scripts to test the investments.
+ * @param flags Type of operation.
+ * @param town_id The town, or TownID::Invalid() for all towns.
+ * @param amount The money.
+ * @param add Add the money to the investment instead of setting it.
+ * @return Empty cost or an error.
+ */
+CommandCost CmdSetTownInvestment(DoCommandFlags flags, TownID town_id, Money amount, bool add)
+{
+	if (town_id != TownID::Invalid() && !Town::IsValidID(town_id)) return CMD_ERROR;
+	if (amount < 0) return CMD_ERROR;
+
+	if (flags.Test(DoCommandFlag::Execute)) {
+		auto set = [amount, add](Town *t) {
+			if (!add) t->growth.investment = 0;
+			AddTownInvestment(t, amount);
+		};
+		if (town_id == TownID::Invalid()) {
+			for (Town *t : Town::Iterate()) set(t);
+		} else {
+			set(Town::Get(town_id));
+		}
+	}
+	return CommandCost();
+}
 
 /** Severity of the simulation log lines: they are written from debug level 1 of the "town" facility on ("-d town=1"). */
 static constexpr Severity TOWN_SIMULATION_LOG_SEVERITY = Severity::Error;
@@ -111,9 +160,9 @@ void LogTownGrowthSimulation(bool force)
 			format_append(coverage, "{}{}", sep, g.needs[n].coverage);
 		}
 		DebugPrint(Facility::Town, TOWN_SIMULATION_LOG_SEVERITY, fmt::format(
-				"[townsim] year={} town={} pop={} houses={} mult={} levels={} raw={} cov={} growth={} budget={} status={}",
+				"[townsim] year={} town={} pop={} houses={} mult={} levels={} raw={} cov={} growth={} budget={} status={} invest={}",
 				TimerGameEconomy::year, t->index, t->cache.population, t->cache.num_houses, g.multiplier,
-				levels, raw, coverage, g.yearly_growth, g.budget / 1000, to_underlying(g.status)));
+				levels, raw, coverage, g.yearly_growth, g.budget / 1000, to_underlying(g.status), g.investment));
 	}
 }
 

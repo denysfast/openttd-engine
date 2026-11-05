@@ -37,6 +37,7 @@
 #include "window_func.h"
 #include "timer/timer.h"
 #include "company_func.h"
+#include "core/backup_type.hpp"
 #include "gamelog.h"
 #include "ai/ai.hpp"
 #include "ai/ai_config.hpp"
@@ -2087,6 +2088,9 @@ static void PrintTownNeedsDetails(const Town *t)
 		t->index, GetString(STR_TOWN_NAME, t->index), t->cache.population, t->cache.num_houses, GetTownGrowthStatusText(t));
 	IConsolePrint(CC_INFO, "  multiplier x{}, growth {} residents/year, budget {} residents",
 		FormatPerMille(g.multiplier), g.yearly_growth, g.budget / 1000);
+	IConsolePrint(CC_INFO, "  investment {}, growth bonus +{}, densify first {}%, centre radius^2 {}",
+		g.investment, FormatPerMille(GetTownInvestmentBonus(t)), GetTownDensifyFirstChance(t),
+		t->cache.squared_town_zone_radius[to_underlying(HouseZone::TownCentre)]);
 	IConsolePrint(CC_INFO, "  {:<12} {:>8} {:>5} {:>4} {:>6} {:>9} {:>9} {:>9}  {}",
 		"need", "unlocked", "level", "raw", "forced", "coverage", "supplied", "demand", "coverage history");
 	for (TownNeed n : EnumRange(TownNeed::End)) {
@@ -2217,6 +2221,101 @@ static bool ConTownForceNeed(std::span<std::string_view> argv)
 	} else if (!_networking) {
 		IConsolePrint(CC_INFO, "Need level set; the growth multiplier follows at the next monthly update.");
 	}
+	return true;
+}
+
+/** Invest money into towns, by a company or for free. @copydoc IConsoleCmdProc */
+static bool ConTownInvest(std::span<std::string_view> argv)
+{
+	if (argv.empty()) {
+		IConsolePrint(CC_HELP, "Invest into a town. Usage: 'town_invest <town id|all> <amount> [<count> [<company>]]'.");
+		IConsolePrint(CC_HELP, "With a company (1-based) it buys 'count' investments of 50m, 1g or 5g like the town window does.");
+		IConsolePrint(CC_HELP, "Without a company the amount (e.g. 50m, 1g, 2500000) is added for free; 'set <amount>' replaces it, 'set 0' removes it.");
+		return true;
+	}
+	if (argv.size() < 3 || argv.size() > 5) return false;
+
+	if (_game_mode == GameMode::Menu) {
+		IConsolePrint(CC_ERROR, "There is no game running.");
+		return true;
+	}
+
+	TownID town_id = TownID::Invalid();
+	if (argv[1] != "all") {
+		auto id = ParseType<TownID>(argv[1]);
+		if (!id.has_value() || !Town::IsValidID(*id)) {
+			IConsolePrint(CC_ERROR, "Unknown town '{}'.", argv[1]);
+			return true;
+		}
+		town_id = *id;
+	}
+
+	/* Free investments: 'set' replaces the amount instead of adding to it. */
+	bool set = argv[2] == "set";
+	if (set && argv.size() != 4) return false;
+	std::string_view amount_text = set ? argv[3] : argv[2];
+
+	auto parse_amount = [](std::string_view text) -> std::optional<int64_t> {
+		int64_t unit = 1;
+		if (!text.empty() && (text.back() == 'm' || text.back() == 'M')) unit = 1'000'000;
+		if (!text.empty() && (text.back() == 'g' || text.back() == 'G' || text.back() == 'b' || text.back() == 'B')) unit = 1'000'000'000;
+		if (unit != 1) text.remove_suffix(1);
+		auto value = ParseInteger<uint64_t>(text);
+		if (!value.has_value() || *value > static_cast<uint64_t>(INT64_MAX / unit)) return std::nullopt;
+		return static_cast<int64_t>(*value) * unit;
+	};
+	auto amount = parse_amount(amount_text);
+	if (!amount.has_value()) {
+		IConsolePrint(CC_ERROR, "Unknown amount '{}'.", amount_text);
+		return true;
+	}
+
+	if (set || argv.size() < 5) {
+		if (!set && argv.size() == 4) {
+			auto count = ParseInteger(argv[3]);
+			if (!count.has_value() || *count == 0 || *count > 1000) {
+				IConsolePrint(CC_ERROR, "Count must be 1..1000.");
+				return true;
+			}
+			*amount *= *count;
+		}
+		if (!Command<Commands::SetTownInvestment>::Post(town_id, *amount, !set)) IConsolePrint(CC_ERROR, "Setting the investment failed.");
+		return true;
+	}
+
+	/* Paid investments of a company. */
+	if (town_id == TownID::Invalid()) {
+		IConsolePrint(CC_ERROR, "A company invests into one town at a time.");
+		return true;
+	}
+	auto index = std::ranges::find(TownGrowthBalance::INVESTMENT_AMOUNTS, *amount);
+	if (index == TownGrowthBalance::INVESTMENT_AMOUNTS.end()) {
+		IConsolePrint(CC_ERROR, "A company invests 50m, 1g or 5g.");
+		return true;
+	}
+	auto count = ParseInteger(argv[3]);
+	auto company = ParseInteger(argv[4]);
+	if (!count.has_value() || *count == 0 || *count > 1000) {
+		IConsolePrint(CC_ERROR, "Count must be 1..1000.");
+		return true;
+	}
+	if (!company.has_value() || *company == 0 || !Company::IsValidID(CompanyID(*company - 1))) {
+		IConsolePrint(CC_ERROR, "Unknown company '{}'.", argv[4]);
+		return true;
+	}
+	if (_networking && !_network_server && CompanyID(*company - 1) != _local_company) {
+		IConsolePrint(CC_ERROR, "A client invests only for its own company.");
+		return true;
+	}
+
+	Backup<CompanyID> cur_company(_current_company, CompanyID(*company - 1));
+	uint8_t amount_index = static_cast<uint8_t>(index - TownGrowthBalance::INVESTMENT_AMOUNTS.begin());
+	uint done = 0;
+	for (uint i = 0; i < *count; i++) {
+		if (Command<Commands::InvestInTown>::Post(STR_ERROR_CAN_T_INVEST_IN_TOWN, town_id, amount_index)) done++;
+	}
+	cur_company.Restore();
+	IConsolePrint(CC_INFO, "Invested {} x {} into town {}.", done, *amount, town_id);
 	return true;
 }
 
@@ -3710,6 +3809,7 @@ void IConsoleStdLibRegister()
 
 	IConsole::CmdRegister("town_needs",              ConTownNeeds);
 	IConsole::CmdRegister("town_force_need",         ConTownForceNeed,    ConHookServerOrNoNetwork);
+	IConsole::CmdRegister("town_invest",             ConTownInvest);
 	IConsole::CmdRegister("power_grid",              ConPowerGrid);
 	IConsole::CmdRegister("power_add_fuel",          ConPowerAddFuel,     ConHookServerOrNoNetwork);
 	IConsole::CmdRegister("townsim_log",             ConTownSimLog);

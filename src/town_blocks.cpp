@@ -839,6 +839,7 @@ static bool OpenNewBlock(Town *t, const TownBlockCache &cache, TownExpandModes m
 
 /**
  * Do one step of the town builder: fill a free plot, else densify, else open a new block.
+ * With a chance (higher with investments) it densifies first, so towns also grow upwards while they have free plots.
  * @param t The town to grow.
  * @param modes The parts of the town that may be grown.
  * @return What the step built.
@@ -852,6 +853,7 @@ TownBuildResult TownBuilderStep(Town *t, TownExpandModes modes)
 	TownBuildResult result;
 
 	if (modes.Test(TownExpandMode::Buildings)) {
+		if (RandomRange(100) < GetTownDensifyFirstChance(t) && DensifyOpenedBlocks(t, *cache, result)) return result;
 		if (FillOpenedBlocks(t, *cache, modes, result)) return result;
 		if (DensifyOpenedBlocks(t, *cache, result)) return result;
 	}

@@ -53,8 +53,24 @@ namespace TownGrowthBalance {
 	static constexpr std::array<uint16_t, 14> DEMAND_SCALE = {1000, 933, 871, 812, 758, 707, 660, 616, 574, 536, 500, 467, 435, 406};
 	/** The budget is capped at this many years of growth. */
 	static constexpr uint32_t BUDGET_CAP_YEARS = 2;
-	/** A house is replaced by a denser one only when it is at least this many years old. */
-	static constexpr uint8_t DENSIFY_MIN_AGE = 10;
+	/** A house is replaced by a denser one only when it is at least this many years old (not while the town has investments). */
+	static constexpr uint8_t DENSIFY_MIN_AGE = 3;
+	/** A house that suits its zone is still replaced by one with at least this many times its residents, per mille. */
+	static constexpr uint32_t DENSIFY_SAME_ZONE_GAIN = 1500;
+	/** Chance in percent that the builder first tries to replace a house by a denser one, before building on free plots. */
+	static constexpr uint32_t DENSIFY_FIRST_CHANCE = 35;
+	/** Highest chance in percent to densify first, reached with large investments. */
+	static constexpr uint32_t DENSIFY_FIRST_CHANCE_MAX = 90;
+	/** Amounts a company can invest into a town at once (base currency). */
+	static constexpr std::array<int64_t, 3> INVESTMENT_AMOUNTS = {50'000'000, 1'000'000'000, 5'000'000'000};
+	/** Investment unit of the bonus: the bonus grows by #INVESTMENT_BONUS_PER_DOUBLING for every doubling of 1 + investment / unit. */
+	static constexpr int64_t INVESTMENT_BONUS_UNIT = 50'000'000;
+	/** Growth bonus per doubling of 1 + investment / #INVESTMENT_BONUS_UNIT, per mille (50M: x1.6, 1G: x3.6, 5G: x5.0, 100G: x7.6). */
+	static constexpr uint32_t INVESTMENT_BONUS_PER_DOUBLING = 600;
+	/** Every month 1/this of the invested money runs out (about two years for most of it). */
+	static constexpr int64_t INVESTMENT_MONTHS = 24;
+	/** The last of an investment runs out at once when less than this is left. */
+	static constexpr int64_t INVESTMENT_MIN_REMAINDER = 1'000'000;
 	/** Ticks to wait before trying the builder again after it failed. */
 	static constexpr uint16_t BUILDER_RETRY_TICKS = 74 * 10;
 	/** Number of power plants a town links to: one plus one per this many residents (from 50000 on). */
@@ -85,6 +101,10 @@ uint32_t GetTownYearlyGrowth(const Town *t, uint32_t multiplier);
 void SetTownNeedForced(Town *t, TownNeed need, uint8_t level);
 StringID GetTownNeedName(TownNeed need);
 uint32_t ScaleHousePopulation(uint32_t house_population);
+uint32_t CalcTownInvestmentBonus(int64_t investment);
+uint32_t GetTownInvestmentBonus(const Town *t);
+uint32_t GetTownDensifyFirstChance(const Town *t);
+void AddTownInvestment(Town *t, int64_t amount);
 
 /* --- Power grid (town_power.cpp) --- */
 

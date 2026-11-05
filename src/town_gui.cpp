@@ -345,6 +345,7 @@ static void ShowTownAuthorityWindow(uint town)
 }
 
 void ShowTownSupplyWindow(TownID town);
+void ShowTownInvestWindow(TownID town);
 void ShowIndustryViewWindow(IndustryID industry);
 
 /**
@@ -594,6 +595,10 @@ public:
 				break;
 			}
 
+			case WID_TV_INVEST:
+				ShowTownInvestWindow(this->town->index);
+				break;
+
 			case WID_TV_SUPPLY:
 				ShowTownSupplyWindow(this->town->index);
 				break;
@@ -716,7 +721,10 @@ static constexpr std::initializer_list<NWidgetPart> _nested_town_game_view_widge
 		NWidget(WWT_PUSHTXTBTN, Colours::Brown, WID_TV_GRAPH), SetFill(1, 0), SetResize(1, 0), SetStringTip(STR_TOWN_VIEW_CARGO_GRAPH, STR_TOWN_VIEW_CARGO_GRAPH_TOOLTIP),
 	EndContainer(),
 	NWidget(NWID_HORIZONTAL),
-		NWidget(WWT_PUSHTXTBTN, Colours::Brown, WID_TV_SUPPLY), SetMinimalSize(80, 12), SetFill(1, 1), SetResize(1, 0), SetStringTip(STR_TOWN_VIEW_SUPPLY_BUTTON, STR_TOWN_VIEW_SUPPLY_TOOLTIP),
+		NWidget(NWID_HORIZONTAL, NWidContainerFlag::EqualSize),
+			NWidget(WWT_PUSHTXTBTN, Colours::Brown, WID_TV_SUPPLY), SetMinimalSize(80, 12), SetFill(1, 1), SetResize(1, 0), SetStringTip(STR_TOWN_VIEW_SUPPLY_BUTTON, STR_TOWN_VIEW_SUPPLY_TOOLTIP),
+			NWidget(WWT_PUSHTXTBTN, Colours::Brown, WID_TV_INVEST), SetMinimalSize(80, 12), SetFill(1, 1), SetResize(1, 0), SetStringTip(STR_TOWN_VIEW_INVEST_BUTTON, STR_TOWN_VIEW_INVEST_TOOLTIP),
+		EndContainer(),
 		NWidget(WWT_RESIZEBOX, Colours::Brown),
 	EndContainer(),
 };
@@ -1413,6 +1421,148 @@ static WindowDesc _town_supply_desc(
 void ShowTownSupplyWindow(TownID town)
 {
 	AllocateWindowDescFront<TownSupplyWindow>(_town_supply_desc, town);
+}
+
+/** Widgets of the town investment window. */
+static constexpr std::initializer_list<NWidgetPart> _nested_town_invest_widgets = {
+	NWidget(NWID_HORIZONTAL),
+		NWidget(WWT_CLOSEBOX, Colours::Brown),
+		NWidget(WWT_CAPTION, Colours::Brown, WID_TI_CAPTION),
+		NWidget(WWT_SHADEBOX, Colours::Brown),
+		NWidget(WWT_STICKYBOX, Colours::Brown),
+	EndContainer(),
+	NWidget(WWT_PANEL, Colours::Brown, WID_TI_INFO), SetFill(1, 0), SetResize(1, 0), EndContainer(),
+	NWidget(NWID_HORIZONTAL, NWidContainerFlag::EqualSize),
+		NWidget(WWT_PUSHTXTBTN, Colours::Brown, WID_TI_INVEST_SMALL), SetMinimalSize(80, 12), SetFill(1, 1), SetResize(1, 0), SetToolTip(STR_TOWN_INVEST_BUTTON_TOOLTIP),
+		NWidget(WWT_PUSHTXTBTN, Colours::Brown, WID_TI_INVEST_MEDIUM), SetMinimalSize(80, 12), SetFill(1, 1), SetResize(1, 0), SetToolTip(STR_TOWN_INVEST_BUTTON_TOOLTIP),
+		NWidget(WWT_PUSHTXTBTN, Colours::Brown, WID_TI_INVEST_LARGE), SetMinimalSize(80, 12), SetFill(1, 1), SetResize(1, 0), SetToolTip(STR_TOWN_INVEST_BUTTON_TOOLTIP),
+	EndContainer(),
+};
+
+/** Town investment window: companies invest money into a town to speed up its growth, most of all of tall buildings. */
+struct TownInvestWindow : Window {
+	TownInvestWindow(WindowDesc &desc, WindowNumber window_number) : Window(desc)
+	{
+		this->InitNested(window_number);
+	}
+
+	/**
+	 * Get the town of the window.
+	 * @return The town, or nullptr when it is gone.
+	 */
+	const Town *GetTown() const
+	{
+		return Town::GetIfValid(this->window_number);
+	}
+
+	/**
+	 * Get the lines of the information panel.
+	 * @param t The town.
+	 * @return The lines.
+	 */
+	static std::vector<std::string> GetInfoLines(const Town *t)
+	{
+		return {
+			GetString(STR_TOWN_INVEST_AMOUNT, t->growth.investment),
+			GetString(STR_TOWN_INVEST_BONUS, 1000 + GetTownInvestmentBonus(t), 2),
+			GetString(STR_TOWN_INVEST_TALL, GetTownDensifyFirstChance(t)),
+			GetString(STR_TOWN_INVEST_RULES, TownGrowthBalance::INVESTMENT_MONTHS),
+		};
+	}
+
+	std::string GetWidgetString(WidgetID widget, StringID stringid) const override
+	{
+		switch (widget) {
+			case WID_TI_CAPTION: {
+				const Town *t = this->GetTown();
+				return t == nullptr ? std::string{} : GetString(STR_TOWN_INVEST_CAPTION, t->index);
+			}
+			case WID_TI_INVEST_SMALL:
+			case WID_TI_INVEST_MEDIUM:
+			case WID_TI_INVEST_LARGE:
+				return GetString(STR_TOWN_INVEST_BUTTON, TownGrowthBalance::INVESTMENT_AMOUNTS[widget - WID_TI_INVEST_SMALL]);
+			default:
+				return this->Window::GetWidgetString(widget, stringid);
+		}
+	}
+
+	bool OnTooltip([[maybe_unused]] Point pt, WidgetID widget, TooltipCloseCondition close_cond) override
+	{
+		if (widget < WID_TI_INVEST_SMALL || widget > WID_TI_INVEST_LARGE) return false;
+		GuiShowTooltips(this, GetEncodedString(STR_TOWN_INVEST_BUTTON_TOOLTIP, TownGrowthBalance::INVESTMENT_AMOUNTS[widget - WID_TI_INVEST_SMALL]), close_cond);
+		return true;
+	}
+
+	void UpdateWidgetSize(WidgetID widget, Dimension &size, [[maybe_unused]] const Dimension &padding, [[maybe_unused]] Dimension &fill, [[maybe_unused]] Dimension &resize) override
+	{
+		if (widget != WID_TI_INFO) return;
+		const Town *t = this->GetTown();
+		if (t == nullptr) return;
+
+		/* Leave room for large amounts, so the window does not have to grow. */
+		Dimension d = GetStringBoundingBox(GetString(STR_TOWN_INVEST_AMOUNT, INT64_C(999'999'999'999'999)));
+		std::vector<std::string> lines = GetInfoLines(t);
+		for (const std::string &line : lines) d = maxdim(d, GetStringBoundingBox(line));
+		size.width = std::max(size.width, d.width + padding.width);
+		size.height = static_cast<uint>(lines.size()) * GetCharacterHeight(FontSize::Normal) + padding.height;
+	}
+
+	void DrawWidget(const Rect &r, WidgetID widget) const override
+	{
+		if (widget != WID_TI_INFO) return;
+		const Town *t = this->GetTown();
+		if (t == nullptr) return;
+
+		Rect ir = r.Shrink(WidgetDimensions::scaled.framerect);
+		for (const std::string &line : GetInfoLines(t)) {
+			DrawString(ir, line);
+			ir.top += GetCharacterHeight(FontSize::Normal);
+		}
+	}
+
+	void OnPaint() override
+	{
+		bool can_invest = Company::IsValidID(_local_company);
+		for (WidgetID widget = WID_TI_INVEST_SMALL; widget <= WID_TI_INVEST_LARGE; widget++) {
+			this->SetWidgetDisabledState(widget, !can_invest);
+		}
+		this->DrawWidgets();
+	}
+
+	void OnClick([[maybe_unused]] Point pt, WidgetID widget, [[maybe_unused]] int click_count) override
+	{
+		if (widget < WID_TI_INVEST_SMALL || widget > WID_TI_INVEST_LARGE) return;
+		const Town *t = this->GetTown();
+		if (t == nullptr) return;
+		/* Every click is one more investment: they add up. */
+		Command<Commands::InvestInTown>::Post(STR_ERROR_CAN_T_INVEST_IN_TOWN, t->index, static_cast<uint8_t>(widget - WID_TI_INVEST_SMALL));
+	}
+
+	/** Refresh the window regularly: investments of other companies and the monthly decay change the numbers. */
+	const IntervalTimer<TimerWindow> refresh_interval = {std::chrono::seconds(1), [this](auto) {
+		if (this->GetTown() == nullptr) {
+			this->Close();
+			return;
+		}
+		this->SetDirty();
+	}};
+};
+
+/** Window definition of the town investment window. */
+static WindowDesc _town_invest_desc(
+	WindowPosition::Automatic, "view_town_invest", 0, 0,
+	WindowClass::TownInvest, WindowClass::TownView,
+	{},
+	_nested_town_invest_widgets
+);
+
+/**
+ * Show the investment window of a town.
+ * @param town The town.
+ */
+void ShowTownInvestWindow(TownID town)
+{
+	AllocateWindowDescFront<TownInvestWindow>(_town_invest_desc, town);
 }
 
 static constexpr std::initializer_list<NWidgetPart> _nested_town_directory_widgets = {

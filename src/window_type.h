@@ -356,6 +356,12 @@ enum class WindowClass : uint16_t {
 	TownSupply,
 
 	/**
+	 * Investments into a town; %Window numbers:
+	 *   - #TownID = #TownInvestWidgets
+	 */
+	TownInvest,
+
+	/**
 	 * Rail blueprints; %Window numbers:
 	 *   - 0 = #BlueprintWidgets
 	 */

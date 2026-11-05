@@ -47,6 +47,7 @@ enum TownViewWidgets : WidgetID {
 	WID_TV_DELETE,         ///< Delete this town (scenario editor only).
 	WID_TV_GRAPH,
 	WID_TV_SUPPLY,         ///< Show the town supply window.
+	WID_TV_INVEST,         ///< Show the town investment window.
 };
 
 /** Widgets of the #TownSupplyWindow class. */
@@ -58,6 +59,15 @@ enum TownSupplyWidgets : WidgetID {
 	WID_TS_HINT,             ///< What to improve first.
 	WID_TS_PLANTS,           ///< List of linked power plants.
 	WID_TS_PLANTS_SCROLLBAR, ///< Scrollbar of the power plant list.
+};
+
+/** Widgets of the #TownInvestWindow class. */
+enum TownInvestWidgets : WidgetID {
+	WID_TI_CAPTION, ///< Caption of the window.
+	WID_TI_INFO,    ///< Invested money and its effect.
+	WID_TI_INVEST_SMALL,  ///< Invest the smallest amount.
+	WID_TI_INVEST_MEDIUM, ///< Invest the medium amount.
+	WID_TI_INVEST_LARGE,  ///< Invest the largest amount.
 };
 
 /** Widgets of the #FoundTownWindow class. */

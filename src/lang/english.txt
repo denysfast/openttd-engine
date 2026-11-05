@@ -3987,6 +3987,16 @@ STR_TOWN_SUPPLY_PLANT_NO_COAL                                   :{RED}no coal
 STR_TOWN_SUPPLY_PLANT_DELIVERED                                 :{BLACK}{COMMA} MWh
 STR_TOWN_SUPPLY_PLANTS_NONE                                     :{BLACK}No power plant supplies the town. Build or fund a power station within {COMMA} tiles of the town centre and deliver coal to it
 STR_TOWN_SUPPLY_PLANTS_TOOLTIP                                  :{BLACK}Power plants that supply the town with electricity. Click to centre the main view on a power plant. Ctrl+Click to open its window
+STR_TOWN_VIEW_INVEST_BUTTON                                     :{BLACK}Invest
+STR_TOWN_VIEW_INVEST_TOOLTIP                                    :{BLACK}Invest money into the town: it grows faster, most of all upwards (tall buildings)
+STR_TOWN_INVEST_CAPTION                                         :{WHITE}{TOWN}: investments
+STR_TOWN_INVEST_AMOUNT                                          :{BLACK}Invested and still working: {GOLD}{CURRENCY_LONG}
+STR_TOWN_INVEST_BONUS                                           :{BLACK}Growth bonus: {GOLD}x{DECIMAL}
+STR_TOWN_INVEST_TALL                                            :{BLACK}Chance to rebuild into taller buildings first: {GOLD}{NUM}%
+STR_TOWN_INVEST_RULES                                           :{BLACK}Investments add up; 1/{NUM} of them runs out every month
+STR_TOWN_INVEST_BUTTON                                          :{BLACK}{CURRENCY_SHORT}
+STR_TOWN_INVEST_BUTTON_TOOLTIP                                  :{BLACK}Invest {CURRENCY_LONG} into the town. Click again to invest more
+STR_ERROR_CAN_T_INVEST_IN_TOWN                                  :{WHITE}Can't invest in this town...
 
 STR_INDUSTRY_VIEW_POWER_COAL_STOCK                              :{BLACK}Coal in stock: {YELLOW}{CARGO_SHORT}
 STR_INDUSTRY_VIEW_POWER_OUTPUT                                  :{BLACK}Electricity last month: {YELLOW}{COMMA} MWh

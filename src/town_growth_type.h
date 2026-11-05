@@ -67,6 +67,7 @@ struct TownGrowthState {
 	uint16_t retry_ticks = 0; ///< Ticks to wait before the builder is tried again after a failure.
 	uint32_t valuables_received = 0; ///< Valuables (armoured cargo) delivered to the town this month.
 	uint8_t builder_failures = 0; ///< Consecutive failed builder steps; from a few on the town has no space to grow.
+	int64_t investment = 0; ///< Money invested into the town by companies that is still working; a part runs out every month.
 	std::shared_ptr<TownBlockCache> block_cache{}; ///< NOSAVE: blocks of the town grid used by the builder, rebuilt from the map after loading.
 };
 

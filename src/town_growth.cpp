@@ -386,6 +386,72 @@ void UpdateTownNeeds(Town *t)
 		UpdateTownNeedCoverage(state, CalcTownNeedCoverage(state.supplied, state.demand, t->cache.population));
 	}
 	t->growth.valuables_received = 0;
+
+	/* A part of the investments runs out every month. */
+	int64_t &investment = t->growth.investment;
+	if (investment > 0) {
+		int64_t spent = std::max(investment / TownGrowthBalance::INVESTMENT_MONTHS, TownGrowthBalance::INVESTMENT_MIN_REMAINDER);
+		investment = std::max<int64_t>(investment - spent, 0);
+		UpdateTownRadius(t);
+	}
+}
+
+/**
+ * Compute the growth bonus of the money invested into a town: #TownGrowthBalance::INVESTMENT_BONUS_PER_DOUBLING
+ * per doubling of 1 + investment / #TownGrowthBalance::INVESTMENT_BONUS_UNIT, so every further investment helps a bit less.
+ * Integer arithmetic only (the result is game state): the fraction of the logarithm is interpolated linearly.
+ * @param investment Money still working in the town.
+ * @return Bonus per mille, added to the neutral 1000 of the growth multiplier.
+ */
+uint32_t CalcTownInvestmentBonus(int64_t investment)
+{
+	if (investment <= 0) return 0;
+	/* 1 + investment / unit, with 10 bits of fraction; capped far above any reachable amount. */
+	uint64_t units = static_cast<uint64_t>(std::min<int64_t>(investment, INT64_C(1'000'000'000'000'000)));
+	uint64_t value = (static_cast<uint64_t>(TownGrowthBalance::INVESTMENT_BONUS_UNIT) + units) * 1024 / static_cast<uint64_t>(TownGrowthBalance::INVESTMENT_BONUS_UNIT);
+	uint8_t top = FindLastBit(value);
+	uint64_t whole = top - 10;
+	uint64_t mantissa = (top >= 10 ? value >> (top - 10) : value << (10 - top)) - 1024;
+	uint64_t log2_permille = whole * 1000 + mantissa * 1000 / 1024;
+	return ClampTo<uint32_t>(log2_permille * TownGrowthBalance::INVESTMENT_BONUS_PER_DOUBLING / 1000);
+}
+
+/**
+ * Get the growth bonus of the money invested into a town.
+ * @param t The town.
+ * @return Bonus per mille.
+ */
+uint32_t GetTownInvestmentBonus(const Town *t)
+{
+	return CalcTownInvestmentBonus(t->growth.investment);
+}
+
+/**
+ * Get the chance that the builder of a town first tries to replace a house by a denser one; investments raise it.
+ * @param t The town.
+ * @return Chance in percent.
+ */
+uint32_t GetTownDensifyFirstChance(const Town *t)
+{
+	return std::min(TownGrowthBalance::DENSIFY_FIRST_CHANCE + GetTownInvestmentBonus(t) / 100, TownGrowthBalance::DENSIFY_FIRST_CHANCE_MAX);
+}
+
+/**
+ * Add money to the investments of a town and update its growth at once.
+ * @param t The town.
+ * @param amount Money to add.
+ * @note This changes the game state; call it from a command so every client does the same.
+ */
+void AddTownInvestment(Town *t, int64_t amount)
+{
+	int64_t &investment = t->growth.investment;
+	investment = (amount > INT64_MAX - investment) ? INT64_MAX : investment + amount;
+
+	UpdateTownRadius(t);
+	UpdateTownGrowthState(t);
+	if (!t->flags.Test(TownFlag::CustomGrowth)) t->growth_rate = GetTownGrowthRateEstimate(t);
+	SetWindowDirty(WindowClass::TownView, t->index);
+	InvalidateWindowData(WindowClass::TownView, t->index);
 }
 
 /**
@@ -488,17 +554,22 @@ bool IsTownGrowthCargo(CargoType cargo)
 
 /**
  * Get the current growth multiplier of a town: the product of the multipliers of the effective
- * need levels, x1.5 while new buildings are funded, times the town growth speed setting.
+ * need levels, x1.5 while new buildings are funded, times the town growth speed setting, times the investment bonus.
  * @param t The town.
  * @return Multiplier per mille; 0 when the town cannot grow.
  */
 uint32_t GetTownGrowthMultiplier(const Town *t)
 {
+	bool invested = t->growth.investment > 0;
 	std::array<uint8_t, to_underlying(TownNeed::End)> levels{};
 	for (TownNeed need : EnumRange(TownNeed::End)) {
-		levels[to_underlying(need)] = GetTownNeedEffectiveLevel(t, need);
+		uint8_t level = GetTownNeedEffectiveLevel(t, need);
+		/* Investments keep a town growing even when a need is not supplied at all. */
+		if (invested && level == 0 && !IsTownNeedBonus(need)) level = 1;
+		levels[to_underlying(need)] = level;
 	}
-	return CalcTownGrowthMultiplier(levels, t->fund_buildings_months != 0, _settings_game.economy.town_growth_rate);
+	uint64_t multiplier = CalcTownGrowthMultiplier(levels, t->fund_buildings_months != 0, _settings_game.economy.town_growth_rate);
+	return ClampTo<uint32_t>(multiplier * (1000 + GetTownInvestmentBonus(t)) / 1000);
 }
 
 /**
@@ -557,7 +628,7 @@ void UpdateTownGrowthState(Town *t)
 	} else {
 		growth.status = TownGrowthStatus::Growing;
 		for (TownNeed need : EnumRange(TownNeed::End)) {
-			if (!IsTownNeedBonus(need) && GetTownNeedEffectiveLevel(t, need) == 0) {
+			if (!IsTownNeedBonus(need) && GetTownNeedEffectiveLevel(t, need) == 0 && growth.investment <= 0) {
 				growth.status = TownGrowthStatus::Blocked;
 				growth.blocking_need = need;
 				break;

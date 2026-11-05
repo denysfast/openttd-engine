@@ -1035,19 +1035,30 @@ static bool GrowTown(Town *t, TownExpandModes modes)
  */
 void UpdateTownRadius(Town *t)
 {
-	/** Squared fraction of the town radius (in 1/10000) that bounds each zone, except the edge. */
-	static constexpr std::array<std::pair<HouseZone, uint64_t>, 4> zone_fractions = {{
-		{HouseZone::TownCentre, 20 * 20},
-		{HouseZone::TownInnerSuburb, 40 * 40},
-		{HouseZone::TownOuterSuburb, 65 * 65},
-		{HouseZone::TownOutskirt, 85 * 85},
+	/**
+	 * Fraction of the town radius in percent that bounds each zone, except the edge, and the most it can grow to
+	 * with investments. The dense zones are wide, so towns grow upwards and not only outwards.
+	 */
+	struct ZoneFraction {
+		HouseZone zone; ///< The zone.
+		uint64_t base; ///< Fraction without investments.
+		uint64_t max; ///< Fraction with large investments.
+	};
+	static constexpr std::array<ZoneFraction, 4> zone_fractions = {{
+		{HouseZone::TownCentre, 35, 60},
+		{HouseZone::TownInnerSuburb, 55, 75},
+		{HouseZone::TownOuterSuburb, 75, 85},
+		{HouseZone::TownOutskirt, 90, 95},
 	}};
 	/** Distance in tiles between the centre of the outer blocks and the boundary of the town. */
 	static constexpr uint32_t TOWN_EDGE_MARGIN = 4;
 
+	/* Investments widen the dense zones: one percent of the radius per 0.2 of growth bonus. */
+	uint64_t extra = GetTownInvestmentBonus(t) / 200;
 	uint32_t radius_sq = GetTownBlockRadiusSquared(t);
-	for (const auto &[zone, fraction] : zone_fractions) {
-		t->cache.squared_town_zone_radius[to_underlying(zone)] = static_cast<uint32_t>(radius_sq * fraction / 10000);
+	for (const auto &[zone, base, max] : zone_fractions) {
+		uint64_t fraction = std::min(base + extra, max);
+		t->cache.squared_town_zone_radius[to_underlying(zone)] = static_cast<uint32_t>(radius_sq * fraction * fraction / 10000);
 	}
 	uint32_t edge = IntSqrt(radius_sq) + TOWN_EDGE_MARGIN;
 	t->cache.squared_town_zone_radius[to_underlying(HouseZone::TownEdge)] = edge * edge;
@@ -2067,15 +2078,19 @@ int32_t TryReplaceTownHouse(Town *t, TileIndex tile)
 	if (!IsHouseCompleted(tile)) return -1;
 
 	const HouseSpec *old_hs = HouseSpec::Get(old_house);
-	if (GetHouseAge(tile) < std::max(old_hs->minimum_life, TownGrowthBalance::DENSIFY_MIN_AGE)) return -1;
+	uint8_t min_age = t->growth.investment > 0 ? 0 : TownGrowthBalance::DENSIFY_MIN_AGE;
+	if (GetHouseAge(tile) < std::max(old_hs->minimum_life, min_age)) return -1;
 
 	/* The new house has to fit into the plot of the old one, inside one block. */
 	uint width = old_hs->building_flags.Any(BUILDING_2_TILES_X) ? 2 : 1;
 	uint height = old_hs->building_flags.Any(BUILDING_2_TILES_Y) ? 2 : 1;
 	if (!IsTownBlockInteriorTile(tile) || !IsTownBlockInteriorTile(TileAddXY(tile, width - 1, height - 1))) return -1;
 
+	/* A house that suits its zone is only replaced by a much denser one. */
 	bool outdated = !old_hs->enabled || TimerGameCalendar::year > old_hs->max_year;
-	if (!outdated && GetHighestHouseZone(old_hs) >= GetTownRadiusGroup(t, tile)) return -1;
+	bool suits_zone = !outdated && GetHighestHouseZone(old_hs) >= GetTownRadiusGroup(t, tile);
+	uint32_t min_population = old_hs->population + 1;
+	if (suits_zone) min_population = std::max<uint32_t>(min_population, old_hs->population * TownGrowthBalance::DENSIFY_SAME_ZONE_GAIN / 1000);
 
 	if (!CanDeleteHouse(tile)) return -1;
 
@@ -2090,7 +2105,7 @@ int32_t TryReplaceTownHouse(Town *t, TileIndex tile)
 	uint probability_max = 0;
 
 	for (const auto &hs : HouseSpec::Specs()) {
-		if (hs.population <= old_hs->population || !hs.building_availability.All(zones)) continue;
+		if (hs.population < min_population || !hs.building_availability.All(zones)) continue;
 		if (!IsHouseTypeBuildableByTown(t, hs)) continue;
 
 		/* The old house frees its flag of the special houses only if it has the same one. */

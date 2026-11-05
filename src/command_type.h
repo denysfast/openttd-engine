@@ -306,6 +306,8 @@ enum class Commands : uint8_t {
 	PlaceHouseArea, ///< place an area of houses
 	TownForceNeedLevel, ///< force the level of a need of a town (debugging and game scripts)
 	PowerPlantAddFuel, ///< add fuel to the stock of a power plant (debugging and game scripts)
+	InvestInTown, ///< a company invests money into a town to speed up its growth
+	SetTownInvestment, ///< set the invested money of a town (debugging and game scripts)
 	PasteBlueprint, ///< build one chunk of a rail blueprint
 	PrepareRailRoute, ///< clear and level a part of the corridor of a rail trunk line
 
