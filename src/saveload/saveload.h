@@ -427,6 +427,8 @@ enum class SaveLoadVersion : uint16_t {
 
 	TownNeedsGrowth, ///< Fork mapuamap/openttd-engine: supply-driven town growth (needs, growth budget, power links).
 	TownValuablesBonus, ///< Fork mapuamap/openttd-engine: valuables bonus need of towns.
+	StationCatchmentUpgrade, ///< Fork mapuamap/openttd-engine: bought catchment radius levels of stations.
+	TownInvestment, ///< Fork mapuamap/openttd-engine: investments of companies into towns.
 
 	MaxVersion, ///< Highest possible saveload version.
 };
