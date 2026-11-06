@@ -22,6 +22,7 @@ add_files(
     pool_func.cpp
     pool_func.hpp
     pool_type.hpp
+    prefetch.hpp
     random_func.cpp
     random_func.hpp
     string_builder.cpp

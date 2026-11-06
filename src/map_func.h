@@ -14,6 +14,7 @@
 #include "tile_type.h"
 #include "map_type.h"
 #include "direction_func.h"
+#include "core/prefetch.hpp"
 
 /**
  * Wrapper class to abstract away the way the tiles are stored. It is
@@ -80,6 +81,18 @@ public:
 	 * @return The (unsigned) integer representation of the tile location.
 	 */
 	[[debug_inline]] constexpr operator uint() const { return this->tile.base(); }
+
+	/**
+	 * Hint the CPU to start loading the map data of a tile into the cache.
+	 * Purely a performance hint for loops that visit tiles in a scattered order
+	 * (e.g. the tile loop); it never changes any state.
+	 * @param tile The tile that will be accessed soon.
+	 */
+	static inline void Prefetch(TileIndex tile)
+	{
+		PrefetchCacheLine(&base_tiles[tile.base()]);
+		PrefetchCacheLine(&extended_tiles[tile.base()]);
+	}
 
 	/**
 	 * The type (bits 4..7), bridges (2..3), rainforest/desert (0..1)

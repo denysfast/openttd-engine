@@ -19,6 +19,7 @@
 #include "company_func.h"
 #include "train.h"
 #include "aircraft.h"
+#include "core/prefetch.hpp"
 #include "newgrf_debug.h"
 #include "newgrf_sound.h"
 #include "newgrf_station.h"
@@ -1000,6 +1001,13 @@ void CallVehicleTicks()
 
 	for (Vehicle *v : Vehicle::Iterate()) {
 		[[maybe_unused]] VehicleID vehicle_index = v->index;
+
+		/* Vehicles are allocated one by one, so with many of them nearly every vehicle is a cache
+		 * miss. Prefetch the vehicle a few pool slots ahead; this is only a hint. */
+		static constexpr size_t PREFETCH_DISTANCE = 8;
+		if (const Vehicle *ahead = Vehicle::GetIfValid(vehicle_index.base() + PREFETCH_DISTANCE); ahead != nullptr) {
+			PrefetchRange(ahead, sizeof(Train));
+		}
 
 		/* Vehicle could be deleted in this tick */
 		if (!v->Tick()) {

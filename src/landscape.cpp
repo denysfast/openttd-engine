@@ -832,11 +832,25 @@ void RunTileLoop()
 		count--;
 	}
 
+	/* The tiles are visited in a scattered order, so on large maps nearly every tile is a cache
+	 * miss and the loop is bound by memory latency. Run a second LFSR a few steps ahead and
+	 * prefetch the tiles it reaches; the visiting order (and so the game state) is unchanged. */
+	static constexpr uint PREFETCH_DISTANCE = 16;
+	auto next_tile = [feedback](TileIndex t) { return TileIndex{(t.base() >> 1) ^ (-(int32_t)(t.base() & 1) & feedback)}; };
+	TileIndex ahead = tile;
+	for (uint i = 0; i < PREFETCH_DISTANCE && i < count; i++) {
+		ahead = next_tile(ahead);
+		Tile::Prefetch(ahead);
+	}
+
 	while (count--) {
 		_tile_type_procs[GetTileType(tile)]->tile_loop_proc(tile);
 
+		ahead = next_tile(ahead);
+		Tile::Prefetch(ahead);
+
 		/* Get the next tile in sequence using a Galois LFSR. */
-		tile = TileIndex{(tile.base() >> 1) ^ (-(int32_t)(tile.base() & 1) & feedback)};
+		tile = next_tile(tile);
 	}
 
 	_cur_tileloop_tile = tile;
