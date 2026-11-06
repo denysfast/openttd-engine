@@ -63,6 +63,41 @@ static void CheckNextTrainTile(Train *v);
 /** Set while TrainLocoHandler moves a train; TrainController then skips the per-step viewport updates. */
 static bool _train_defer_viewport = false;
 
+/**
+ * Same as GroundVehicle::UpdateZPositionAndInclination(), but cheaper on the tiles trains mostly
+ * enter: the height of a station tile, or of a flat plain rail tile, is the same everywhere on
+ * the tile, so it is looked up once and the vehicle is neither going up nor down.
+ * @param v The vehicle that entered a new tile.
+ */
+static void TrainUpdateZPositionAndInclination(Train *v)
+{
+	TileIndex tile = TileVirtXY(v->x_pos, v->y_pos);
+	switch (GetTileType(tile)) {
+		case TileType::Station:
+			/* Same as the station tile's get_slope_pixel_z_proc. */
+			v->z_pos = GetTileMaxPixelZ(tile);
+			v->gv_flags.Reset({GroundVehicleFlag::GoingUp, GroundVehicleFlag::GoingDown});
+			assert(v->z_pos == GetSlopePixelZ(v->x_pos, v->y_pos, true));
+			return;
+
+		case TileType::Railway:
+			if (IsPlainRail(tile)) {
+				/* Same as GetSlopePixelZ_Rail for a flat tile. */
+				auto [tileh, z] = GetTilePixelSlope(tile);
+				if (tileh == SLOPE_FLAT) {
+					v->z_pos = z;
+					v->gv_flags.Reset({GroundVehicleFlag::GoingUp, GroundVehicleFlag::GoingDown});
+					assert(v->z_pos == GetSlopePixelZ(v->x_pos, v->y_pos, true));
+					return;
+				}
+			}
+			break;
+
+		default: break;
+	}
+	v->UpdateZPositionAndInclination();
+}
+
 /** Initial x subtile coordinate of rail vehicles for each direction. */
 static constexpr DiagDirectionIndexArray<uint8_t> _vehicle_initial_x_fract{10, 8, 4,  8};
 /** Initial y subtile coordinate of rail vehicles for each direction. */
@@ -3656,7 +3691,7 @@ bool TrainController(Train *v, Vehicle *nomove, bool reverse)
 		/* update the Z position of the vehicle */
 		int old_z = v->z_pos;
 		if (gp.new_tile != gp.old_tile) {
-			v->UpdateZPositionAndInclination();
+			TrainUpdateZPositionAndInclination(v);
 		} else {
 			v->UpdateZPosition();
 		}
