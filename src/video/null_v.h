@@ -17,6 +17,11 @@ class VideoDriver_Null : public VideoDriver {
 private:
 	uint ticks = 0; ///< Amount of ticks to run.
 	bool bench = false; ///< Print timing statistics of the game loop to stderr at the end.
+	bool draw = false; ///< Keep the selected blitter and draw into memory (to benchmark drawing).
+	bool full_redraw = false; ///< Redraw the whole screen every tick.
+	std::unique_ptr<uint8_t[]> video_mem; ///< Memory drawn into when #draw is set.
+	std::string shot; ///< Name of a raw screenshot of the last frame (with #draw).
+	bool verify_draw = false; ///< Check at the end that parallel and serial viewport drawing give the same screen.
 
 public:
 	std::optional<std::string_view> Start(const StringList &param) override;

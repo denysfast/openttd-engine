@@ -14,6 +14,7 @@
 #include "../window_func.h"
 #include "../openttd.h"
 #include "../linkgraph/linkgraphschedule.h"
+#include "../screenshot.h"
 #include "null_v.h"
 
 #include <chrono>
@@ -38,9 +39,23 @@ std::optional<std::string_view> VideoDriver_Null::Start(const StringList &parm)
 
 	this->ticks = GetDriverParamInt(parm, "ticks", 1000);
 	this->bench = GetDriverParamBool(parm, "bench");
+	this->draw = GetDriverParamBool(parm, "draw");
+	this->full_redraw = GetDriverParamBool(parm, "fullredraw");
+	if (auto shot = GetDriverParam(parm, "shot"); shot.has_value()) this->shot = *shot;
+	this->verify_draw = GetDriverParamBool(parm, "verifydraw");
 	_screen.width  = _screen.pitch = _cur_resolution.width;
 	_screen.height = _cur_resolution.height;
 	_screen.dst_ptr = nullptr;
+
+	if (this->draw) {
+		/* Benchmark the drawing too: keep the selected blitter and draw into memory. */
+		int bpp = BlitterFactory::GetCurrentBlitter()->GetScreenDepth();
+		if (bpp != 0) this->video_mem = std::make_unique<uint8_t[]>(static_cast<size_t>(_cur_resolution.width) * _cur_resolution.height * (bpp / 8));
+		_screen.dst_ptr = this->video_mem.get();
+		ScreenSizeChanged();
+		BlitterFactory::GetCurrentBlitter()->PostResize();
+		return std::nullopt;
+	}
 	ScreenSizeChanged();
 
 	/* Do not render, nor blit */
@@ -77,6 +92,7 @@ void VideoDriver_Null::MainLoop()
 		auto start = std::chrono::steady_clock::now();
 		::GameLoop();
 		::InputLoop();
+		if (this->full_redraw && i > 0) MarkWholeScreenDirty();
 		::UpdateWindows();
 		if (this->bench && i > 0) {
 			if (_pause_mode.Test(PauseMode::LinkGraph)) {
@@ -98,6 +114,56 @@ void VideoDriver_Null::MainLoop()
 		extern void PrintFramerateToStderr();
 		PrintFramerateToStderr();
 	}
+
+	if (this->draw && this->verify_draw && this->video_mem != nullptr) {
+		/* Draw the same frame with one thread and with several; the screen must be identical. */
+		extern bool _viewport_draw_parallel;
+		size_t bytes = static_cast<size_t>(_screen.pitch) * _screen.height * (BlitterFactory::GetCurrentBlitter()->GetScreenDepth() / 8);
+		auto draw_all = [](bool parallel) {
+			_viewport_draw_parallel = parallel;
+			MarkWholeScreenDirty();
+			DrawDirtyBlocks();
+		};
+		draw_all(false); // warm up: resolves sprites that are only resolved on drawing
+		draw_all(false);
+		std::vector<uint8_t> serial(this->video_mem.get(), this->video_mem.get() + bytes);
+		auto compare = [&](std::string_view what) {
+			size_t diff = 0;
+			size_t bpp = BlitterFactory::GetCurrentBlitter()->GetScreenDepth() / 8;
+			std::string where;
+			for (size_t b = 0; b < bytes; b++) {
+				if (serial[b] == this->video_mem[b]) continue;
+				if (diff++ < 12) where += fmt::format(" ({},{})", (b / bpp) % _screen.pitch, (b / bpp) / _screen.pitch);
+			}
+			fmt::print(stderr, "bench: verify draw ({}): {} of {} bytes differ{}\n", what, diff, bytes, where);
+		};
+		draw_all(false);
+		compare("serial again");
+		draw_all(true);
+		compare("parallel");
+
+		/* Many small dirty rectangles, like moving vehicles cause: drawn all at once by the main viewport. */
+		auto draw_scattered = [](bool parallel) {
+			_viewport_draw_parallel = parallel;
+			for (int y = 0; y < _screen.height; y += 96) {
+				for (int x = (y / 96 % 2) * 128; x < _screen.width; x += 320) AddDirtyBlock(x, y, x + 200, y + 40);
+			}
+			DrawDirtyBlocks();
+		};
+		draw_all(false);
+		draw_scattered(false);
+		std::copy_n(this->video_mem.get(), bytes, serial.begin());
+		draw_all(false);
+		draw_scattered(false);
+		compare("serial, scattered rectangles again");
+		draw_all(false);
+		draw_scattered(true);
+		compare("parallel, scattered rectangles");
+		_viewport_draw_parallel = true;
+	}
+
+	/* Benchmark: a raw screenshot of the last frame, to compare drawing between builds. */
+	if (this->draw && !this->shot.empty()) MakeScreenshot(SC_CRASHLOG, this->shot);
 
 	/* If requested, make a save just before exit. The normal exit-flow is
 	 * not triggered from this driver, so we have to do this manually. */
