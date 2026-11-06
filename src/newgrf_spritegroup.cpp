@@ -18,7 +18,7 @@
 SpriteGroupPool _spritegroup_pool("SpriteGroup");
 INSTANTIATE_POOL_METHODS(SpriteGroup)
 
-/* static */ TemporaryStorageArray<int32_t, 0x110> ResolverObject::temp_store;
+/* static */ thread_local TemporaryStorageArray<int32_t, 0x110> ResolverObject::temp_store;
 
 
 /**

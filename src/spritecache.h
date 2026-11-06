@@ -26,6 +26,15 @@ protected:
 };
 
 void *GetRawSprite(SpriteID sprite, SpriteType type, SpriteAllocator *allocator = nullptr, SpriteEncoder *encoder = nullptr);
+
+/**
+ * While an instance lives, the current thread uses the sprite cache together with other threads that
+ * have one (several threads drawing a viewport). Nothing may be removed from the cache meanwhile.
+ */
+struct SpriteCacheSharedAccess {
+	SpriteCacheSharedAccess();
+	~SpriteCacheSharedAccess();
+};
 bool SpriteExists(SpriteID sprite);
 
 SpriteType GetSpriteType(SpriteID sprite);

@@ -74,6 +74,8 @@
 #include "vehicle_gui.h"
 #include "blitter/factory.hpp"
 #include "spritecache.h"
+#include "thread.h"
+#include "newgrf_debug.h"
 #include "strings_func.h"
 #include "zoom_func.h"
 #include "vehicle_func.h"
@@ -95,7 +97,12 @@
 #include "framerate_type.h"
 #include "viewport_cmd.h"
 
+#include <atomic>
+#include <condition_variable>
 #include <forward_list>
+#include <functional>
+#include <mutex>
+#include <thread>
 #include <stack>
 
 #include "widgets/vehicle_widget.h"
@@ -192,10 +199,10 @@ struct ViewportDrawer {
 
 static bool MarkViewportDirty(const Viewport &vp, int left, int top, int right, int bottom);
 
-static ViewportDrawer _vd;
+static thread_local ViewportDrawer _vd; ///< Thread local: viewports may be drawn by several threads, see #ViewportDrawPool.
 
 TileHighlightData _thd;
-static TileInfo _cur_ti;
+static thread_local TileInfo _cur_ti; ///< Thread local, see #_vd.
 bool _draw_bounding_boxes = false;
 bool _draw_dirty_blocks = false;
 uint _dirty_block_colour = 0;
@@ -1789,6 +1796,327 @@ static void ViewportDrawParentSprites(const ParentSpriteToSortVector *psd, const
 }
 
 /**
+ * Threads that draw parts of a viewport at the same time.
+ *
+ * Collecting and sorting the sprites of a viewport stays on the drawing thread (it resolves NewGRF
+ * sprites, which is not thread safe), but the actual blitting of the sorted sprites is split into
+ * horizontal bands of the screen, drawn by these threads. Each band draws all sprites in the same
+ * order, clipped to the band, so the result is exactly the same as drawing the whole area at once
+ * (just like a viewport is already redrawn in arbitrary dirty rectangles).
+ */
+class ViewportDrawPool {
+public:
+	/** Create the pool; threads are started on first use. */
+	ViewportDrawPool()
+	{
+		uint threads = std::thread::hardware_concurrency();
+		if (const char *env = std::getenv("OTTD_DRAW_THREADS"); env != nullptr) {
+			threads = 0;
+			for (; *env >= '0' && *env <= '9'; env++) threads = threads * 10 + (*env - '0');
+		}
+		/* The drawing thread itself takes part as well. */
+		this->wanted_workers = std::min<uint>(threads > 1 ? threads - 1 : 0, MAX_WORKERS);
+	}
+
+	~ViewportDrawPool()
+	{
+		{
+			std::lock_guard<std::mutex> lock(this->mutex);
+			this->stop = true;
+		}
+		this->start.notify_all();
+		for (auto &t : this->workers) {
+			if (t.joinable()) t.join();
+		}
+	}
+
+	/** @return Number of threads that draw, including the calling thread. */
+	uint Threads() const { return this->wanted_workers + 1; }
+
+	/**
+	 * Run \a job for every index in [0, \a count) on all threads; returns when all are done.
+	 * @param count Number of jobs.
+	 * @param job Function called with the job index.
+	 */
+	void Run(uint count, const std::function<void(uint)> &job)
+	{
+		this->StartWorkers();
+		{
+			std::lock_guard<std::mutex> lock(this->mutex);
+			this->job = &job;
+			this->job_count = count;
+			this->next_job.store(0, std::memory_order_relaxed);
+			this->busy = static_cast<uint>(this->workers.size());
+			this->generation++;
+		}
+		this->start.notify_all();
+		this->Work(job, count);
+
+		std::unique_lock<std::mutex> lock(this->mutex);
+		this->done.wait(lock, [this] { return this->busy == 0; });
+		this->job = nullptr;
+	}
+
+private:
+	static constexpr uint MAX_WORKERS = 15; ///< More threads hardly help: drawing is memory bound by then.
+
+	void StartWorkers()
+	{
+		while (this->workers.size() < this->wanted_workers) {
+			std::thread &t = this->workers.emplace_back();
+			if (!StartNewThread(&t, "ottd:draw", [this]() { this->WorkerMain(); })) {
+				this->workers.pop_back();
+				this->wanted_workers = static_cast<uint>(this->workers.size());
+				break;
+			}
+		}
+	}
+
+	void Work(const std::function<void(uint)> &job, uint count)
+	{
+		for (uint i; (i = this->next_job.fetch_add(1, std::memory_order_relaxed)) < count;) job(i);
+	}
+
+	void WorkerMain()
+	{
+		uint seen = 0;
+		for (;;) {
+			const std::function<void(uint)> *job;
+			uint count;
+			{
+				std::unique_lock<std::mutex> lock(this->mutex);
+				this->start.wait(lock, [this, seen] { return this->stop || this->generation != seen; });
+				if (this->stop) return;
+				seen = this->generation;
+				job = this->job;
+				count = this->job_count;
+			}
+			this->Work(*job, count);
+			{
+				std::lock_guard<std::mutex> lock(this->mutex);
+				if (--this->busy == 0) this->done.notify_one();
+			}
+		}
+	}
+
+	std::vector<std::thread> workers; ///< The worker threads.
+	uint wanted_workers = 0; ///< Number of worker threads to use.
+	std::mutex mutex; ///< Protects everything below except #next_job.
+	std::condition_variable start; ///< Signalled when a new run starts (or on #stop).
+	std::condition_variable done; ///< Signalled when the last worker finished a run.
+	const std::function<void(uint)> *job = nullptr; ///< Job of the current run.
+	uint job_count = 0; ///< Number of jobs of the current run.
+	std::atomic<uint> next_job = 0; ///< Next job index to take.
+	uint busy = 0; ///< Workers still busy with the current run.
+	uint generation = 0; ///< Number of the current run.
+	bool stop = false; ///< Set when the pool is destroyed.
+};
+
+bool _viewport_draw_parallel = true; ///< Whether viewports may be drawn by several threads, see #ViewportDrawPool.
+static const Viewport *_viewport_sprites_predrawn = nullptr; ///< Viewport whose sprites of the dirty areas are already drawn, see PredrawMainViewportSprites().
+
+static constexpr int MIN_BAND_ROWS = 48; ///< Thinner bands cost more in collecting tiles twice than they gain.
+
+/**
+ * A part of a viewport whose landscape and vehicle sprites are collected, sorted and drawn by one
+ * thread, with its own (thread local) #_vd; just like a viewport is drawn per dirty rectangle anyway.
+ */
+struct ViewportSpriteJob {
+	DrawPixelInfo area; ///< The area being drawn (as ViewportDoDraw() sets up #_vd.dpi); clipping is done for it.
+	int first_row; ///< First row of the area (in screen pixels) this job draws.
+	int end_row; ///< Row after the last row this job draws.
+};
+
+/**
+ * Collect, sort and draw the landscape and vehicle sprites of a job. The sprites touching the job's rows
+ * are collected, but drawn with the clipping of the whole area, only writing the job's rows: the sprite
+ * rows that get sampled are then the same as when the whole area is drawn at once.
+ * @param job The job; its area is used as #_cur_dpi (only read).
+ */
+static void DrawViewportSpriteJob(ViewportSpriteJob &job)
+{
+	const ZoomLevel zoom = job.area.zoom;
+	_vd.dpi = job.area;
+	_vd.dpi.top = job.area.top + ScaleByZoom(job.first_row, zoom);
+	_vd.dpi.height = ScaleByZoom(job.end_row - job.first_row, zoom);
+	_vd.dpi.dst_ptr = BlitterFactory::GetCurrentBlitter()->MoveTo(job.area.dst_ptr, 0, job.first_row);
+	_vd.combine_sprites = SpriteCombineMode::None;
+	_vd.last_child = LAST_CHILD_NONE;
+	AutoRestoreBackup cur_dpi(_cur_dpi, &_vd.dpi);
+
+	ViewportAddLandscape();
+	ViewportAddVehicles(&_vd.dpi, false, true);
+
+	for (auto &psd : _vd.parent_sprites_to_draw) {
+		_vd.parent_sprites_to_sort.push_back(&psd);
+	}
+	_vp_sprite_sorter(&_vd.parent_sprites_to_sort);
+
+	_cur_dpi = &job.area;
+	SetSpriteDrawRows(job.first_row, job.end_row);
+	if (!_vd.tile_sprites_to_draw.empty()) ViewportDrawTileSprites(&_vd.tile_sprites_to_draw);
+	ViewportDrawParentSprites(&_vd.parent_sprites_to_sort, &_vd.child_screen_sprites_to_draw);
+	SetSpriteDrawRows(0, INT_MAX);
+
+	_vd.tile_sprites_to_draw.clear();
+	_vd.parent_sprites_to_draw.clear();
+	_vd.parent_sprites_to_sort.clear();
+	_vd.child_screen_sprites_to_draw.clear();
+}
+
+/** @return The pool of threads that draw viewports. */
+static ViewportDrawPool &GetViewportDrawPool()
+{
+	static ViewportDrawPool pool;
+	return pool;
+}
+
+/** @return Whether viewports can be drawn by several threads now. */
+static bool CanDrawViewportsParallel()
+{
+	/* The NewGRF sprite picker collects drawn sprites in a shared set; bounding boxes are drawn from one list. */
+	return _viewport_draw_parallel && GetViewportDrawPool().Threads() > 1 &&
+		_newgrf_debug_sprite_picker.mode == SPM_NONE && !_draw_bounding_boxes;
+}
+
+/**
+ * Add jobs for an area of a viewport: one, or several horizontal bands when it is big.
+ * Resolves the sprites of vehicles in the area that need it first; that changes the vehicles,
+ * which may be drawn by several jobs, so it is done here, by the drawing thread.
+ * @param jobs The jobs to add to.
+ * @param area The area, as ViewportDoDraw() sets up #_vd.dpi.
+ */
+static void AddViewportSpriteJobs(std::vector<ViewportSpriteJob> &jobs, const DrawPixelInfo &area)
+{
+	DrawPixelInfo revalidate = area;
+	ViewportAddVehicles(&revalidate, true, false);
+
+	const int rows = UnScaleByZoom(area.height, area.zoom);
+	const uint bands = std::clamp<uint>(rows / MIN_BAND_ROWS, 1, GetViewportDrawPool().Threads());
+	for (uint band = 0; band < bands; band++) {
+		jobs.push_back({area, static_cast<int>(rows * band / bands), static_cast<int>(rows * (band + 1) / bands)});
+	}
+}
+
+/**
+ * Run the jobs with all threads of the pool.
+ * @param jobs The jobs.
+ */
+static void RunViewportSpriteJobs(std::vector<ViewportSpriteJob> &jobs)
+{
+	/* This thread draws jobs too; keep the area it is drawing. */
+	const DrawPixelInfo saved_dpi = _vd.dpi;
+	SpriteCacheSharedAccess shared_sprite_cache;
+	GetViewportDrawPool().Run(static_cast<uint>(jobs.size()), [&jobs](uint i) {
+		SpriteCacheSharedAccess shared_sprite_cache;
+		DrawViewportSpriteJob(jobs[i]);
+	});
+	_vd.dpi = saved_dpi;
+	_vd.combine_sprites = SpriteCombineMode::None;
+	_vd.last_child = LAST_CHILD_NONE;
+}
+
+/**
+ * Collect, sort and draw the landscape and vehicle sprites of the area in #_vd.dpi with several threads,
+ * see #ViewportDrawPool and #ViewportSpriteJob. Signs, text effects and the overlay are left to the caller
+ * (drawing text is not thread safe).
+ * @return False if the area is too small to be worth it; nothing is done then.
+ */
+static bool ViewportDrawBandsParallel()
+{
+	const int rows = UnScaleByZoom(_vd.dpi.height, _vd.dpi.zoom);
+	const int width = UnScaleByZoom(_vd.dpi.width, _vd.dpi.zoom);
+	static constexpr size_t MIN_PIXELS = 256 * 256; ///< Smaller areas are drawn on one thread.
+	if (rows < 2 * MIN_BAND_ROWS || static_cast<size_t>(rows) * width < MIN_PIXELS || !CanDrawViewportsParallel()) return false;
+
+	static std::vector<ViewportSpriteJob> jobs;
+	jobs.clear();
+	AddViewportSpriteJobs(jobs, _vd.dpi);
+	RunViewportSpriteJobs(jobs);
+	return true;
+}
+
+/**
+ * Set up the area of a viewport to draw, the way ViewportDoDraw() does.
+ * @param[out] dpi The area: virtual coordinates, with \a base 's pixels.
+ * @param vp The viewport.
+ * @param left Left edge, in virtual coordinates.
+ * @param top Top edge, in virtual coordinates.
+ * @param right Right edge, in virtual coordinates.
+ * @param bottom Bottom edge, in virtual coordinates.
+ * @param base The drawing target (window or screen) the area lies in.
+ * @return Screen position of the top left corner of the area.
+ */
+static Point SetupViewportArea(DrawPixelInfo &dpi, const Viewport &vp, int left, int top, int right, int bottom, const DrawPixelInfo &base)
+{
+	dpi.zoom = vp.zoom;
+	int mask = ScaleByZoom(-1, vp.zoom);
+
+	dpi.width = (right - left) & mask;
+	dpi.height = (bottom - top) & mask;
+	dpi.left = left & mask;
+	dpi.top = top & mask;
+	dpi.pitch = base.pitch;
+
+	int x = UnScaleByZoom(dpi.left - (vp.virtual_left & mask), vp.zoom) + vp.left;
+	int y = UnScaleByZoom(dpi.top - (vp.virtual_top & mask), vp.zoom) + vp.top;
+
+	dpi.dst_ptr = BlitterFactory::GetCurrentBlitter()->MoveTo(base.dst_ptr, x - base.left, y - base.top);
+	return {x, y};
+}
+
+/**
+ * Draw the landscape and vehicle sprites of the main viewport in all dirty rectangles of the screen
+ * at once, with several threads; afterwards the rectangles are drawn as usual (windows, signs, text),
+ * but without these sprites. Drawing many (small) dirty rectangles one by one leaves the threads idle.
+ * The main viewport is the bottom window, so windows on top of it still cover what is drawn here.
+ * @param rects The dirty rectangles, in screen coordinates.
+ * @return Whether the sprites have been drawn; then FinishPredrawnViewportSprites() must follow the drawing.
+ */
+bool PredrawMainViewportSprites(std::span<const Rect> rects)
+{
+	if (!CanDrawViewportsParallel()) return false;
+	const Window *w = FindWindowById(WindowClass::MainWindow, 0);
+	if (w == nullptr || w->viewport == nullptr) return false;
+	const Viewport &vp = *w->viewport;
+
+	static std::vector<ViewportSpriteJob> jobs;
+	jobs.clear();
+	size_t pixels = 0;
+	for (const Rect &r : rects) {
+		int left = std::max(r.left, vp.left);
+		int top = std::max(r.top, vp.top);
+		int right = std::min(r.right, vp.left + vp.width);
+		int bottom = std::min(r.bottom, vp.top + vp.height);
+		if (left >= right || top >= bottom) continue;
+
+		DrawPixelInfo area;
+		SetupViewportArea(area, vp,
+			ScaleByZoom(left - vp.left, vp.zoom) + vp.virtual_left,
+			ScaleByZoom(top - vp.top, vp.zoom) + vp.virtual_top,
+			ScaleByZoom(right - vp.left, vp.zoom) + vp.virtual_left,
+			ScaleByZoom(bottom - vp.top, vp.zoom) + vp.virtual_top,
+			_screen);
+		if (area.width <= 0 || area.height <= 0) continue;
+		AddViewportSpriteJobs(jobs, area);
+		pixels += static_cast<size_t>(right - left) * (bottom - top);
+	}
+	/* Not worth waking the threads for a few small areas: draw as usual. */
+	static constexpr size_t MIN_PIXELS = 128 * 128;
+	if (jobs.size() < 2 || pixels < MIN_PIXELS) return false;
+
+	RunViewportSpriteJobs(jobs);
+	_viewport_sprites_predrawn = &vp;
+	return true;
+}
+
+/** The dirty rectangles have been drawn after PredrawMainViewportSprites(). */
+void FinishPredrawnViewportSprites()
+{
+	_viewport_sprites_predrawn = nullptr;
+}
+
+/**
  * Draws the bounding boxes of all ParentSprites
  * @param psd Array of ParentSprites
  */
@@ -1867,39 +2195,32 @@ static void ViewportDrawStrings(ZoomLevel zoom, const StringSpriteToDrawVector *
 
 void ViewportDoDraw(const Viewport &vp, int left, int top, int right, int bottom)
 {
-	_vd.dpi.zoom = vp.zoom;
-	int mask = ScaleByZoom(-1, vp.zoom);
-
 	_vd.combine_sprites = SpriteCombineMode::None;
-
-	_vd.dpi.width = (right - left) & mask;
-	_vd.dpi.height = (bottom - top) & mask;
-	_vd.dpi.left = left & mask;
-	_vd.dpi.top = top & mask;
-	_vd.dpi.pitch = _cur_dpi->pitch;
 	_vd.last_child = LAST_CHILD_NONE;
-
-	int x = UnScaleByZoom(_vd.dpi.left - (vp.virtual_left & mask), vp.zoom) + vp.left;
-	int y = UnScaleByZoom(_vd.dpi.top - (vp.virtual_top & mask), vp.zoom) + vp.top;
-
-	_vd.dpi.dst_ptr = BlitterFactory::GetCurrentBlitter()->MoveTo(_cur_dpi->dst_ptr, x - _cur_dpi->left, y - _cur_dpi->top);
+	auto [x, y] = SetupViewportArea(_vd.dpi, vp, left, top, right, bottom, *_cur_dpi);
 	AutoRestoreBackup dpi_backup(_cur_dpi, &_vd.dpi);
 
-	ViewportAddLandscape();
-	ViewportAddVehicles(&_vd.dpi);
+	/* With several threads the landscape and vehicle sprites are drawn separately (or already have been). */
+	const bool parallel = &vp == _viewport_sprites_predrawn || ViewportDrawBandsParallel();
+	if (!parallel) {
+		ViewportAddLandscape();
+		ViewportAddVehicles(&_vd.dpi);
+	}
 
 	ViewportAddKdtreeSigns(&_vd.dpi);
 
 	DrawTextEffects(&_vd.dpi);
 
-	if (!_vd.tile_sprites_to_draw.empty()) ViewportDrawTileSprites(&_vd.tile_sprites_to_draw);
+	if (!parallel) {
+		for (auto &psd : _vd.parent_sprites_to_draw) {
+			_vd.parent_sprites_to_sort.push_back(&psd);
+		}
 
-	for (auto &psd : _vd.parent_sprites_to_draw) {
-		_vd.parent_sprites_to_sort.push_back(&psd);
+		_vp_sprite_sorter(&_vd.parent_sprites_to_sort);
+
+		if (!_vd.tile_sprites_to_draw.empty()) ViewportDrawTileSprites(&_vd.tile_sprites_to_draw);
+		ViewportDrawParentSprites(&_vd.parent_sprites_to_sort, &_vd.child_screen_sprites_to_draw);
 	}
-
-	_vp_sprite_sorter(&_vd.parent_sprites_to_sort);
-	ViewportDrawParentSprites(&_vd.parent_sprites_to_sort, &_vd.child_screen_sprites_to_draw);
 
 	if (_draw_bounding_boxes) ViewportDrawBoundingBoxes(&_vd.parent_sprites_to_sort);
 	if (_draw_dirty_blocks) ViewportDrawDirtyBlocks();

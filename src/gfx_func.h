@@ -91,6 +91,8 @@ Dimension GetSpriteSize(SpriteID sprid, Point *offset = nullptr, ZoomLevel zoom 
 Dimension GetScaledSpriteSize(SpriteID sprid); /* widget.cpp */
 Dimension GetSquareScaledSpriteSize(SpriteID sprid); /* widget.cpp */
 void DrawSpriteViewport(SpriteID img, PaletteID pal, int x, int y, const SubSprite *sub = nullptr);
+
+void SetSpriteDrawRows(int first, int end);
 void DrawSprite(SpriteID img, PaletteID pal, int x, int y, const SubSprite *sub = nullptr, ZoomLevel zoom = _gui_zoom);
 void DrawSpriteIgnorePadding(SpriteID img, PaletteID pal, const Rect &r, Alignment align); /* widget.cpp */
 std::unique_ptr<uint32_t[]> DrawSpriteToRgbaBuffer(SpriteID spriteId, ZoomLevel zoom = _gui_zoom);
@@ -233,6 +235,6 @@ std::pair<uint8_t, uint8_t> GetBroadestDigit(FontSize size);
 
 int GetCharacterHeight(FontSize size);
 
-extern DrawPixelInfo *_cur_dpi;
+extern thread_local DrawPixelInfo *_cur_dpi;
 
 #endif /* GFX_FUNC_H */

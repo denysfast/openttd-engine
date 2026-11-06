@@ -1154,8 +1154,10 @@ static void DoDrawVehicle(const Vehicle *v)
 /**
  * Add the vehicle sprites that should be drawn at a part of the screen.
  * @param dpi Rectangle being drawn.
+ * @param revalidate Resolve the sprites of vehicles that need it (changes the vehicles).
+ * @param draw Add the vehicle sprites to the viewport; without it only the sprites are revalidated.
  */
-void ViewportAddVehicles(DrawPixelInfo *dpi)
+void ViewportAddVehicles(DrawPixelInfo *dpi, bool revalidate, bool draw)
 {
 	/* The bounding rectangle */
 	const int l = dpi->left;
@@ -1204,7 +1206,7 @@ void ViewportAddVehicles(DrawPixelInfo *dpi)
 					 * This vehicle can potentially be drawn as part of this viewport and
 					 * needs to be revalidated, as the sprite may not be correct.
 					 */
-					if (v->sprite_cache.revalidate_before_draw) {
+					if (revalidate && v->sprite_cache.revalidate_before_draw) {
 						VehicleSpriteSeq seq;
 						v->GetImage(v->direction, EngineImageType::OnMap, &seq);
 
@@ -1226,7 +1228,7 @@ void ViewportAddVehicles(DrawPixelInfo *dpi)
 						v->sprite_cache.revalidate_before_draw = false;
 					}
 
-					if (l <= v->coord.right &&
+					if (draw && l <= v->coord.right &&
 						t <= v->coord.bottom &&
 						r >= v->coord.left &&
 						b >= v->coord.top) DoDrawVehicle(v);

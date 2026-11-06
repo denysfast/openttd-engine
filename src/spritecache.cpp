@@ -15,12 +15,16 @@
 #include "settings_type.h"
 #include "blitter/factory.hpp"
 #include "core/math_func.hpp"
+#include "core/backup_type.hpp"
 #include "video/video_driver.hpp"
 #include "spritecache.h"
 #include "spritecache_internal.h"
 
 #include "table/sprites.h"
 #include "table/palette_convert.h"
+
+#include <atomic>
+#include <mutex>
 
 #include "safeguards.h"
 
@@ -32,6 +36,25 @@ static std::vector<SpriteCache> _spritecache;
 static size_t _spritecache_bytes_used = 0;
 static uint32_t _sprite_lru_counter;
 static std::vector<std::unique_ptr<SpriteFile>> _sprite_files;
+
+/* Shared access while several threads draw parts of a viewport, see SpriteCacheSharedAccess. Nothing is
+ * removed from the cache then (that only happens in the game loop), sprites may only be added. */
+static thread_local int _sprite_cache_shared = 0; ///< Nesting count: this thread accesses the cache together with others.
+static uint32_t _sprite_cache_shared_lru = 0; ///< LRU stamp given to sprites used during shared access.
+static std::recursive_mutex _sprite_cache_load_mutex; ///< Serialises loading sprites during shared access.
+static std::atomic<uint> _sprite_cache_shared_users = 0; ///< Number of threads with shared access.
+
+SpriteCacheSharedAccess::SpriteCacheSharedAccess()
+{
+	if (_sprite_cache_shared_users.fetch_add(1) == 0) _sprite_cache_shared_lru = ++_sprite_lru_counter;
+	_sprite_cache_shared++;
+}
+
+SpriteCacheSharedAccess::~SpriteCacheSharedAccess()
+{
+	_sprite_cache_shared--;
+	_sprite_cache_shared_users.fetch_sub(1);
+}
 
 static inline SpriteCache *GetSpriteCache(uint index)
 {
@@ -862,6 +885,18 @@ void *GetRawSprite(SpriteID sprite, SpriteType type, SpriteAllocator *allocator,
 	}
 
 	SpriteCache *sc = GetSpriteCache(sprite);
+
+	if (_sprite_cache_shared > 0 && allocator == nullptr && encoder == nullptr) {
+		/* Several threads draw: a loaded sprite only gets the common LRU stamp; loading (and
+		 * anything unusual) happens one thread at a time. */
+		if (sc->type == type && sc->ptr != nullptr) {
+			std::atomic_ref<uint32_t>(sc->lru).store(_sprite_cache_shared_lru, std::memory_order_relaxed);
+			return static_cast<void *>(sc->ptr.get());
+		}
+		std::lock_guard<std::recursive_mutex> lock(_sprite_cache_load_mutex);
+		AutoRestoreBackup exclusive(_sprite_cache_shared, 0);
+		return GetRawSprite(sprite, type, allocator, encoder);
+	}
 
 	if (sc->type != type) return HandleInvalidSpriteRequest(sprite, type, sc, allocator, encoder);
 

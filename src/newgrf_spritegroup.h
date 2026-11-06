@@ -321,7 +321,7 @@ struct ScopeResolver {
  */
 struct ResolverObject {
 private:
-	static TemporaryStorageArray<int32_t, 0x110> temp_store;
+	static thread_local TemporaryStorageArray<int32_t, 0x110> temp_store; ///< Thread local: viewports are drawn by several threads.
 
 public:
 	/**

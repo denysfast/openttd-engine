@@ -51,7 +51,8 @@ PauseModes _pause_mode;
 GameSessionStats _game_session_stats; ///< Statistics about the current session.
 
 static EnumIndexArray<std::array<uint8_t, 244>, FontSize, FontSize::End> _stringwidth_table; ///< Cache containing width of often used characters. @see GetCharacterWidth()
-DrawPixelInfo *_cur_dpi;
+/* Thread local: viewports may be drawn by several threads at once, each into its own part of the screen. */
+thread_local DrawPixelInfo *_cur_dpi;
 
 static void GfxMainBlitterViewport(const Sprite *sprite, int x, int y, BlitterMode mode, const SubSprite *sub = nullptr, SpriteID sprite_id = SPR_CURSOR_MOUSE);
 static void GfxMainBlitter(const Sprite *sprite, int x, int y, BlitterMode mode, const SubSprite *sub = nullptr, SpriteID sprite_id = SPR_CURSOR_MOUSE, ZoomLevel zoom = ZoomLevel::Min);
@@ -71,8 +72,26 @@ int _gui_scale_cfg;                         ///< GUI scale in config.
  * @ingroup dirty
  */
 static Rect _invalid_rect;
-static const uint8_t *_colour_remap_ptr;
-static uint8_t _string_colourremap[3]; ///< Recoloursprite for stringdrawing. The grf loader ensures that #SpriteType::Font sprites only use colours 0 to 2.
+static thread_local const uint8_t *_colour_remap_ptr; ///< Thread local, see #_cur_dpi.
+
+/** Rows of #_cur_dpi that sprites are drawn into, see SetSpriteDrawRows(). */
+static thread_local struct {
+	int first = 0; ///< First row (in screen pixels from the top of #_cur_dpi).
+	int end = INT_MAX; ///< Row after the last row.
+} _draw_rows;
+
+/**
+ * Limit the drawing of sprites by this thread to some rows of #_cur_dpi, without changing how they are
+ * clipped and sampled otherwise. Used to draw one viewport area with several threads, see ViewportDrawPool.
+ * @param first First row to draw, in screen pixels from the top of #_cur_dpi.
+ * @param end Row after the last row to draw.
+ */
+void SetSpriteDrawRows(int first, int end)
+{
+	_draw_rows.first = first;
+	_draw_rows.end = end;
+}
+static thread_local uint8_t _string_colourremap[3]; ///< Thread local, see #_cur_dpi. Recoloursprite for stringdrawing. The grf loader ensures that #SpriteType::Font sprites only use colours 0 to 2.
 
 static const uint DIRTY_BLOCK_HEIGHT   = 8;
 static const uint DIRTY_BLOCK_WIDTH    = 64;
@@ -1024,6 +1043,7 @@ void DrawSpriteViewport(SpriteID img, PaletteID pal, int x, int y, const SubSpri
 	}
 }
 
+
 /**
  * Draw a sprite, not in a viewport
  * @param img  Image number to draw
@@ -1140,6 +1160,17 @@ static void GfxBlitter(const Sprite * const sprite, int x, int y, BlitterMode mo
 	if (y > 0) {
 		bp.height -= UnScaleByZoom(y, zoom);
 		if (bp.height <= 0) return;
+	}
+
+	/* Only some rows of the area are to be drawn (by this thread). Clipping the rows only now keeps
+	 * the source rows that are sampled the same as when the whole area is drawn at once. */
+	if (_draw_rows.first > bp.top || _draw_rows.end < bp.top + bp.height) {
+		int first = std::max(bp.top, _draw_rows.first);
+		int end = std::min(bp.top + bp.height, _draw_rows.end);
+		if (first >= end) return;
+		bp.skip_top += first - bp.top;
+		bp.height = end - first;
+		bp.top = first;
 	}
 
 	x -= SCALED_XY ? ScaleByZoom(dpi->left, zoom) : dpi->left;
@@ -1457,6 +1488,11 @@ void DrawDirtyBlocks()
 	auto is_dirty = [](auto block) -> bool { return block != 0; };
 	auto block = _dirty_blocks.begin();
 
+	/* The rectangles are first collected (right and bottom exclusive), so the main viewport can draw its
+	 * sprites in all of them at once with several threads; then they are drawn as usual. */
+	static std::vector<Rect> rects;
+	rects.clear();
+
 	for (size_t x = 0; x < _dirty_blocks_per_row; ++x) {
 		auto last_of_column = block + _dirty_blocks_per_column;
 		for (size_t y = 0; y < _dirty_blocks_per_column; ++y, ++block) {
@@ -1491,11 +1527,24 @@ void DrawDirtyBlocks()
 			right = std::min(_invalid_rect.right, right);
 			bottom = std::min(_invalid_rect.bottom, bottom);
 
-			if (left < right && top < bottom) {
-				RedrawScreenRect(left, top, right, bottom);
-			}
+			if (left < right && top < bottom) rects.push_back({left, top, right, bottom});
 		}
 	}
+
+	if (rects.size() > 1) {
+		/* What is under the mouse cursor and the chat messages is restored as soon as a rectangle
+		 * touching them is redrawn; do that before drawing anything below them. */
+		for (const Rect &r : rects) {
+			if (_cursor.visible && r.right > _cursor.draw_pos.x && r.left < _cursor.draw_pos.x + _cursor.draw_size.x &&
+					r.bottom > _cursor.draw_pos.y && r.top < _cursor.draw_pos.y + _cursor.draw_size.y) {
+				UndrawMouseCursor();
+			}
+		}
+		if (_networking) NetworkUndrawChatMessage();
+	}
+	const bool predrawn = rects.size() > 1 && PredrawMainViewportSprites(rects);
+	for (const Rect &r : rects) RedrawScreenRect(r.left, r.top, r.right, r.bottom);
+	if (predrawn) FinishPredrawnViewportSprites();
 
 	++_dirty_block_colour;
 	_invalid_rect.left = _screen.width;

@@ -70,6 +70,8 @@ void SetTileSelectSize(int w, int h);
 void SetTileSelectBigSize(int ox, int oy, int sx, int sy);
 
 void ViewportDoDraw(const Viewport &vp, int left, int top, int right, int bottom);
+bool PredrawMainViewportSprites(std::span<const Rect> rects);
+void FinishPredrawnViewportSprites();
 
 bool ScrollWindowToTile(TileIndex tile, Window *w, bool instant = false);
 bool ScrollWindowTo(int x, int y, int z, Window *w, bool instant = false);
