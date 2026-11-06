@@ -24,6 +24,7 @@ CommandCost CmdSendVehicleToDepot(DoCommandFlags flags, VehicleID veh_id, DepotC
 CommandCost CmdChangeServiceInt(DoCommandFlags flags, VehicleID veh_id, uint16_t serv_int, bool is_custom, bool is_percent);
 CommandCost CmdRenameVehicle(DoCommandFlags flags, VehicleID veh_id, const std::string &text);
 std::tuple<CommandCost, VehicleID> CmdCloneVehicle(DoCommandFlags flags, TileIndex tile, VehicleID veh_id, bool share_orders);
+std::tuple<CommandCost, uint16_t, uint16_t> CmdCloneDepot(DoCommandFlags flags, TileIndex tile, TileIndex source, bool share_orders);
 CommandCost CmdStartStopVehicle(DoCommandFlags flags, VehicleID veh_id, bool evaluate_startstop_cb);
 CommandCost CmdMassStartStopVehicle(DoCommandFlags flags, TileIndex tile, bool do_start, bool vehicle_list_window, const VehicleListIdentifier &vli);
 CommandCost CmdDepotSellAllVehicles(DoCommandFlags flags, TileIndex tile, VehicleType vehicle_type);
@@ -36,6 +37,7 @@ DEF_CMD_TRAIT(Commands::SendVehicleToDepot, CmdSendVehicleToDepot, {}, CommandTy
 DEF_CMD_TRAIT(Commands::ChangeServiceInterval, CmdChangeServiceInt, {}, CommandType::VehicleManagement)
 DEF_CMD_TRAIT(Commands::RenameVehicle, CmdRenameVehicle, {}, CommandType::OtherManagement)
 DEF_CMD_TRAIT(Commands::CloneVehicle, CmdCloneVehicle, CommandFlag::NoTest, CommandType::VehicleConstruction) // NewGRF callbacks influence building and refitting making it impossible to correctly estimate the cost
+DEF_CMD_TRAIT(Commands::CloneDepot, CmdCloneDepot, CommandFlag::NoTest, CommandType::VehicleConstruction) // as CloneVehicle
 DEF_CMD_TRAIT(Commands::StartStopVehicle, CmdStartStopVehicle, CommandFlag::Location, CommandType::VehicleManagement)
 DEF_CMD_TRAIT(Commands::MassStartStop, CmdMassStartStopVehicle, {}, CommandType::VehicleManagement)
 DEF_CMD_TRAIT(Commands::DepotMassSell, CmdDepotSellAllVehicles, {}, CommandType::VehicleConstruction)
@@ -43,6 +45,7 @@ DEF_CMD_TRAIT(Commands::DepotMassAutoreplace, CmdDepotMassAutoReplace, {}, Comma
 
 void CcBuildPrimaryVehicle(Commands, const CommandCost &result, VehicleID new_veh_id, uint, uint16_t, CargoArray);
 void CcStartStopVehicle(Commands, const CommandCost &result, VehicleID veh_id, bool);
+void CcCloneDepot(Commands, const CommandCost &result, uint16_t copied, uint16_t skipped);
 
 template <typename Tcont, typename Titer>
 inline EndianBufferWriter<Tcont, Titer> &operator <<(EndianBufferWriter<Tcont, Titer> &buffer, const CargoArray &cargo_array)

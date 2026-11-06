@@ -54,6 +54,9 @@
 #include "industry.h"
 #include "town.h"
 #include "town_cmd.h"
+#include "vehicle_cmd.h"
+#include "depot_func.h"
+#include "depot_map.h"
 #include "town_growth.h"
 #include "station_base.h"
 #include "station_func.h"
@@ -2275,6 +2278,57 @@ static bool ConTownDelete(std::span<std::string_view> argv)
 	return true;
 }
 
+/** Copy a depot: buy copies of all vehicles in another depot, like the depot window does. @copydoc IConsoleCmdProc */
+static bool ConDepotClone(std::span<std::string_view> argv)
+{
+	if (argv.empty()) {
+		IConsolePrint(CC_HELP, "Buy copies of all vehicles standing in a depot. Usage: 'depot_clone <source x> <source y> <target x> <target y> [<company> [copy]]'.");
+		IConsolePrint(CC_HELP, "The copies share the orders of the originals, 'copy' gives them their own copy. The company (1-based) defaults to the local one.");
+		return true;
+	}
+	if (argv.size() < 5 || argv.size() > 7) return false;
+	if (_game_mode != GameMode::Normal) {
+		IConsolePrint(CC_ERROR, "There is no game running.");
+		return true;
+	}
+
+	std::array<uint32_t, 4> c{};
+	for (uint i = 0; i < 4; i++) {
+		auto v = ParseInteger(argv[i + 1]);
+		if (!v.has_value()) return false;
+		c[i] = *v;
+	}
+	if (c[0] >= Map::SizeX() || c[2] >= Map::SizeX() || c[1] >= Map::SizeY() || c[3] >= Map::SizeY()) {
+		IConsolePrint(CC_ERROR, "Tile outside the map.");
+		return true;
+	}
+
+	CompanyID company = _local_company;
+	if (argv.size() >= 6) {
+		auto number = ParseInteger(argv[5]);
+		if (!number.has_value() || *number == 0 || !Company::IsValidID(CompanyID(*number - 1))) {
+			IConsolePrint(CC_ERROR, "Unknown company '{}'.", argv[5]);
+			return true;
+		}
+		company = CompanyID(*number - 1);
+		if (_networking && !_network_server && company != _local_company) {
+			IConsolePrint(CC_ERROR, "A client copies depots only for its own company.");
+			return true;
+		}
+	}
+	if (!Company::IsValidID(company)) {
+		IConsolePrint(CC_ERROR, "Give the company that owns the depots.");
+		return true;
+	}
+	bool share = !(argv.size() == 7 && argv[6] == "copy");
+
+	AutoRestoreBackup cur_company(_current_company, company);
+	if (!Command<Commands::CloneDepot>::Post(STR_ERROR_CAN_T_CLONE_DEPOT, TileXY(c[2], c[3]), TileXY(c[0], c[1]), share)) {
+		IConsolePrint(CC_ERROR, "Copying the depot failed.");
+	}
+	return true;
+}
+
 /** Invest money into towns, by a company or for free. @copydoc IConsoleCmdProc */
 static bool ConTownInvest(std::span<std::string_view> argv)
 {
@@ -3696,7 +3750,7 @@ static bool ConRailRouteWindow(std::span<std::string_view> argv)
 static bool ConOpenWindow(std::span<std::string_view> argv)
 {
 	if (argv.empty()) {
-		IConsolePrint(CC_HELP, "Open a window. Usage: 'open_window town <town id> [supply|invest|destroy]' or 'open_window station <station id>'.");
+		IConsolePrint(CC_HELP, "Open a window. Usage: 'open_window town <town id> [supply|invest|destroy]' or 'open_window station <station id>' or 'open_window depot <x> <y>'.");
 		return true;
 	}
 	if (argv.size() < 3 || argv.size() > 4) return false;
@@ -3724,6 +3778,16 @@ static bool ConOpenWindow(std::span<std::string_view> argv)
 			return true;
 		}
 		ShowStationViewWindow(*id);
+		return true;
+	}
+	if (argv[1] == "depot" && argv.size() == 4) {
+		auto x = ParseInteger(argv[2]);
+		auto y = ParseInteger(argv[3]);
+		if (!x.has_value() || !y.has_value() || *x >= Map::SizeX() || *y >= Map::SizeY() || !IsDepotTile(TileXY(*x, *y))) {
+			IConsolePrint(CC_ERROR, "No depot at {} {}.", argv[2], argv[3]);
+			return true;
+		}
+		ShowDepotWindow(TileXY(*x, *y), GetDepotVehicleType(TileXY(*x, *y)));
 		return true;
 	}
 	return false;
@@ -3971,6 +4035,7 @@ void IConsoleStdLibRegister()
 	IConsole::CmdRegister("town_force_need",         ConTownForceNeed,    ConHookServerOrNoNetwork);
 	IConsole::CmdRegister("town_invest",             ConTownInvest);
 	IConsole::CmdRegister("town_delete",             ConTownDelete);
+	IConsole::CmdRegister("depot_clone",             ConDepotClone);
 	IConsole::CmdRegister("power_grid",              ConPowerGrid);
 	IConsole::CmdRegister("power_add_fuel",          ConPowerAddFuel,     ConHookServerOrNoNetwork);
 	IConsole::CmdRegister("townsim_log",             ConTownSimLog);

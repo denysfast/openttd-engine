@@ -17,6 +17,7 @@
 #include "viewport_func.h"
 #include "command_func.h"
 #include "depot_base.h"
+#include "station_base.h"
 #include "spritecache_type.h"
 #include "strings_func.h"
 #include "sound_func.h"
@@ -80,6 +81,7 @@ static constexpr std::initializer_list<NWidgetPart> _nested_train_depot_widgets 
 	NWidget(NWID_HORIZONTAL, NWidContainerFlag::EqualSize),
 		NWidget(WWT_PUSHTXTBTN, Colours::Grey, WID_D_BUILD), SetFill(1, 1), SetResize(1, 0),
 		NWidget(WWT_TEXTBTN, Colours::Grey, WID_D_CLONE), SetFill(1, 1), SetResize(1, 0),
+		NWidget(WWT_TEXTBTN, Colours::Grey, WID_D_CLONE_DEPOT), SetFill(1, 1), SetResize(1, 0), SetStringTip(STR_DEPOT_CLONE_DEPOT_BUTTON, STR_DEPOT_CLONE_DEPOT_TOOLTIP),
 		NWidget(WWT_PUSHTXTBTN, Colours::Grey, WID_D_VEHICLE_LIST), SetAspect(WidgetDimensions::ASPECT_VEHICLE_ICON), SetFill(0, 1),
 		NWidget(WWT_PUSHIMGBTN, Colours::Grey, WID_D_STOP_ALL), SetSpriteTip(SPR_FLAG_VEH_STOPPED), SetAspect(WidgetDimensions::ASPECT_VEHICLE_FLAG), SetFill(0, 1),
 		NWidget(WWT_PUSHIMGBTN, Colours::Grey, WID_D_START_ALL), SetSpriteTip(SPR_FLAG_VEH_RUNNING), SetAspect(WidgetDimensions::ASPECT_VEHICLE_FLAG), SetFill(0, 1),
@@ -126,6 +128,19 @@ extern void DepotSortList(VehicleList *list);
  * @param result the result of the cloning command
  * @param veh_id cloned vehicle ID
  */
+/**
+ * Callback of copying a depot: tell how many vehicles could not be built in this depot.
+ * @param result The result of the command.
+ * @param copied Number of vehicles copied.
+ * @param skipped Number of vehicles that could not be copied.
+ */
+void CcCloneDepot(Commands, const CommandCost &result, uint16_t copied, uint16_t skipped)
+{
+	if (result.Failed() || skipped == 0) return;
+
+	ShowErrorMessage(GetEncodedString(STR_DEPOT_CLONE_PARTIAL, copied, skipped), {}, WarningLevel::Info);
+}
+
 void CcCloneVehicle(Commands, const CommandCost &result, VehicleID veh_id)
 {
 	if (result.Failed()) return;
@@ -795,6 +810,7 @@ struct DepotWindow : Window {
 			WID_D_SELL_ALL,
 			WID_D_BUILD,
 			WID_D_CLONE,
+			WID_D_CLONE_DEPOT,
 			WID_D_RENAME,
 			WID_D_AUTOREPLACE);
 
@@ -815,15 +831,28 @@ struct DepotWindow : Window {
 
 			case WID_D_CLONE: // Clone button
 				this->SetWidgetDirty(WID_D_CLONE);
-				this->ToggleWidgetLoweredState(WID_D_CLONE);
 
-				if (this->IsWidgetLowered(WID_D_CLONE)) {
+				if (!this->IsWidgetLowered(WID_D_CLONE)) {
 					static constexpr VehicleTypeIndexArray<const CursorID> clone_icons = {
 						SPR_CURSOR_CLONE_TRAIN, SPR_CURSOR_CLONE_ROADVEH,
 						SPR_CURSOR_CLONE_SHIP, SPR_CURSOR_CLONE_AIRPLANE
 					};
 
+					/* Lower after placing: placing aborts the copy depot tool, which raises both buttons. */
 					SetObjectToPlaceWnd(clone_icons[this->type], PAL_NONE, HT_VEHICLE, this);
+					this->LowerWidget(WID_D_CLONE);
+				} else {
+					ResetObjectToPlace();
+				}
+				SndClickBeep();
+				break;
+
+			case WID_D_CLONE_DEPOT: // Copy depot button: pick another depot on the map
+				this->SetWidgetDirty(WID_D_CLONE_DEPOT);
+
+				if (!this->IsWidgetLowered(WID_D_CLONE_DEPOT)) {
+					SetObjectToPlaceWnd(SPR_CURSOR_MOUSE, PAL_NONE, HT_RECT, this);
+					this->LowerWidget(WID_D_CLONE_DEPOT);
 				} else {
 					ResetObjectToPlace();
 				}
@@ -999,11 +1028,34 @@ struct DepotWindow : Window {
 		return true;
 	}
 
+	/**
+	 * The copy depot tool picked a tile: copy the vehicles of the depot there into this depot.
+	 * @param pt Unused.
+	 * @param tile The clicked tile; for aircraft any tile of an airport stands for its first hangar.
+	 */
+	void OnPlaceObject([[maybe_unused]] Point pt, TileIndex tile) override
+	{
+		if (!this->IsWidgetLowered(WID_D_CLONE_DEPOT)) return;
+
+		TileIndex source = tile;
+		if (this->type == VehicleType::Aircraft && IsTileType(tile, TileType::Station) && IsAirport(tile)) {
+			const Station *st = Station::GetByTile(tile);
+			if (st->airport.HasHangar()) source = st->airport.GetHangarTile(0);
+		}
+
+		/* The copies share the orders of the originals; with Ctrl they get their own copy. */
+		if (Command<Commands::CloneDepot>::Post(STR_ERROR_CAN_T_CLONE_DEPOT, CcCloneDepot, TileIndex(this->window_number), source, !_ctrl_pressed)) {
+			ResetObjectToPlace();
+		}
+	}
+
 	void OnPlaceObjectAbort() override
 	{
 		/* abort clone */
 		this->RaiseWidget(WID_D_CLONE);
 		this->SetWidgetDirty(WID_D_CLONE);
+		this->RaiseWidget(WID_D_CLONE_DEPOT);
+		this->SetWidgetDirty(WID_D_CLONE_DEPOT);
 
 		/* abort drag & drop */
 		this->sel = VehicleID::Invalid();

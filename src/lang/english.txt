@@ -4631,6 +4631,9 @@ STR_DEPOT_CLONE_TRAIN                                           :{BLACK}Clone Tr
 STR_DEPOT_CLONE_ROAD_VEHICLE                                    :{BLACK}Clone Vehicle
 STR_DEPOT_CLONE_SHIP                                            :{BLACK}Clone Ship
 STR_DEPOT_CLONE_AIRCRAFT                                        :{BLACK}Clone Aircraft
+STR_DEPOT_CLONE_DEPOT_BUTTON                                    :{BLACK}Copy depot
+STR_DEPOT_CLONE_DEPOT_TOOLTIP                                   :{BLACK}Buy copies of all vehicles standing in another depot: click this button, then the other depot. Every copy gets the same cars, refits, service interval and group, and shares the orders of its original. Ctrl+Click on the depot gives the copies their own copy of the orders
+STR_DEPOT_CLONE_PARTIAL                                         :{WHITE}Copied {NUM} vehicle{P "" s}; {NUM} could not be built in this depot
 
 ###length VEHICLE_TYPES
 STR_DEPOT_CLONE_TRAIN_DEPOT_TOOLTIP                             :{BLACK}Buy a copy of a train including all cars. Click this button and then on a train inside or outside the depot. Ctrl+Click to share the orders. Also press Shift to show cost estimate only
@@ -5722,6 +5725,9 @@ STR_ERROR_CAN_T_CHANGE_SERVICING                                :Can't change se
 STR_ERROR_VEHICLE_IS_DESTROYED                                  :vehicle is destroyed
 
 STR_ERROR_CAN_T_CLONE_VEHICLE_LIST                              :not all vehicles are identical
+STR_ERROR_CAN_T_CLONE_DEPOT                                     :{WHITE}Can't copy the depot...
+STR_ERROR_DEPOT_CLONE_WRONG_DEPOT                               :{WHITE}... select another depot of the same kind
+STR_ERROR_DEPOT_CLONE_EMPTY                                     :{WHITE}... there are no vehicles in that depot
 
 STR_ERROR_NO_VEHICLES_AVAILABLE_AT_ALL                          :No vehicles will be available at all
 STR_ERROR_NO_VEHICLES_AVAILABLE_AT_ALL_EXPLANATION              :Change your NewGRF configuration

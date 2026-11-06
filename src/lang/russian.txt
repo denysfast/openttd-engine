@@ -4806,6 +4806,9 @@ STR_DEPOT_CLONE_TRAIN                                           :{BLACK}Копи
 STR_DEPOT_CLONE_ROAD_VEHICLE                                    :{BLACK}Копировать
 STR_DEPOT_CLONE_SHIP                                            :{BLACK}Копировать
 STR_DEPOT_CLONE_AIRCRAFT                                        :{BLACK}Копировать
+STR_DEPOT_CLONE_DEPOT_BUTTON                                    :{BLACK}Копия депо
+STR_DEPOT_CLONE_DEPOT_TOOLTIP                                   :{BLACK}Купить копии всего транспорта, который стоит в другом депо: нажмите эту кнопку, затем другое депо. Каждая копия получает те же вагоны, переоборудование, интервал обслуживания и группу и общие приказы с оригиналом. Ctrl+щелчок по депо - у копий будут свои копии приказов
+STR_DEPOT_CLONE_PARTIAL                                         :{WHITE}Скопировано: {NUM}; не удалось построить в этом депо: {NUM}
 
 ###length VEHICLE_TYPES
 STR_DEPOT_CLONE_TRAIN_DEPOT_TOOLTIP                             :{BLACK}Создать копию состава. Нажмите на кнопку, а затем на поезд внутри или снаружи депо. Ctrl+щелчок создаст поезд с общим маршрутом. При нажатом Shift - оценка стоимости покупки.
@@ -5909,6 +5912,9 @@ STR_ERROR_CAN_T_CHANGE_SERVICING                                :Невозмо�
 STR_ERROR_VEHICLE_IS_DESTROYED                                  :транспортное средство уничтожено
 
 STR_ERROR_CAN_T_CLONE_VEHICLE_LIST                              :не все транспортные средства идентичны друг другу
+STR_ERROR_CAN_T_CLONE_DEPOT                                     :{WHITE}Невозможно скопировать депо...
+STR_ERROR_DEPOT_CLONE_WRONG_DEPOT                               :{WHITE}... выберите другое депо того же вида
+STR_ERROR_DEPOT_CLONE_EMPTY                                     :{WHITE}... в том депо нет транспорта
 
 STR_ERROR_NO_VEHICLES_AVAILABLE_AT_ALL                          :Доступных транспортных средств не будет
 STR_ERROR_NO_VEHICLES_AVAILABLE_AT_ALL_EXPLANATION              :Измените настройки модуля NewGRF

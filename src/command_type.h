@@ -312,6 +312,7 @@ enum class Commands : uint8_t {
 	PrepareRailRoute, ///< clear and level a part of the corridor of a rail trunk line
 	UpgradeStationCatchment, ///< buy one catchment radius level of a station
 	DestroyTown, ///< destroy a town in a running game
+	CloneDepot, ///< buy copies of all vehicles in another depot
 
 	OrderRefit, ///< change the refit information of an order (for "goto depot" )
 	CloneOrder, ///< clone (and share) an order

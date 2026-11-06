@@ -1023,6 +1023,59 @@ std::tuple<CommandCost, VehicleID> CmdCloneVehicle(DoCommandFlags flags, TileInd
 }
 
 /**
+ * Copy a depot: buy a clone (see #CmdCloneVehicle) of every vehicle of the company that stands in another depot.
+ * Vehicles that can't be built in this depot (e.g. another rail type) are skipped; if the company can't pay
+ * for all copies, none is bought.
+ * @param flags type of operation
+ * @param tile tile of the depot where the copies are built
+ * @param source tile of the depot whose vehicles are copied; may be the same depot
+ * @param share_orders the copies share the orders of the originals, else they get a copy of them
+ * @return the cost of this operation, the number of vehicles copied and the number that could not be copied
+ */
+std::tuple<CommandCost, uint16_t, uint16_t> CmdCloneDepot(DoCommandFlags flags, TileIndex tile, TileIndex source, bool share_orders)
+{
+	if (!IsValidTile(tile) || !IsDepotTile(tile)) return { CMD_ERROR, 0, 0 };
+	VehicleType type = GetDepotVehicleType(tile);
+	if (!IsValidTile(source) || !IsDepotTile(source) || GetDepotVehicleType(source) != type) return { CommandCost(STR_ERROR_DEPOT_CLONE_WRONG_DEPOT), 0, 0 };
+
+	CommandCost ret = CheckTileOwnership(source);
+	if (ret.Failed()) return { ret, 0, 0 };
+	ret = CheckTileOwnership(tile);
+	if (ret.Failed()) return { ret, 0, 0 };
+
+	/* Collect first: copies into the same depot must not be copied again. */
+	std::vector<VehicleID> originals;
+	for (const Vehicle *v : Vehicle::Iterate()) {
+		if (v->type == type && v->IsPrimaryVehicle() && v->owner == _current_company && v->tile == source && v->IsInDepot()) {
+			originals.push_back(v->index);
+		}
+	}
+	if (originals.empty()) return { CommandCost(STR_ERROR_DEPOT_CLONE_EMPTY), 0, 0 };
+
+	CommandCost total_cost(ExpensesType::NewVehicles);
+	CommandCost last_error = CMD_ERROR;
+	std::vector<VehicleID> copies;
+	for (VehicleID id : originals) {
+		auto [cost, copy] = Command<Commands::CloneVehicle>::Do(flags, tile, id, share_orders);
+		if (cost.Failed()) {
+			last_error = cost;
+			continue;
+		}
+		total_cost.AddCost(cost.GetCost());
+		copies.push_back(copy);
+	}
+	uint16_t skipped = static_cast<uint16_t>(originals.size() - copies.size());
+	if (copies.empty()) return { last_error, 0, skipped };
+
+	/* Each clone only checked its own price; the company has to afford all of them together. */
+	if (flags.Test(DoCommandFlag::Execute) && !CheckCompanyHasMoney(total_cost)) {
+		for (VehicleID copy : copies) Command<Commands::SellVehicle>::Do(flags, copy, true, false, ClientID::Invalid);
+		return { total_cost, 0, static_cast<uint16_t>(originals.size()) };
+	}
+	return { total_cost, static_cast<uint16_t>(copies.size()), skipped };
+}
+
+/**
  * Send all vehicles of type to depots
  * @param flags   the flags used for DoCommand()
  * @param service should the vehicles only get service in the depots
