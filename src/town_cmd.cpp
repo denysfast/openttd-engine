@@ -1001,6 +1001,26 @@ void LevelTownLand(TileIndex tile)
 }
 
 /**
+ * Take the steepness off a tile, so a house or road of a town can stand on it with a foundation:
+ * lower the highest corner of a steep slope, or else raise its lowest corner. Changing a single corner is
+ * cheap and usually possible even between houses and roads, unlike levelling the whole tile.
+ * @param tile The tile.
+ * @return True if the tile is not steep (anymore).
+ */
+bool MakeTownTileNotSteep(TileIndex tile)
+{
+	Slope tileh = GetTileSlope(tile);
+	if (!IsSteepSlope(tileh)) return true;
+	if (IsTileType(tile, TileType::House)) return false;
+
+	Corner top = GetHighestSlopeCorner(tileh);
+	if (!TerraformTownTile(tile, SlopeWithOneCornerRaised(top), false)) {
+		TerraformTownTile(tile, SlopeWithOneCornerRaised(OppositeCorner(top)), true);
+	}
+	return !IsSteepSlope(GetTileSlope(tile));
+}
+
+/**
  * Checks whether at least one surrounding road allows to build a house here.
  *
  * @param t The tile where the house will be built.
@@ -1692,9 +1712,9 @@ static void MakeTownHouse(TileIndex tile, Town *t, uint8_t counter, uint8_t stag
  */
 static inline bool CanBuildHouseHere(TileIndex tile, bool noslope)
 {
-	/* cannot build on these slopes... */
+	/* Steep slopes are fine: the house stands on a levelled foundation, two levels high on the steep side. */
 	Slope slope = GetTileSlope(tile);
-	if ((noslope && slope != SLOPE_FLAT) || IsSteepSlope(slope)) return false;
+	if (noslope && slope != SLOPE_FLAT) return false;
 
 	/* at least one RoadTypes allow building the house here? */
 	if (!RoadTypesAllowHouseHere(tile)) return false;

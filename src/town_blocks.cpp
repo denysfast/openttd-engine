@@ -15,6 +15,10 @@
  *  2. replacing old houses by denser ones when they are below the zone of their position;
  *  3. opening a new block: the cheapest block next to the town gets its missing perimeter roads and a first house.
  *
+ * Towns build on any land: steep plots and road tiles get one corner levelled first where possible, houses
+ * stand on steep slopes with a foundation otherwise, a first house goes up
+ * even if no road reaches the block yet, and a side of a block gets as much of its road as can be built.
+ *
  * A block is opened by a town while it holds at least one house of that town. This makes
  * the state of the builder a pure function of the house tiles on the map: it is never saved,
  * every client rebuilds it after loading and then keeps it up to date from the house
@@ -72,9 +76,11 @@ static constexpr uint BLOCK_MAX_UNUSABLE_PLOTS = BLOCK_PLOTS / 2; ///< A block w
 static constexpr uint32_t PLAN_DISTANCE_WEIGHT = 4; ///< Cost per squared tile of distance between the block centre and the town centre.
 static constexpr uint32_t PLAN_JITTER = 64; ///< Range of the deterministic jitter that makes the town outline less regular.
 static constexpr uint32_t PENALTY_PLOT_SLOPED = 8; ///< Plot that needs a foundation or levelling.
-static constexpr uint32_t PENALTY_PLOT_UNUSABLE = 96; ///< Plot that cannot hold a house: water, steep slope.
+static constexpr uint32_t PENALTY_PLOT_STEEP = 24; ///< Plot on a steep slope: a corner has to be levelled first.
+static constexpr uint32_t PENALTY_PLOT_UNUSABLE = 96; ///< Plot that cannot hold a house: water.
 static constexpr uint32_t PENALTY_PLOT_FOREIGN = 160; ///< Plot taken by something else: rail, station, industry, object, house of another town.
 static constexpr uint32_t PENALTY_ROAD_SLOPED = 4; ///< Road piece on a slope.
+static constexpr uint32_t PENALTY_ROAD_STEEP = 16; ///< Road piece on a steep slope: a corner has to be levelled first.
 static constexpr uint32_t PENALTY_ROAD_CROSSING = 48; ///< Road piece that makes a level crossing.
 static constexpr uint32_t PENALTY_ROAD_BRIDGE = 64; ///< Road piece that needs a bridge.
 static constexpr uint32_t PENALTY_ROAD_BLOCKED = 48; ///< Road piece that cannot be built.
@@ -351,14 +357,14 @@ bool IsTownBlockHousePosition(TileIndex tile, BuildingFlags flags)
 }
 
 /**
- * Quick check whether a tile could get a house: bare land or trees, not too steep, nothing above.
+ * Quick check whether a tile could get a house: bare land or trees with nothing above.
+ * Steep plots count too: a corner is levelled just before the house is built, or the house takes a foundation.
  * @param tile The tile.
  * @return True if the tile is a free plot.
  */
 static bool IsFreeHousePlot(TileIndex tile)
 {
 	if (!IsTileType(tile, TileType::Clear) && !IsTileType(tile, TileType::Trees)) return false;
-	if (IsSteepSlope(GetTileSlope(tile))) return false;
 	return !IsBridgeAbove(tile);
 }
 
@@ -385,8 +391,10 @@ static HouseID BuildHouseInBlock(Town *t, TownBlockKey key, TownExpandModes mode
 	uint first = RandomRange(count);
 	for (uint i = 0; i < count; i++) {
 		TileIndex tile = plots[(first + i) % count];
-		/* The plot might have been covered by a multi-tile house or levelled away meanwhile. */
+		/* The plot might have been covered by a multi-tile house meanwhile. */
 		if (!IsFreeHousePlot(tile)) continue;
+		/* Levelling a corner gives a lower foundation; between houses it often fails, then the house takes the steep slope as it is. */
+		MakeTownTileNotSteep(tile);
 		if (!IsTileFlat(tile) && (!_settings_game.construction.build_on_slopes || Chance16(1, 6))) LevelTownLand(tile);
 
 		HouseID house = TryBuildTownHouse(t, tile, modes);
@@ -471,6 +479,7 @@ enum class RoadLineTile : uint8_t {
 	Done, ///< The road is there.
 	Buildable, ///< A road piece can probably be built.
 	Sloped, ///< A road piece can probably be built, on a slope.
+	Steep, ///< A road piece can be built once a corner of the steep slope is levelled.
 	Crossing, ///< A level crossing can probably be built.
 	Bridge, ///< Water or rail; a bridge has to span it.
 	Blocked, ///< Nothing can be built without demolishing something.
@@ -491,7 +500,7 @@ static RoadLineTile ClassifyRoadLineTile(TileIndex tile, Axis axis)
 		case TileType::Clear:
 		case TileType::Trees: {
 			Slope slope = GetTileSlope(tile);
-			if (IsSteepSlope(slope)) return RoadLineTile::Blocked;
+			if (IsSteepSlope(slope)) return RoadLineTile::Steep;
 			return slope == SLOPE_FLAT ? RoadLineTile::Buildable : RoadLineTile::Sloped;
 		}
 
@@ -595,7 +604,9 @@ static bool BuildTownBridge(const TownBridgePlan &plan, bool test)
 
 /**
  * Build the missing road of one side of a block: five tiles from one corner to the other.
- * Either the whole side can be completed, or nothing is built, so the town leaves no dead ends.
+ * Steep tiles get a corner levelled first where possible. If some tiles of the side can't take a road (a house of
+ * another town, a station, an impossible slope, a bridge the town can't build), the side gets the road
+ * that grows in from its two corners up to those tiles, so every new piece hangs on to the road network.
  * @param t The town.
  * @param start The first corner of the side.
  * @param dir The direction from the first corner to the second one.
@@ -607,77 +618,91 @@ static bool BuildBlockSide(Town *t, TileIndex start, DiagDirection dir)
 	Axis axis = DiagDirToAxis(dir);
 	TileIndexDiff delta = TileOffsByDiagDir(dir);
 	RoadType rt = GetTownRoadType();
+	auto tile_at = [start, delta](uint i) { return start + delta * static_cast<int>(i); };
 
-	/* What to build on each tile of the side, if anything. */
-	std::array<RoadBits, SIDE_TILES> pieces{};
-	std::vector<TownBridgePlan> bridges;
-	bool needed = false;
+	/** What a tile of the side gets. */
+	enum class Part : uint8_t { Done, Road, Bridge, Blocked };
+	std::array<Part, SIDE_TILES> parts{};
+	std::vector<std::pair<TownBridgePlan, std::pair<uint, uint>>> bridges; // Plan and the tiles it covers.
 
 	for (uint i = 0; i < SIDE_TILES; i++) {
-		TileIndex tile = start + delta * static_cast<int>(i);
-		switch (ClassifyRoadLineTile(tile, axis)) {
+		TileIndex tile = tile_at(i);
+		RoadLineTile kind = ClassifyRoadLineTile(tile, axis);
+		if (kind == RoadLineTile::Steep) {
+			/* Level a corner if possible; otherwise the test of the road piece decides whether a foundation can carry it. */
+			MakeTownTileNotSteep(tile);
+			kind = ClassifyRoadLineTile(tile, axis);
+			if (kind == RoadLineTile::Steep) kind = RoadLineTile::Sloped;
+		}
+
+		switch (kind) {
 			case RoadLineTile::Done:
+				parts[i] = Part::Done;
 				break;
 
 			case RoadLineTile::Buildable:
 			case RoadLineTile::Sloped:
-			case RoadLineTile::Crossing: {
-				RoadBits want{};
-				if (i > 0) want.Set(DiagDirToRoadBits(ReverseDiagDir(dir)));
-				if (i + 1 < SIDE_TILES) want.Set(DiagDirToRoadBits(dir));
-				pieces[i] = want.Reset(GetAnyRoadBits(tile, RoadTramType::Road, true));
-				needed |= pieces[i].Any();
+			case RoadLineTile::Crossing:
+				parts[i] = Part::Road;
 				break;
-			}
 
 			case RoadLineTile::Bridge: {
 				std::optional<TownBridgePlan> plan = PlanTownBridge(t, tile, dir);
-				if (!plan.has_value()) return false;
-				bridges.push_back(*plan);
-				needed = true;
-				/* Skip the stretch; the tiles up to the far head belong to the bridge. */
-				while (i + 1 < SIDE_TILES && tile != plan->end) {
-					tile += delta;
-					i++;
-					pieces[i] = {};
+				if (!plan.has_value() || !BuildTownBridge(*plan, true)) {
+					parts[i] = Part::Blocked;
+					break;
 				}
-				/* A bridge head inside the side needs no road piece. */
-				if (tile == plan->end) pieces[i] = {};
+				/* The bridge covers its heads and the stretch between them, as far as they lie on the side. */
+				uint first = i;
+				if (i > 0 && tile_at(i - 1) == plan->start) first = i - 1;
+				uint last = i;
+				while (last + 1 < SIDE_TILES && tile_at(last) != plan->end) last++;
+				for (uint j = first; j <= last; j++) parts[j] = Part::Bridge;
+				bridges.push_back({*plan, {first, last}});
+				i = last;
 				break;
 			}
 
+			case RoadLineTile::Steep:
 			case RoadLineTile::Blocked:
-				return false;
-		}
-	}
-	if (!needed) return false;
-
-	/* The near head of a bridge may lie on a tile before it that was planned as a road piece. */
-	for (const TownBridgePlan &bridge : bridges) {
-		for (uint i = 0; i < SIDE_TILES; i++) {
-			if (start + delta * static_cast<int>(i) == bridge.start) pieces[i] = {};
+				parts[i] = Part::Blocked;
+				break;
 		}
 	}
 
-	/* Test everything before building anything. */
+	/* The road pieces each tile needs if the whole side can be built; one that fails its test blocks the tile. */
+	auto wanted = [&](uint i, const std::array<bool, SIDE_TILES> &use) {
+		RoadBits want{};
+		if (i > 0 && use[i - 1]) want.Set(DiagDirToRoadBits(ReverseDiagDir(dir)));
+		if (i + 1 < SIDE_TILES && use[i + 1]) want.Set(DiagDirToRoadBits(dir));
+		return want.Reset(GetAnyRoadBits(tile_at(i), RoadTramType::Road, true));
+	};
+	std::array<bool, SIDE_TILES> all{};
+	all.fill(true);
 	for (uint i = 0; i < SIDE_TILES; i++) {
-		if (pieces[i].None()) continue;
-		TileIndex tile = start + delta * static_cast<int>(i);
-		if (Command<Commands::BuildRoad>::Do({DoCommandFlag::Auto, DoCommandFlag::NoWater}, tile, pieces[i], rt, {}, t->index).Failed()) return false;
+		if (parts[i] != Part::Road) continue;
+		RoadBits want = wanted(i, all);
+		if (want.Any() && Command<Commands::BuildRoad>::Do({DoCommandFlag::Auto, DoCommandFlag::NoWater}, tile_at(i), want, rt, {}, t->index).Failed()) {
+			parts[i] = Part::Blocked;
+		}
 	}
-	for (const TownBridgePlan &bridge : bridges) {
-		if (!BuildTownBridge(bridge, true)) return false;
-	}
+
+	/* Only what is connected to one of the two corners through tiles that can get their road. */
+	std::array<bool, SIDE_TILES> use{};
+	for (uint i = 0; i < SIDE_TILES && parts[i] != Part::Blocked; i++) use[i] = true;
+	for (uint i = SIDE_TILES; i-- > 0 && parts[i] != Part::Blocked;) use[i] = true;
 
 	bool built = false;
 	for (uint i = 0; i < SIDE_TILES; i++) {
-		if (pieces[i].None()) continue;
-		TileIndex tile = start + delta * static_cast<int>(i);
+		if (!use[i] || parts[i] != Part::Road) continue;
+		RoadBits want = wanted(i, use);
+		if (want.None()) continue;
+		TileIndex tile = tile_at(i);
 		if (!IsTileType(tile, TileType::Road) && (!_settings_game.construction.build_on_slopes || Chance16(1, 6))) LevelTownLand(tile);
-		built |= Command<Commands::BuildRoad>::Do({DoCommandFlag::Execute, DoCommandFlag::Auto, DoCommandFlag::NoWater}, tile, pieces[i], rt, {}, t->index).Succeeded();
+		built |= Command<Commands::BuildRoad>::Do({DoCommandFlag::Execute, DoCommandFlag::Auto, DoCommandFlag::NoWater}, tile, want, rt, {}, t->index).Succeeded();
 	}
-	for (const TownBridgePlan &bridge : bridges) {
-		built |= BuildTownBridge(bridge, false);
+	for (const auto &[plan, range] : bridges) {
+		if (use[range.first] && use[range.second]) built |= BuildTownBridge(plan, false);
 	}
 	return built;
 }
@@ -707,27 +732,6 @@ static bool BuildBlockRoads(Town *t, TownBlockKey key)
 }
 
 /**
- * Is a block connected to the road network: does at least one of its sides have a complete road?
- * @param key The block.
- * @return True if at least one side has road on its three middle tiles.
- */
-static bool IsBlockConnected(TownBlockKey key)
-{
-	TileIndex origin = GetBlockOrigin(key);
-	for (const auto &[x, y, dir] : _block_sides) {
-		TileIndex tile = origin + TileDiffXY(x, y);
-		TileIndexDiff delta = TileOffsByDiagDir(dir);
-		Axis axis = DiagDirToAxis(dir);
-		bool complete = true;
-		for (uint i = 1; i < TOWN_BLOCK_PITCH && complete; i++) {
-			complete = HasRoadAlong(tile + delta * static_cast<int>(i), axis);
-		}
-		if (complete) return true;
-	}
-	return false;
-}
-
-/**
  * Evaluate a block that the town might open: its plan cost including the terrain.
  * @param t The town.
  * @param key The block.
@@ -745,7 +749,12 @@ static std::optional<uint32_t> EvaluateBlock(const Town *t, TownBlockKey key)
 		for (uint x = 1; x < TOWN_BLOCK_PITCH; x++) {
 			TileIndex tile = origin + TileDiffXY(x, y);
 			if (IsFreeHousePlot(tile)) {
-				if (!IsTileFlat(tile)) cost += PENALTY_PLOT_SLOPED;
+				Slope slope = GetTileSlope(tile);
+				if (IsSteepSlope(slope)) {
+					cost += PENALTY_PLOT_STEEP;
+				} else if (slope != SLOPE_FLAT) {
+					cost += PENALTY_PLOT_SLOPED;
+				}
 				continue;
 			}
 			unusable++;
@@ -778,6 +787,7 @@ static std::optional<uint32_t> EvaluateBlock(const Town *t, TownBlockKey key)
 				case RoadLineTile::Done: break;
 				case RoadLineTile::Buildable: break;
 				case RoadLineTile::Sloped: cost += PENALTY_ROAD_SLOPED; break;
+				case RoadLineTile::Steep: cost += PENALTY_ROAD_STEEP; break;
 				case RoadLineTile::Crossing: cost += PENALTY_ROAD_CROSSING; break;
 				case RoadLineTile::Bridge: cost += PENALTY_ROAD_BRIDGE; break;
 				case RoadLineTile::Blocked: cost += PENALTY_ROAD_BLOCKED; break;
@@ -820,7 +830,8 @@ static bool OpenNewBlock(Town *t, const TownBlockCache &cache, TownExpandModes m
 	for (const auto &[cost, key] : candidates) {
 		bool built = modes.Test(TownExpandMode::Roads) && BuildBlockRoads(t, key);
 
-		if (modes.Test(TownExpandMode::Buildings) && IsBlockConnected(key)) {
+		/* Roads first, but the first house goes up even if no road could reach the block, e.g. on steep hills. */
+		if (modes.Test(TownExpandMode::Buildings)) {
 			HouseID house = BuildHouseInBlock(t, key, modes);
 			if (house != INVALID_HOUSE_ID) {
 				result.success = true;

@@ -42,5 +42,6 @@ uint32_t GetTownBlockRadiusSquared(Town *t);
 HouseID TryBuildTownHouse(Town *t, TileIndex tile, TownExpandModes modes);
 int32_t TryReplaceTownHouse(Town *t, TileIndex tile);
 void LevelTownLand(TileIndex tile);
+bool MakeTownTileNotSteep(TileIndex tile);
 
 #endif /* TOWN_BLOCKS_H */
