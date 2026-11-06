@@ -277,6 +277,14 @@
 	return ScriptObject::Command<Commands::TownAction>::Do(town_id, ::TownAction(town_action));
 }
 
+/* static */ bool ScriptTown::Destroy(TownID town_id)
+{
+	EnforcePrecondition(false, IsValidTown(town_id));
+	EnforcePrecondition(false, GetTownCount() > 1);
+
+	return ScriptObject::Command<Commands::DestroyTown>::Do(town_id);
+}
+
 /* static */ bool ScriptTown::ExpandTown(TownID town_id, SQInteger houses)
 {
 	EnforceDeityMode(false);

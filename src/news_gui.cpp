@@ -1059,6 +1059,17 @@ void DeleteIndustryNews(IndustryID iid)
 	});
 }
 
+/**
+ * Remove news regarding a town that is deleted; clicking them would look up the town.
+ * @param tid town to remove news about
+ */
+void DeleteTownNews(TownID tid)
+{
+	DeleteNews([&](const auto &ni) {
+		return HasReferenceObject(ni, tid);
+	});
+}
+
 bool IsInvalidEngineNews(const NewsReference &reference)
 {
 	if (!std::holds_alternative<EngineID>(reference)) return false;

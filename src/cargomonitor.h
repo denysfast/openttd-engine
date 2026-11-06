@@ -139,6 +139,7 @@ inline TownID DecodeMonitorTown(CargoMonitorID num)
 
 void ClearCargoPickupMonitoring(CompanyID company = INVALID_OWNER);
 void ClearCargoDeliveryMonitoring(CompanyID company = INVALID_OWNER);
+void ClearCargoMonitoringOfTown(TownID town);
 int32_t GetDeliveryAmount(CargoMonitorID monitor, bool keep_monitoring);
 int32_t GetPickupAmount(CargoMonitorID monitor, bool keep_monitoring);
 void AddCargoDelivery(CargoType cargo_type, CompanyID company, uint32_t amount, Source src, const Station *st, IndustryID dest = IndustryID::Invalid());

@@ -62,6 +62,24 @@ void ClearCargoDeliveryMonitoring(CompanyID company)
 }
 
 /**
+ * Remove the pick-up and delivery monitors of a town that is deleted, so a later town with the same id
+ * does not inherit its numbers.
+ * @param town The town.
+ */
+void ClearCargoMonitoringOfTown(TownID town)
+{
+	for (CargoMonitorMap *map : {&_cargo_pickups, &_cargo_deliveries}) {
+		for (auto it = map->begin(); it != map->end(); /* nothing */) {
+			if (DecodeMonitorTown(it->first) == town) {
+				it = map->erase(it);
+			} else {
+				++it;
+			}
+		}
+	}
+}
+
+/**
  * Get and reset the amount associated with a cargo monitor.
  * @param[in,out] monitor_map Monitoring map to search (and reset for the queried entry).
  * @param monitor Cargo monitor to query/reset.

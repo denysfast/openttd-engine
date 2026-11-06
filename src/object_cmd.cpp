@@ -524,6 +524,17 @@ static void ReallyClearObjectTile(Object *o)
 	delete o;
 }
 
+/**
+ * Remove a statue of a town that is being destroyed (see #CmdDestroyTown). Statues can't be removed otherwise.
+ * @param o The statue.
+ */
+void RemoveTownStatue(Object *o)
+{
+	assert(o->type == OBJECT_STATUE);
+	o->town->statues.Reset(GetTileOwner(o->location.tile));
+	ReallyClearObjectTile(o);
+}
+
 std::vector<ClearedObjectArea> _cleared_object_areas;
 
 /**

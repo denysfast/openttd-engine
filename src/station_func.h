@@ -45,6 +45,7 @@ void RemoveDockingTile(TileIndex t);
 void ClearDockingTilesCheckingNeighbours(TileIndex tile);
 
 void UpdateAirportsNoise();
+void RenameStationForNewTown(Station *st);
 
 bool SplitGroundSpriteForOverlay(const TileInfo *ti, SpriteID *ground, RailTrackOffset *overlay_offset);
 

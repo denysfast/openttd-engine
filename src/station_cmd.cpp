@@ -409,6 +409,32 @@ static StringID GenerateStationName(Station *st, TileIndex tile, StationNaming n
 }
 
 /**
+ * Pick a new default name for a station that moved to another town, because its town was destroyed.
+ * Otherwise it could end up with the same name as a station of its new town. Custom names are kept.
+ * @param st The station, with its new town set.
+ */
+void RenameStationForNewTown(Station *st)
+{
+	if (!st->name.empty()) return;
+
+	StationNaming name_class = StationNaming::Rail;
+	if (st->facilities.Test(StationFacility::Airport)) {
+		if (st->airport.type == AT_OILRIG) {
+			name_class = StationNaming::Oilrig;
+		} else {
+			name_class = GetAirport(st->airport.type)->flags.Test(AirportFTAClass::Flag::Airplanes) ? StationNaming::Airport : StationNaming::Heliport;
+		}
+	} else if (!st->facilities.Test(StationFacility::Train) && st->facilities.Any({StationFacility::BusStop, StationFacility::TruckStop})) {
+		name_class = StationNaming::Road;
+	} else if (!st->facilities.Test(StationFacility::Train) && st->facilities.Test(StationFacility::Dock)) {
+		name_class = StationNaming::Dock;
+	}
+
+	st->indtype = IT_INVALID;
+	st->string_id = GenerateStationName(st, st->xy, name_class);
+}
+
+/**
  * Find the closest deleted station of the current company
  * @param tile the tile to search from.
  * @return the closest station or nullptr if too far.

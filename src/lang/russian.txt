@@ -4164,6 +4164,9 @@ STR_TOWN_SUPPLY_PLANTS_NONE                                     :{BLACK}Горо
 STR_TOWN_SUPPLY_PLANTS_TOOLTIP                                  :{BLACK}Электростанции, которые снабжают город электричеством. Щелчок - показать электростанцию в основном окне. Ctrl+щелчок - открыть её окно
 STR_TOWN_VIEW_INVEST_BUTTON                                     :{BLACK}Инвестировать
 STR_TOWN_VIEW_INVEST_TOOLTIP                                    :{BLACK}Вложить деньги в город: он растёт быстрее, прежде всего вверх (высотные здания)
+STR_TOWN_VIEW_DESTROY_TOOLTIP                                   :{BLACK}Удалить город полностью и навсегда. Сперва спросит подтверждение
+STR_TOWN_DESTROY_CAPTION                                        :{WHITE}Удаление города
+STR_TOWN_DESTROY_QUERY                                          :{YELLOW}Удалить город {TOWN} полностью и навсегда?{}{}{WHITE}Будет снесено {COMMA} дом{P "" а ов} и {COMMA} клет{P ка ки ок} дорог города, снос стоит {CURRENCY_LONG}. Дороги, которые ещё нужны вашему транспорту, - переезды, подъезды к остановкам и депо, дороги к другим местам, мосты и тоннели - останутся общими. Станции, депо и предприятия города перейдут к ближайшему городу, памятники города будут убраны.{}{}{YELLOW}Отменить это нельзя.
 STR_TOWN_INVEST_CAPTION                                         :{WHITE}{TOWN}: инвестиции
 STR_TOWN_INVEST_AMOUNT                                          :{BLACK}Вложено и ещё работает: {GOLD}{CURRENCY_LONG}
 STR_TOWN_INVEST_BONUS                                           :{BLACK}Ускорение роста: {GOLD}x{DECIMAL}
@@ -5598,6 +5601,8 @@ STR_ERROR_TOO_MANY_TOWNS                                        :слишком 
 STR_ERROR_NO_SPACE_FOR_TOWN                                     :на карте нет места
 STR_ERROR_ROAD_WORKS_IN_PROGRESS                                :идут дорожные работы
 STR_ERROR_TOWN_CAN_T_DELETE                                     :Невозможно снести этот город.{}{}К нему относится станция или депо, либо невозможно очистить одну из занимаемых им клеток.
+STR_ERROR_CAN_T_DESTROY_TOWN                                    :{WHITE}Невозможно удалить этот город...
+STR_ERROR_TOWN_CAN_T_DELETE_LAST_TOWN                           :{WHITE}... последний город удалить нельзя
 STR_ERROR_STATUE_NO_SUITABLE_PLACE                              :в центре города нет подходящего места для статуи
 STR_ERROR_CAN_T_BUILD_HOUSE                                     :Невозможно поставить дом...
 

@@ -259,6 +259,7 @@ void ClearAllTownCachedNames();
 void ShowTownViewWindow(TownID town);
 void ShowTownSupplyWindow(TownID town);
 void ShowTownInvestWindow(TownID town);
+void ShowTownDestroyQuery(TownID town);
 void ExpandTown(Town *t);
 
 void RebuildTownKdtree();
@@ -292,6 +293,7 @@ CommandCost CheckforTownRating(DoCommandFlags flags, Town *t, TownRatingCheckTyp
 
 
 TileIndexDiff GetHouseNorthPart(HouseID &house);
+std::pair<uint, uint> GetTownDestructionCounts(const Town *t);
 
 Town *CalcClosestTownFromTile(TileIndex tile, uint threshold = UINT_MAX);
 

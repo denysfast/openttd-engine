@@ -64,6 +64,7 @@ void DeleteInvalidEngineNews();
 void DeleteVehicleNews(VehicleID vid, AdviceType advice_type = AdviceType::Invalid);
 void DeleteStationNews(StationID sid);
 void DeleteIndustryNews(IndustryID iid);
+void DeleteTownNews(TownID tid);
 
 uint32_t SerialiseNewsReference(const NewsReference &reference);
 

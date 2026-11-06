@@ -448,6 +448,20 @@ public:
 	static bool ExpandTown(TownID town_id, SQInteger houses);
 
 	/**
+	 * Destroy a town completely and for good, like the delete button of the town window in a running game.
+	 * Houses and the town roads nothing needs anymore are demolished; roads that vehicles still need (level
+	 * crossings, the way to road stops and depots, roads between other places), bridges and tunnels stay
+	 * without an owner. Stations, waypoints, depots and industries of the town move to the closest town.
+	 * In company mode that company pays the demolition costs, in deity mode it is free.
+	 * @param town_id The town to destroy.
+	 * @pre IsValidTown(town_id).
+	 * @pre ScriptTown::GetTownCount() > 1.
+	 * @return True if the town was destroyed.
+	 * @api -ai
+	 */
+	static bool Destroy(TownID town_id);
+
+	/**
 	 * Found a new town.
 	 * @param tile The location of the new town.
 	 * @param size The town size of the new town.

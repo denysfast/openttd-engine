@@ -28,6 +28,7 @@ CommandCost CmdTownCargoGoal(DoCommandFlags flags, TownID town_id, TownAcceptanc
 CommandCost CmdTownSetText(DoCommandFlags flags, TownID town_id, const EncodedString &text);
 CommandCost CmdExpandTown(DoCommandFlags flags, TownID town_id, uint32_t grow_amount, TownExpandModes modes);
 CommandCost CmdDeleteTown(DoCommandFlags flags, TownID town_id);
+CommandCost CmdDestroyTown(DoCommandFlags flags, TownID town_id);
 CommandCost CmdPlaceHouse(DoCommandFlags flags, TileIndex tile, HouseID house, bool house_protected, bool replace);
 CommandCost CmdPlaceHouseArea(DoCommandFlags flags, TileIndex tile, TileIndex start_tile, HouseID house, bool is_protected, bool replace, bool diagonal);
 CommandCost CmdTownForceNeedLevel(DoCommandFlags flags, TownID town_id, TownNeed need, uint8_t level);
@@ -44,6 +45,7 @@ DEF_CMD_TRAIT(Commands::TownRating, CmdTownRating, CommandFlags({CommandFlag::De
 DEF_CMD_TRAIT(Commands::TownSetText, CmdTownSetText, CommandFlags({CommandFlag::Deity, CommandFlag::StrCtrl}), CommandType::OtherManagement)
 DEF_CMD_TRAIT(Commands::ExpandTown, CmdExpandTown, CommandFlags({CommandFlag::Deity}), CommandType::LandscapeConstruction)
 DEF_CMD_TRAIT(Commands::DeleteTown, CmdDeleteTown, CommandFlags({CommandFlag::Offline}), CommandType::LandscapeConstruction)
+DEF_CMD_TRAIT(Commands::DestroyTown, CmdDestroyTown, CommandFlags({CommandFlag::Deity}), CommandType::LandscapeConstruction)
 DEF_CMD_TRAIT(Commands::PlaceHouse, CmdPlaceHouse, CommandFlags({CommandFlag::Deity}), CommandType::OtherManagement)
 DEF_CMD_TRAIT(Commands::PlaceHouseArea, CmdPlaceHouseArea, CommandFlags({ CommandFlag::Deity }), CommandType::OtherManagement)
 DEF_CMD_TRAIT(Commands::TownForceNeedLevel, CmdTownForceNeedLevel, CommandFlags({CommandFlag::Deity, CommandFlag::Server}), CommandType::OtherManagement)

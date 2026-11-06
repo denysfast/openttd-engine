@@ -3989,6 +3989,9 @@ STR_TOWN_SUPPLY_PLANTS_NONE                                     :{BLACK}No power
 STR_TOWN_SUPPLY_PLANTS_TOOLTIP                                  :{BLACK}Power plants that supply the town with electricity. Click to centre the main view on a power plant. Ctrl+Click to open its window
 STR_TOWN_VIEW_INVEST_BUTTON                                     :{BLACK}Invest
 STR_TOWN_VIEW_INVEST_TOOLTIP                                    :{BLACK}Invest money into the town: it grows faster, most of all upwards (tall buildings)
+STR_TOWN_VIEW_DESTROY_TOOLTIP                                   :{BLACK}Delete this town completely and for good. Asks for confirmation first
+STR_TOWN_DESTROY_CAPTION                                        :{WHITE}Delete town
+STR_TOWN_DESTROY_QUERY                                          :{YELLOW}Delete {TOWN} completely and for good?{}{}{WHITE}{COMMA} house{P "" s} and {COMMA} road tile{P "" s} of the town are demolished for {CURRENCY_LONG}. Roads your vehicles still need - level crossings, the way to road stops and depots, roads to other places, bridges and tunnels - stay as public roads. Stations, depots and industries of the town move to the nearest town, statues of the town are removed.{}{}{YELLOW}This can't be undone.
 STR_TOWN_INVEST_CAPTION                                         :{WHITE}{TOWN}: investments
 STR_TOWN_INVEST_AMOUNT                                          :{BLACK}Invested and still working: {GOLD}{CURRENCY_LONG}
 STR_TOWN_INVEST_BONUS                                           :{BLACK}Growth bonus: {GOLD}x{DECIMAL}
@@ -5411,6 +5414,8 @@ STR_ERROR_TOO_MANY_TOWNS                                        :too many towns
 STR_ERROR_NO_SPACE_FOR_TOWN                                     :there is no more space on the map
 STR_ERROR_ROAD_WORKS_IN_PROGRESS                                :road works in progress
 STR_ERROR_TOWN_CAN_T_DELETE                                     :Can't delete this town...{}{}A station or depot is referring to the town or a town owned tile can't be removed
+STR_ERROR_CAN_T_DESTROY_TOWN                                    :{WHITE}Can't delete this town...
+STR_ERROR_TOWN_CAN_T_DELETE_LAST_TOWN                           :{WHITE}... the last town can't be deleted
 STR_ERROR_STATUE_NO_SUITABLE_PLACE                              :there is no suitable place for a statue in the centre of this town
 STR_ERROR_CAN_T_BUILD_HOUSE                                     :Can't build house...
 

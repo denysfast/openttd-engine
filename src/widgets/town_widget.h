@@ -44,7 +44,7 @@ enum TownViewWidgets : WidgetID {
 	WID_TV_EXPAND,         ///< Expand this town (scenario editor only).
 	WID_TV_EXPAND_BUILDINGS, ///< Expand number of buildings this town (scenario editor only).
 	WID_TV_EXPAND_ROADS, ///< Expand roads of this town (scenario editor only).
-	WID_TV_DELETE,         ///< Delete this town (scenario editor only).
+	WID_TV_DELETE,         ///< Delete this town (scenario editor: Commands::DeleteTown, game: Commands::DestroyTown).
 	WID_TV_GRAPH,
 	WID_TV_SUPPLY,         ///< Show the town supply window.
 	WID_TV_INVEST,         ///< Show the town investment window.

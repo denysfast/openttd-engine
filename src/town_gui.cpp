@@ -551,6 +551,16 @@ public:
 		}
 	}
 
+	/**
+	 * Destroy the town once the player confirmed it.
+	 * @param w The town window.
+	 * @param confirmed Whether the player confirmed.
+	 */
+	static void DestroyTownCallback(Window *w, bool confirmed)
+	{
+		if (confirmed) Command<Commands::DestroyTown>::Post(STR_ERROR_CAN_T_DESTROY_TOWN, static_cast<TownID>(w->window_number));
+	}
+
 	void OnClick([[maybe_unused]] Point pt, WidgetID widget, [[maybe_unused]] int click_count) override
 	{
 		switch (widget) {
@@ -586,9 +596,22 @@ public:
 				Command<Commands::ExpandTown>::Post(STR_ERROR_CAN_T_EXPAND_TOWN, static_cast<TownID>(this->window_number), 0, {TownExpandMode::Roads});
 				break;
 
-			case WID_TV_DELETE: // delete town - only available on Scenario editor
-				Command<Commands::DeleteTown>::Post(STR_ERROR_TOWN_CAN_T_DELETE, static_cast<TownID>(this->window_number));
+			case WID_TV_DELETE: {
+				TownID town_id = static_cast<TownID>(this->window_number);
+				if (_game_mode == GameMode::Editor) {
+					Command<Commands::DeleteTown>::Post(STR_ERROR_TOWN_CAN_T_DELETE, town_id);
+					break;
+				}
+				/* A dry run gives the price; if it fails, the real command reports why. */
+				CommandCost cost = Command<Commands::DestroyTown>::Do(DoCommandFlag::QueryCost, town_id);
+				if (cost.Failed()) {
+					Command<Commands::DestroyTown>::Post(STR_ERROR_CAN_T_DESTROY_TOWN, town_id);
+					break;
+				}
+				auto [houses, roads] = GetTownDestructionCounts(this->town);
+				ShowQuery(GetEncodedString(STR_TOWN_DESTROY_CAPTION), GetEncodedString(STR_TOWN_DESTROY_QUERY, town_id, houses, roads, cost.GetCost()), this, DestroyTownCallback);
 				break;
+			}
 
 			case WID_TV_GRAPH: {
 				ShowTownCargoGraph(this->window_number);
@@ -724,6 +747,7 @@ static constexpr std::initializer_list<NWidgetPart> _nested_town_game_view_widge
 		NWidget(NWID_HORIZONTAL, NWidContainerFlag::EqualSize),
 			NWidget(WWT_PUSHTXTBTN, Colours::Brown, WID_TV_SUPPLY), SetMinimalSize(80, 12), SetFill(1, 1), SetResize(1, 0), SetStringTip(STR_TOWN_VIEW_SUPPLY_BUTTON, STR_TOWN_VIEW_SUPPLY_TOOLTIP),
 			NWidget(WWT_PUSHTXTBTN, Colours::Brown, WID_TV_INVEST), SetMinimalSize(80, 12), SetFill(1, 1), SetResize(1, 0), SetStringTip(STR_TOWN_VIEW_INVEST_BUTTON, STR_TOWN_VIEW_INVEST_TOOLTIP),
+			NWidget(WWT_PUSHTXTBTN, Colours::Brown, WID_TV_DELETE), SetMinimalSize(80, 12), SetFill(1, 1), SetResize(1, 0), SetStringTip(STR_TOWN_VIEW_DELETE_BUTTON, STR_TOWN_VIEW_DESTROY_TOOLTIP),
 		EndContainer(),
 		NWidget(WWT_RESIZEBOX, Colours::Brown),
 	EndContainer(),
@@ -772,6 +796,17 @@ static WindowDesc _town_editor_view_desc(
 	{},
 	_nested_town_editor_view_widgets
 );
+
+/**
+ * Open the town window and ask to destroy the town, as its delete button does.
+ * @param town The town.
+ */
+void ShowTownDestroyQuery(TownID town)
+{
+	ShowTownViewWindow(town);
+	Window *w = FindWindowById(WindowClass::TownView, town);
+	if (w != nullptr) w->OnClick({}, WID_TV_DELETE, 1);
+}
 
 void ShowTownViewWindow(TownID town)
 {

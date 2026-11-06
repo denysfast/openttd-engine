@@ -50,6 +50,9 @@
 #include "core/random_func.hpp"
 #include "core/backup_type.hpp"
 #include "depot_base.h"
+#include "vehicle_func.h"
+#include "station_map.h"
+#include "cargomonitor.h"
 #include "object_base.h"
 #include "ai/ai.hpp"
 #include "game/game.hpp"
@@ -128,6 +131,17 @@ Town::~Town()
 	CloseWindowById(WindowClass::TownView, this->index);
 	CloseWindowById(WindowClass::TownCargoGraph, this->index);
 	CloseWindowById(WindowClass::TownSupply, this->index);
+	CloseWindowById(WindowClass::TownAuthority, this->index);
+	CloseWindowById(WindowClass::TownInvest, this->index);
+
+	/* The local authority zone overlay looks the town up by its id. */
+	if (this->show_zone) {
+		extern TownKdtree _town_local_authority_kdtree;
+		_town_local_authority_kdtree.Remove(this->index);
+	}
+	/* Old news about the town would scroll to it when clicked. */
+	DeleteTownNews(this->index);
+	ClearCargoMonitoringOfTown(this->index);
 
 #ifdef WITH_ASSERT
 	/* Check no industry is related to us. */
@@ -2670,6 +2684,286 @@ CommandCost CmdDeleteTown(DoCommandFlags flags, TownID town_id)
 	}
 
 	return CommandCost();
+}
+
+/** What destroying a town in a running game does with the tiles of the town, see #PlanTownDestruction. */
+struct TownDestructionPlan {
+	std::vector<TileIndex> houses; ///< North tiles of the houses to demolish.
+	std::vector<TileIndex> remove_roads; ///< Town road tiles to clear.
+	std::vector<TileIndex> keep_roads; ///< Town road tiles and level crossings that stay, without an owner.
+	std::vector<TileIndex> bridge_heads; ///< Heads of road bridges and tunnels of the town; they stay, without an owner.
+	std::vector<TileIndex> road_stops; ///< Road stops on a road of the town; their road loses its owner.
+};
+
+/**
+ * Whether the road of a tile continues into the neighbouring tile in a direction.
+ * @param tile The tile.
+ * @param dir The direction to look at.
+ * @return True if both tiles have road towards each other.
+ */
+static bool RoadConnectsTowards(TileIndex tile, DiagDirection dir)
+{
+	TileIndex next = TileAddByDiagDir(tile, dir);
+	if (!IsValidTile(next)) return false;
+	return GetAnyRoadBits(tile, RoadTramType::Road, true).Any(DiagDirToRoadBits(dir)) &&
+			GetAnyRoadBits(next, RoadTramType::Road, true).Any(DiagDirToRoadBits(ReverseDiagDir(dir)));
+}
+
+/**
+ * Decide what happens to the tiles of a town that is destroyed in a running game.
+ *
+ * All houses go. Town roads go too, except those that something else still needs: level crossings, tiles with
+ * a vehicle or a tram track on them, and the roads that link the "anchors" of the town's road network to each
+ * other. Anchors are the places where the network touches a road element that is not the town's own: company
+ * and ownerless roads, roads of other towns, road stops, road depots and bridges or tunnels of others. The linking
+ * roads are the union of shortest paths from every anchor to the anchors before it, so a bus stop in the town
+ * keeps a way out, and a road through the town between two other places stays. With fewer than two anchors
+ * nothing has to be linked. Everything depends on the map only, so all clients come to the same plan.
+ * @param t The town.
+ * @return The plan.
+ */
+static TownDestructionPlan PlanTownDestruction(const Town *t)
+{
+	TownDestructionPlan plan;
+	std::vector<TileIndex> roads; // Normal town roads; sorted, as the map is iterated in order.
+
+	for (const auto tile : Map::Iterate()) {
+		switch (GetTileType(tile)) {
+			case TileType::House: {
+				if (GetTownIndex(tile) != t->index) break;
+				HouseID house = GetHouseType(tile);
+				if (GetHouseNorthPart(house) == 0) plan.houses.push_back(tile);
+				break;
+			}
+
+			case TileType::Road:
+				if (IsRoadDepot(tile) || !HasTownOwnedRoad(tile) || GetTownIndex(tile) != t->index) break;
+				if (IsLevelCrossing(tile)) {
+					plan.keep_roads.push_back(tile);
+				} else {
+					roads.push_back(tile);
+				}
+				break;
+
+			case TileType::TunnelBridge:
+				if (GetTunnelBridgeTransportType(tile) == TransportType::Road && TestTownOwnsBridge(tile, t)) plan.bridge_heads.push_back(tile);
+				break;
+
+			case TileType::Station:
+				/* The road of a stop does not store its town; it goes back to the closest town once the stop is removed. */
+				if (IsAnyRoadStop(tile) && HasTileRoadType(tile, RoadTramType::Road) && GetRoadOwner(tile, RoadTramType::Road) == OWNER_TOWN &&
+						CalcClosestTownFromTile(tile) == t) {
+					plan.road_stops.push_back(tile);
+				}
+				break;
+
+			default:
+				break;
+		}
+	}
+
+	auto road_index = [&roads](TileIndex tile) -> std::optional<size_t> {
+		auto it = std::ranges::lower_bound(roads, tile);
+		if (it == roads.end() || *it != tile) return std::nullopt;
+		return static_cast<size_t>(it - roads.begin());
+	};
+	/* Our own crossings and bridges stay without an owner anyway; they do not need a way to anywhere. */
+	auto is_own_element = [&plan](TileIndex tile) {
+		return std::ranges::binary_search(plan.keep_roads, tile) || std::ranges::find(plan.bridge_heads, tile) != plan.bridge_heads.end();
+	};
+
+	std::vector<bool> keep(roads.size(), false);
+	std::vector<size_t> anchors;
+	for (size_t i = 0; i < roads.size(); i++) {
+		TileIndex tile = roads[i];
+		if (HasTileRoadType(tile, RoadTramType::Tram) || EnsureNoVehicleOnGround(tile).Failed()) keep[i] = true;
+		for (DiagDirection dir : EnumRange(DiagDirection::End)) {
+			if (!RoadConnectsTowards(tile, dir)) continue;
+			TileIndex next = TileAddByDiagDir(tile, dir);
+			if (!road_index(next).has_value() && !is_own_element(next)) {
+				anchors.push_back(i);
+				break;
+			}
+		}
+	}
+
+	if (anchors.size() >= 2) {
+		std::vector<bool> linked(roads.size(), false);
+		std::vector<size_t> parent(roads.size());
+		std::vector<bool> visited(roads.size());
+		std::vector<size_t> queue;
+		linked[anchors[0]] = true;
+		for (size_t a = 1; a < anchors.size(); a++) {
+			size_t start = anchors[a];
+			if (linked[start]) continue;
+
+			/* Breadth first from the anchor until the roads that are linked already. */
+			std::fill(visited.begin(), visited.end(), false);
+			queue.assign(1, start);
+			visited[start] = true;
+			std::optional<size_t> found;
+			for (size_t q = 0; q < queue.size() && !found.has_value(); q++) {
+				size_t cur = queue[q];
+				if (linked[cur]) {
+					found = cur;
+					break;
+				}
+				for (DiagDirection dir : EnumRange(DiagDirection::End)) {
+					if (!RoadConnectsTowards(roads[cur], dir)) continue;
+					auto next = road_index(TileAddByDiagDir(roads[cur], dir));
+					if (!next.has_value() || visited[*next]) continue;
+					visited[*next] = true;
+					parent[*next] = cur;
+					queue.push_back(*next);
+				}
+			}
+
+			/* Not reachable: the anchor starts a separate part of the network. */
+			linked[start] = true;
+			if (found.has_value()) {
+				for (size_t cur = *found; cur != start; cur = parent[cur]) linked[cur] = true;
+			}
+		}
+		for (size_t i = 0; i < roads.size(); i++) {
+			if (linked[i]) keep[i] = true;
+		}
+	}
+
+	for (size_t i = 0; i < roads.size(); i++) {
+		(keep[i] ? plan.keep_roads : plan.remove_roads).push_back(roads[i]);
+	}
+	return plan;
+}
+
+/**
+ * Count what destroying a town would demolish, for the confirmation of the town window.
+ * @param t The town.
+ * @return Number of houses and of road tiles that will be removed.
+ */
+std::pair<uint, uint> GetTownDestructionCounts(const Town *t)
+{
+	TownDestructionPlan plan = PlanTownDestruction(t);
+	return {static_cast<uint>(plan.houses.size()), static_cast<uint>(plan.remove_roads.size())};
+}
+
+/**
+ * Destroy a town in a running game, completely and for good.
+ *
+ * Unlike #CmdDeleteTown (scenario editor), nothing that belongs to a company is refused or demolished: houses
+ * (protected ones too) and the town roads that nothing needs are demolished, see #PlanTownDestruction for the
+ * roads that stay without an owner. Stations, waypoints, depots and industries of the town move to the closest
+ * remaining town, statues of the town are removed. The company pays for the demolition.
+ * @param flags Type of operation.
+ * @param town_id The town to destroy.
+ * @return The demolition costs or an error.
+ */
+CommandCost CmdDestroyTown(DoCommandFlags flags, TownID town_id)
+{
+	if (_game_mode != GameMode::Normal) return CMD_ERROR;
+	Town *t = Town::GetIfValid(town_id);
+	if (t == nullptr) return CMD_ERROR;
+	/* Stations, industries and objects always need a town to belong to. */
+	if (Town::GetNumItems() <= 1) return CommandCost(STR_ERROR_TOWN_CAN_T_DELETE_LAST_TOWN);
+
+	TownDestructionPlan plan = PlanTownDestruction(t);
+	CommandCost cost(ExpensesType::Construction);
+
+	for (TileIndex tile : plan.houses) {
+		cost.AddCost(HouseSpec::Get(GetHouseType(tile))->GetRemovalCost());
+		if (flags.Test(DoCommandFlag::Execute)) ClearTownHouse(t, tile);
+	}
+
+	/* Clear the roads as nobody: no local authority or ownership checks; the company pays the total below. */
+	{
+		AutoRestoreBackup cur_company(_current_company, OWNER_NONE);
+		DoCommandFlags test_flags = flags;
+		test_flags.Reset(DoCommandFlag::Execute);
+		for (TileIndex tile : plan.remove_roads) {
+			CommandCost ret = Command<Commands::LandscapeClear>::Do(test_flags, tile);
+			if (ret.Failed()) {
+				/* Whatever keeps this road from being removed, it stays as an ownerless road. */
+				plan.keep_roads.push_back(tile);
+				continue;
+			}
+			cost.AddCost(ret.GetCost());
+			if (flags.Test(DoCommandFlag::Execute)) Command<Commands::LandscapeClear>::Do(flags, tile);
+		}
+	}
+
+	if (!flags.Test(DoCommandFlag::Execute)) return cost;
+
+	/* The ownerless roads get their closest town in Town::PostDestructor. */
+	for (TileIndex tile : plan.keep_roads) {
+		SetRoadOwner(tile, RoadTramType::Road, OWNER_NONE);
+		MarkTileDirtyByTile(tile);
+	}
+	for (TileIndex tile : plan.bridge_heads) {
+		SetTileOwner(tile, OWNER_NONE);
+		SetRoadOwner(tile, RoadTramType::Road, OWNER_NONE);
+		MarkTileDirtyByTile(tile);
+	}
+	for (TileIndex tile : plan.road_stops) {
+		SetRoadOwner(tile, RoadTramType::Road, OWNER_NONE);
+	}
+
+	std::vector<Object *> statues;
+	for (Object *o : Object::Iterate()) {
+		if (o->town != t) continue;
+		if (o->type == OBJECT_STATUE) {
+			statues.push_back(o);
+		} else {
+			o->town = nullptr; // Town::PostDestructor finds a new town for it.
+		}
+	}
+	for (Object *o : statues) RemoveTownStatue(o);
+
+	/* From here on the closest town is never this town anymore. */
+	_town_kdtree.Remove(t->index);
+	if (t->cache.sign.kdtree_valid) _viewport_sign_kdtree.Remove(ViewportSignKdtreeItem::MakeTown(t->index));
+
+	std::vector<BaseStation *> moved_stations;
+	for (Station *st : Station::Iterate()) {
+		if (st->town != t) continue;
+		st->town = CalcClosestTownFromTile(st->xy);
+		RenameStationForNewTown(st);
+		moved_stations.push_back(st);
+	}
+	for (Waypoint *wp : Waypoint::Iterate()) {
+		if (wp->town != t) continue;
+		if (wp->name.empty()) {
+			MakeDefaultName(wp);
+		} else {
+			wp->town = CalcClosestTownFromTile(wp->xy);
+		}
+		moved_stations.push_back(wp);
+	}
+	for (Depot *d : Depot::Iterate()) {
+		if (d->town != t) continue;
+		if (d->name.empty()) {
+			MakeDefaultName(d);
+		} else {
+			d->town = CalcClosestTownFromTile(d->xy);
+		}
+	}
+	for (Industry *i : Industry::Iterate()) {
+		if (i->town == t) i->town = CalcClosestTownFromTile(i->location.tile);
+	}
+
+	/* Names are cached with the town name in them; resolve them anew before the signs are redrawn. */
+	ClearAllStationCachedNames();
+	ClearAllIndustryCachedNames();
+	for (BaseStation *st : moved_stations) st->UpdateVirtCoord();
+
+	delete t;
+
+	/* Airports count towards the noise of their closest town, which may have changed. */
+	UpdateAirportsNoise();
+	InvalidateWindowClassesData(WindowClass::StationList, 0);
+	InvalidateWindowData(WindowClass::IndustryDirectory, 0, IDIWD_FORCE_RESORT);
+	SetWindowClassesDirty(WindowClass::VehicleDepot);
+	MarkWholeScreenDirty();
+
+	return cost;
 }
 
 /**

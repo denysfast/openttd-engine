@@ -23,6 +23,7 @@
  * \li GSRail::RemoveRailDepot
  * \li GSDepot
  * \li GSError::ERR_CAT_DEPOT
+ * \li GSTown::Destroy
  * \li GSTown::TownNeed
  * \li GSTown::TownGrowthStatus
  * \li GSTown::IsValidNeed

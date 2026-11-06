@@ -2228,6 +2228,53 @@ static bool ConTownForceNeed(std::span<std::string_view> argv)
 	return true;
 }
 
+/** Destroy a town in a running game, like the town window does. @copydoc IConsoleCmdProc */
+static bool ConTownDelete(std::span<std::string_view> argv)
+{
+	if (argv.empty()) {
+		IConsolePrint(CC_HELP, "Delete a town completely and for good. Usage: 'town_delete <town id> [<company>]'.");
+		IConsolePrint(CC_HELP, "With a company (1-based) that company pays the demolition, like from the town window; without, it is done for free (server or single player only).");
+		return true;
+	}
+	if (argv.size() < 2 || argv.size() > 3) return false;
+
+	if (_game_mode != GameMode::Normal) {
+		IConsolePrint(CC_ERROR, "Only in a running game; the scenario editor has its own delete button.");
+		return true;
+	}
+	auto id = ParseType<TownID>(argv[1]);
+	if (!id.has_value() || !Town::IsValidID(*id)) {
+		IConsolePrint(CC_ERROR, "Unknown town '{}'.", argv[1]);
+		return true;
+	}
+
+	CompanyID company = OWNER_DEITY;
+	if (argv.size() == 3) {
+		auto number = ParseInteger(argv[2]);
+		if (!number.has_value() || *number == 0 || !Company::IsValidID(CompanyID(*number - 1))) {
+			IConsolePrint(CC_ERROR, "Unknown company '{}'.", argv[2]);
+			return true;
+		}
+		company = CompanyID(*number - 1);
+		if (_networking && !_network_server && company != _local_company) {
+			IConsolePrint(CC_ERROR, "A client deletes towns only for its own company.");
+			return true;
+		}
+	} else if (_networking && !_network_server) {
+		IConsolePrint(CC_ERROR, "Only the server can delete a town for free.");
+		return true;
+	}
+
+	auto [houses, roads] = GetTownDestructionCounts(Town::Get(*id));
+	AutoRestoreBackup cur_company(_current_company, company);
+	if (Command<Commands::DestroyTown>::Post(STR_ERROR_CAN_T_DESTROY_TOWN, *id)) {
+		IConsolePrint(CC_INFO, "Deleting town {}: {} houses and {} road tiles to demolish.", *id, houses, roads);
+	} else {
+		IConsolePrint(CC_ERROR, "Deleting the town failed.");
+	}
+	return true;
+}
+
 /** Invest money into towns, by a company or for free. @copydoc IConsoleCmdProc */
 static bool ConTownInvest(std::span<std::string_view> argv)
 {
@@ -3649,7 +3696,7 @@ static bool ConRailRouteWindow(std::span<std::string_view> argv)
 static bool ConOpenWindow(std::span<std::string_view> argv)
 {
 	if (argv.empty()) {
-		IConsolePrint(CC_HELP, "Open a window. Usage: 'open_window town <town id> [supply|invest]' or 'open_window station <station id>'.");
+		IConsolePrint(CC_HELP, "Open a window. Usage: 'open_window town <town id> [supply|invest|destroy]' or 'open_window station <station id>'.");
 		return true;
 	}
 	if (argv.size() < 3 || argv.size() > 4) return false;
@@ -3667,6 +3714,7 @@ static bool ConOpenWindow(std::span<std::string_view> argv)
 		ShowTownViewWindow(*id);
 		if (argv.size() == 4 && argv[3] == "supply") ShowTownSupplyWindow(*id);
 		if (argv.size() == 4 && argv[3] == "invest") ShowTownInvestWindow(*id);
+		if (argv.size() == 4 && argv[3] == "destroy") ShowTownDestroyQuery(*id);
 		return true;
 	}
 	if (argv[1] == "station") {
@@ -3922,6 +3970,7 @@ void IConsoleStdLibRegister()
 	IConsole::CmdRegister("town_needs",              ConTownNeeds);
 	IConsole::CmdRegister("town_force_need",         ConTownForceNeed,    ConHookServerOrNoNetwork);
 	IConsole::CmdRegister("town_invest",             ConTownInvest);
+	IConsole::CmdRegister("town_delete",             ConTownDelete);
 	IConsole::CmdRegister("power_grid",              ConPowerGrid);
 	IConsole::CmdRegister("power_add_fuel",          ConPowerAddFuel,     ConHookServerOrNoNetwork);
 	IConsole::CmdRegister("townsim_log",             ConTownSimLog);
