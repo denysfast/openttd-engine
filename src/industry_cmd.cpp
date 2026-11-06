@@ -537,7 +537,10 @@ static bool TransportIndustryGoods(TileIndex tile)
 	bool moved_cargo = false;
 
 	for (auto &p : i->produced) {
-		uint cw = ClampTo<uint8_t>(p.waiting);
+		/* Every tile loop of an industry tile moves up to 255 units, as in the original game. When much more is waiting
+		 * (big deliveries to a secondary industry), move a quarter of it instead: otherwise the output is capped at
+		 * 255 units per tile per 256 ticks (~27k goods a month for a factory) and the rest piles up in the industry. */
+		uint cw = std::max<uint>(std::min<uint>(p.waiting, UINT8_MAX), p.waiting / 4);
 		if (cw > indspec->minimal_cargo && IsValidCargoType(p.cargo)) {
 			p.waiting -= cw;
 
@@ -1142,7 +1145,7 @@ static void ChopLumberMillTrees(Industry *i)
 		Command<Commands::LandscapeClear>::Do(DoCommandFlag::Execute, tile);
 
 		/* Add according value to waiting cargo. */
-		itp->waiting = ClampTo<uint16_t>(itp->waiting + ScaleByCargoScale(45, false));
+		itp->waiting = ClampTo<uint32_t>(static_cast<uint64_t>(itp->waiting) + ScaleByCargoScale(45, false));
 		break;
 	}
 }
@@ -1160,7 +1163,7 @@ static void ProduceIndustryGoodsHelper(Industry *i, bool scale)
 		uint16_t amount = p.rate;
 		if (scale) amount = ScaleByCargoScale(amount, false);
 
-		p.waiting = ClampTo<uint16_t>(p.waiting + amount);
+		p.waiting = ClampTo<uint32_t>(static_cast<uint64_t>(p.waiting) + amount);
 	}
 }
 
@@ -2550,19 +2553,19 @@ void GenerateIndustries()
 template <>
 Industry::ProducedHistory SumHistory(std::span<const Industry::ProducedHistory> history)
 {
-	uint32_t production = std::accumulate(std::begin(history), std::end(history), 0, [](uint32_t r, const auto &p) { return r + p.production; });
-	uint32_t transported = std::accumulate(std::begin(history), std::end(history), 0, [](uint32_t r, const auto &p) { return r + p.transported; });
+	uint64_t production = std::accumulate(std::begin(history), std::end(history), uint64_t{0}, [](uint64_t r, const auto &p) { return r + p.production; });
+	uint64_t transported = std::accumulate(std::begin(history), std::end(history), uint64_t{0}, [](uint64_t r, const auto &p) { return r + p.transported; });
 	auto count = std::size(history);
-	return {.production = ClampTo<uint16_t>(production / count), .transported = ClampTo<uint16_t>(transported / count)};
+	return {.production = ClampTo<uint32_t>(production / count), .transported = ClampTo<uint32_t>(transported / count)};
 }
 
 template <>
 Industry::AcceptedHistory SumHistory(std::span<const Industry::AcceptedHistory> history)
 {
-	uint32_t accepted = std::accumulate(std::begin(history), std::end(history), 0, [](uint32_t r, const auto &a) { return r + a.accepted; });
+	uint64_t accepted = std::accumulate(std::begin(history), std::end(history), uint64_t{0}, [](uint64_t r, const auto &a) { return r + a.accepted; });
 	uint32_t waiting = std::accumulate(std::begin(history), std::end(history), 0, [](uint32_t r, const auto &a) { return r + a.waiting; });;
 	auto count = std::size(history);
-	return {.accepted = ClampTo<uint16_t>(accepted / count), .waiting = ClampTo<uint16_t>(waiting / count)};
+	return {.accepted = ClampTo<uint32_t>(accepted / count), .waiting = ClampTo<uint16_t>(waiting / count)};
 }
 
 /**

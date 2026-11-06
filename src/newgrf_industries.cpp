@@ -370,10 +370,10 @@ static uint32_t GetCountAndDistanceOfClosestInstance(const ResolverObject &objec
 
 		case 0x88:
 		case 0x89: return this->industry->GetProduced(variable - 0x88).cargo;
-		case 0x8A: return this->industry->GetProduced(0).waiting;
-		case 0x8B: return GB(this->industry->GetProduced(0).waiting, 8, 8);
-		case 0x8C: return this->industry->GetProduced(1).waiting;
-		case 0x8D: return GB(this->industry->GetProduced(1).waiting, 8, 8);
+		case 0x8A: return ClampTo<uint16_t>(this->industry->GetProduced(0).waiting);
+		case 0x8B: return GB(ClampTo<uint16_t>(this->industry->GetProduced(0).waiting), 8, 8);
+		case 0x8C: return ClampTo<uint16_t>(this->industry->GetProduced(1).waiting);
+		case 0x8D: return GB(ClampTo<uint16_t>(this->industry->GetProduced(1).waiting), 8, 8);
 		case 0x8E:
 		case 0x8F: return this->industry->GetProduced(variable - 0x8E).rate;
 		case 0x90:
@@ -381,28 +381,28 @@ static uint32_t GetCountAndDistanceOfClosestInstance(const ResolverObject &objec
 		case 0x92: return this->industry->GetAccepted(variable - 0x90).cargo;
 		case 0x93: return this->industry->prod_level;
 		/* amount of cargo produced so far THIS month. */
-		case 0x94: return this->industry->GetProduced(0).history[THIS_MONTH].production;
-		case 0x95: return GB(this->industry->GetProduced(0).history[THIS_MONTH].production, 8, 8);
-		case 0x96: return this->industry->GetProduced(1).history[THIS_MONTH].production;
-		case 0x97: return GB(this->industry->GetProduced(1).history[THIS_MONTH].production, 8, 8);
+		case 0x94: return ClampTo<uint16_t>(this->industry->GetProduced(0).history[THIS_MONTH].production);
+		case 0x95: return GB(ClampTo<uint16_t>(this->industry->GetProduced(0).history[THIS_MONTH].production), 8, 8);
+		case 0x96: return ClampTo<uint16_t>(this->industry->GetProduced(1).history[THIS_MONTH].production);
+		case 0x97: return GB(ClampTo<uint16_t>(this->industry->GetProduced(1).history[THIS_MONTH].production), 8, 8);
 		/* amount of cargo transported so far THIS month. */
-		case 0x98: return this->industry->GetProduced(0).history[THIS_MONTH].transported;
-		case 0x99: return GB(this->industry->GetProduced(0).history[THIS_MONTH].transported, 8, 8);
-		case 0x9A: return this->industry->GetProduced(1).history[THIS_MONTH].transported;
-		case 0x9B: return GB(this->industry->GetProduced(1).history[THIS_MONTH].transported, 8, 8);
+		case 0x98: return ClampTo<uint16_t>(this->industry->GetProduced(0).history[THIS_MONTH].transported);
+		case 0x99: return GB(ClampTo<uint16_t>(this->industry->GetProduced(0).history[THIS_MONTH].transported), 8, 8);
+		case 0x9A: return ClampTo<uint16_t>(this->industry->GetProduced(1).history[THIS_MONTH].transported);
+		case 0x9B: return GB(ClampTo<uint16_t>(this->industry->GetProduced(1).history[THIS_MONTH].transported), 8, 8);
 		/* fraction of cargo transported LAST month. */
 		case 0x9C:
 		case 0x9D: return this->industry->GetProduced(variable - 0x9C).history[LAST_MONTH].PctTransported();
 		/* amount of cargo produced LAST month. */
-		case 0x9E: return this->industry->GetProduced(0).history[LAST_MONTH].production;
-		case 0x9F: return GB(this->industry->GetProduced(0).history[LAST_MONTH].production, 8, 8);
-		case 0xA0: return this->industry->GetProduced(1).history[LAST_MONTH].production;
-		case 0xA1: return GB(this->industry->GetProduced(1).history[LAST_MONTH].production, 8, 8);
+		case 0x9E: return ClampTo<uint16_t>(this->industry->GetProduced(0).history[LAST_MONTH].production);
+		case 0x9F: return GB(ClampTo<uint16_t>(this->industry->GetProduced(0).history[LAST_MONTH].production), 8, 8);
+		case 0xA0: return ClampTo<uint16_t>(this->industry->GetProduced(1).history[LAST_MONTH].production);
+		case 0xA1: return GB(ClampTo<uint16_t>(this->industry->GetProduced(1).history[LAST_MONTH].production), 8, 8);
 		/* amount of cargo transported last month. */
-		case 0xA2: return this->industry->GetProduced(0).history[LAST_MONTH].transported;
-		case 0xA3: return GB(this->industry->GetProduced(0).history[LAST_MONTH].transported, 8, 8);
-		case 0xA4: return this->industry->GetProduced(1).history[LAST_MONTH].transported;
-		case 0xA5: return GB(this->industry->GetProduced(1).history[LAST_MONTH].transported, 8, 8);
+		case 0xA2: return ClampTo<uint16_t>(this->industry->GetProduced(0).history[LAST_MONTH].transported);
+		case 0xA3: return GB(ClampTo<uint16_t>(this->industry->GetProduced(0).history[LAST_MONTH].transported), 8, 8);
+		case 0xA4: return ClampTo<uint16_t>(this->industry->GetProduced(1).history[LAST_MONTH].transported);
+		case 0xA5: return GB(ClampTo<uint16_t>(this->industry->GetProduced(1).history[LAST_MONTH].transported), 8, 8);
 
 		case 0xA6: return indspec->grf_prop.local_id;
 		case 0xA7: return this->industry->founder.base();
@@ -652,7 +652,7 @@ void IndustryProductionCallback(Industry *ind, int reason)
 			}
 			for (uint i = 0; i < group->num_output && i < ind->produced.size(); i++) {
 				if (!IsValidCargoType(ind->produced[i].cargo)) continue;
-				ind->produced[i].waiting = ClampTo<uint16_t>(ind->produced[i].waiting + std::max(deref_ind_prod(group->add_output[i], deref), 0) * multiplier);
+				ind->produced[i].waiting = ClampTo<uint32_t>(static_cast<int64_t>(ind->produced[i].waiting) + static_cast<int64_t>(std::max(deref_ind_prod(group->add_output[i], deref), 0)) * multiplier);
 			}
 		} else {
 			/* Callback receives list of cargos to apply for, which need to have their cargo slots in industry looked up */
@@ -664,7 +664,7 @@ void IndustryProductionCallback(Industry *ind, int reason)
 			for (uint i = 0; i < group->num_output; i++) {
 				auto it = ind->GetCargoProduced(group->cargo_output[i]);
 				if (it == std::end(ind->produced)) continue;
-				it->waiting = ClampTo<uint16_t>(it->waiting + std::max(deref_ind_prod(group->add_output[i], deref), 0) * multiplier);
+				it->waiting = ClampTo<uint32_t>(static_cast<int64_t>(it->waiting) + static_cast<int64_t>(std::max(deref_ind_prod(group->add_output[i], deref), 0)) * multiplier);
 			}
 		}
 

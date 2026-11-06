@@ -1665,11 +1665,11 @@ protected:
 		/* Get industry productions (CargoType, production, suffix, transported) */
 		struct CargoInfo {
 			CargoType cargo_type; ///< Cargo type.
-			uint16_t production; ///< Production last month.
+			uint32_t production; ///< Production last month.
 			uint transported; ///< Percent transported last month.
 			std::string suffix; ///< Cargo suffix.
 
-			CargoInfo(CargoType cargo_type, uint16_t production, uint transported, std::string &&suffix) : cargo_type(cargo_type), production(production), transported(transported), suffix(std::move(suffix)) {}
+			CargoInfo(CargoType cargo_type, uint32_t production, uint transported, std::string &&suffix) : cargo_type(cargo_type), production(production), transported(transported), suffix(std::move(suffix)) {}
 		};
 		std::vector<CargoInfo> cargos;
 

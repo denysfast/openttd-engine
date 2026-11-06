@@ -827,10 +827,10 @@ static const OldChunks industry_chunk[] = {
 	OCL_SVAR( OC_FILE_U8 | OC_VAR_U16, Industry, location.h ),
 	OCL_NULL( 2 ),  ///< used to be industry's produced_cargo
 
-	OCL_VAR( OC_TTD | OC_UINT16, 1, &_old_produced[0].waiting ),
-	OCL_VAR( OC_TTD | OC_UINT16, 1, &_old_produced[1].waiting ),
-	OCL_VAR( OC_TTO | OC_FILE_U8 | OC_VAR_U16, 1, &_old_produced[0].waiting ),
-	OCL_VAR( OC_TTO | OC_FILE_U8 | OC_VAR_U16, 1, &_old_produced[1].waiting ),
+	OCL_VAR( OC_TTD | OC_FILE_U16 | OC_VAR_U32, 1, &_old_produced[0].waiting ),
+	OCL_VAR( OC_TTD | OC_FILE_U16 | OC_VAR_U32, 1, &_old_produced[1].waiting ),
+	OCL_VAR( OC_TTO | OC_FILE_U8 | OC_VAR_U32, 1, &_old_produced[0].waiting ),
+	OCL_VAR( OC_TTO | OC_FILE_U8 | OC_VAR_U32, 1, &_old_produced[1].waiting ),
 
 	OCL_VAR(  OC_UINT8, 1, &_old_produced[0].rate ),
 	OCL_VAR(  OC_UINT8, 1, &_old_produced[1].rate ),
@@ -839,17 +839,17 @@ static const OldChunks industry_chunk[] = {
 
 	OCL_SVAR(  OC_UINT8, Industry, prod_level ),
 
-	OCL_VAR( OC_UINT16, 1, &_old_produced[0].history[THIS_MONTH].production ),
-	OCL_VAR( OC_UINT16, 1, &_old_produced[1].history[THIS_MONTH].production ),
-	OCL_VAR( OC_UINT16, 1, &_old_produced[0].history[THIS_MONTH].transported ),
-	OCL_VAR( OC_UINT16, 1, &_old_produced[1].history[THIS_MONTH].transported ),
+	OCL_VAR( OC_FILE_U16 | OC_VAR_U32, 1, &_old_produced[0].history[THIS_MONTH].production ),
+	OCL_VAR( OC_FILE_U16 | OC_VAR_U32, 1, &_old_produced[1].history[THIS_MONTH].production ),
+	OCL_VAR( OC_FILE_U16 | OC_VAR_U32, 1, &_old_produced[0].history[THIS_MONTH].transported ),
+	OCL_VAR( OC_FILE_U16 | OC_VAR_U32, 1, &_old_produced[1].history[THIS_MONTH].transported ),
 
 	OCL_NULL( 2 ), ///< last_month_pct_transported, now computed on the fly
 
-	OCL_VAR( OC_UINT16, 1, &_old_produced[0].history[LAST_MONTH].production ),
-	OCL_VAR( OC_UINT16, 1, &_old_produced[1].history[LAST_MONTH].production ),
-	OCL_VAR( OC_UINT16, 1, &_old_produced[0].history[LAST_MONTH].transported ),
-	OCL_VAR( OC_UINT16, 1, &_old_produced[1].history[LAST_MONTH].transported ),
+	OCL_VAR( OC_FILE_U16 | OC_VAR_U32, 1, &_old_produced[0].history[LAST_MONTH].production ),
+	OCL_VAR( OC_FILE_U16 | OC_VAR_U32, 1, &_old_produced[1].history[LAST_MONTH].production ),
+	OCL_VAR( OC_FILE_U16 | OC_VAR_U32, 1, &_old_produced[0].history[LAST_MONTH].transported ),
+	OCL_VAR( OC_FILE_U16 | OC_VAR_U32, 1, &_old_produced[1].history[LAST_MONTH].transported ),
 
 	OCL_SVAR(  OC_UINT8, Industry, type ),
 	OCL_SVAR( OC_TTO | OC_FILE_U8 | OC_VAR_U16, Industry, counter ),

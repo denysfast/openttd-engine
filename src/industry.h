@@ -63,24 +63,24 @@ using IndustryControlFlags = EnumBitSet<IndustryControlFlag, uint8_t, IndustryCo
  */
 struct Industry : IndustryPool::PoolItem<&_industry_pool> {
 	struct ProducedHistory {
-		uint16_t production = 0; ///< Total produced
-		uint16_t transported = 0; ///< Total transported
+		uint32_t production = 0; ///< Total produced
+		uint32_t transported = 0; ///< Total transported
 
 		uint8_t PctTransported() const
 		{
 			if (this->production == 0) return 0;
-			return ClampTo<uint8_t>(this->transported * 256 / this->production);
+			return ClampTo<uint8_t>(static_cast<uint64_t>(this->transported) * 256 / this->production);
 		}
 	};
 	struct ProducedCargo {
 		CargoType cargo = INVALID_CARGO; ///< Cargo type
-		uint16_t waiting = 0; ///< Amount of cargo produced
+		uint32_t waiting = 0; ///< Amount of cargo produced and not yet moved to stations
 		uint8_t rate = 0; ///< Production rate
 		HistoryData<ProducedHistory> history{}; ///< History of cargo produced and transported for this month and 24 previous months
 	};
 
 	struct AcceptedHistory {
-		uint16_t accepted = 0; ///< Total accepted.
+		uint32_t accepted = 0; ///< Total accepted.
 		uint16_t waiting = 0; ///< Average waiting.
 	};
 

@@ -23,7 +23,8 @@ static OldPersistentStorage _old_ind_persistent_storage;
 class SlIndustryAcceptedHistory : public DefaultSaveLoadHandler<SlIndustryAcceptedHistory, Industry::AcceptedCargo> {
 public:
 	static inline const SaveLoad description[] = {
-		SaveLoad::Variable<VarFileType::U16>("accepted", SLE_OBJECT_ADDRESS(Industry::AcceptedHistory, accepted)),
+		SaveLoad::Variable<VarFileType::U16>("accepted", SLE_OBJECT_ADDRESS(Industry::AcceptedHistory, accepted), SaveLoadVersion::MinVersion, SaveLoadVersion::IndustryCargoAmounts32),
+		SaveLoad::Variable<VarFileType::U32>("accepted", SLE_OBJECT_ADDRESS(Industry::AcceptedHistory, accepted), SaveLoadVersion::IndustryCargoAmounts32),
 		SaveLoad::Variable<VarFileType::U16>("waiting", SLE_OBJECT_ADDRESS(Industry::AcceptedHistory, waiting)),
 	};
 	static inline const SaveLoadCompatTable compat_description = _industry_produced_history_sl_compat;
@@ -87,8 +88,10 @@ public:
 class SlIndustryProducedHistory : public DefaultSaveLoadHandler<SlIndustryProducedHistory, Industry::ProducedCargo> {
 public:
 	static inline const SaveLoad description[] = {
-		SaveLoad::Variable<VarFileType::U16>("production", SLE_OBJECT_ADDRESS(Industry::ProducedHistory, production)),
-		SaveLoad::Variable<VarFileType::U16>("transported", SLE_OBJECT_ADDRESS(Industry::ProducedHistory, transported)),
+		SaveLoad::Variable<VarFileType::U16>("production", SLE_OBJECT_ADDRESS(Industry::ProducedHistory, production), SaveLoadVersion::MinVersion, SaveLoadVersion::IndustryCargoAmounts32),
+		SaveLoad::Variable<VarFileType::U32>("production", SLE_OBJECT_ADDRESS(Industry::ProducedHistory, production), SaveLoadVersion::IndustryCargoAmounts32),
+		SaveLoad::Variable<VarFileType::U16>("transported", SLE_OBJECT_ADDRESS(Industry::ProducedHistory, transported), SaveLoadVersion::MinVersion, SaveLoadVersion::IndustryCargoAmounts32),
+		SaveLoad::Variable<VarFileType::U32>("transported", SLE_OBJECT_ADDRESS(Industry::ProducedHistory, transported), SaveLoadVersion::IndustryCargoAmounts32),
 	};
 	static inline const SaveLoadCompatTable compat_description = _industry_produced_history_sl_compat;
 
@@ -122,7 +125,8 @@ class SlIndustryProduced : public VectorSaveLoadHandler<SlIndustryProduced, Indu
 public:
 	static inline const SaveLoad description[] = {
 		SaveLoad::Variable<VarFileType::U8>("cargo", SLE_OBJECT_ADDRESS(Industry::ProducedCargo, cargo)),
-		SaveLoad::Variable<VarFileType::U16>("waiting", SLE_OBJECT_ADDRESS(Industry::ProducedCargo, waiting)),
+		SaveLoad::Variable<VarFileType::U16>("waiting", SLE_OBJECT_ADDRESS(Industry::ProducedCargo, waiting), SaveLoadVersion::MinVersion, SaveLoadVersion::IndustryCargoAmounts32),
+		SaveLoad::Variable<VarFileType::U32>("waiting", SLE_OBJECT_ADDRESS(Industry::ProducedCargo, waiting), SaveLoadVersion::IndustryCargoAmounts32),
 		SaveLoad::Variable<VarFileType::U8>("rate", SLE_OBJECT_ADDRESS(Industry::ProducedCargo, rate)),
 		SaveLoad::StructList<SlIndustryProducedHistory>("history"),
 	};
