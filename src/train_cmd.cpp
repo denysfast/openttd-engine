@@ -27,6 +27,7 @@
 #include "game/game.hpp"
 #include "newgrf_station.h"
 #include "effectvehicle_func.h"
+#include "core/backup_type.hpp"
 #include "core/random_func.hpp"
 #include "company_base.h"
 #include "newgrf.h"
@@ -58,6 +59,9 @@ bool TrainController(Train *v, Vehicle *nomove, bool reverse = true); // Also us
 static TileIndex TrainApproachingCrossingTile(const Train *v);
 static void CheckIfTrainNeedsService(Train *v);
 static void CheckNextTrainTile(Train *v);
+
+/** Set while TrainLocoHandler moves a train; TrainController then skips the per-step viewport updates. */
+static bool _train_defer_viewport = false;
 
 /** Initial x subtile coordinate of rail vehicles for each direction. */
 static constexpr DiagDirectionIndexArray<uint8_t> _vehicle_initial_x_fract{10, 8, 4,  8};
@@ -3381,6 +3385,28 @@ bool TrainController(Train *v, Vehicle *nomove, bool reverse)
 		bool update_signals_crossing = false; // will we update signals or crossing state?
 
 		GetNewVehiclePosResult gp = GetNewVehiclePos(v);
+
+		/* Fast path for by far the most common step: a vehicle behind the moving front that stays
+		 * on a plain rail or station tile. Such a step changes nothing but the vehicle's own
+		 * position: VehicleEnterTile does nothing for it (it only acts on depots, and on stations
+		 * for the moving front), the tile and so the tile hash stay the same, and signals,
+		 * crossings and reservations are only touched on entering a tile or by the moving front.
+		 * This is exactly what the full code below does for this case, minus the no-ops. */
+		if (prev != nullptr && gp.old_tile == gp.new_tile && v->track != Track::Wormhole && v->track != Track::Depot) {
+			TileType tt = GetTileType(gp.new_tile);
+			if ((tt == TileType::Railway && !IsRailDepot(gp.new_tile)) || tt == TileType::Station) {
+				v->x_pos = gp.x;
+				v->y_pos = gp.y;
+				v->UpdatePosition();
+				v->UpdateZPosition();
+				if (!_train_defer_viewport) {
+					v->UpdateDeltaXY();
+					v->UpdateViewport(true, false);
+				}
+				continue;
+			}
+		}
+
 		if (v->track != Track::Wormhole) {
 			/* Not inside tunnel */
 			if (gp.old_tile == gp.new_tile) {
@@ -3615,20 +3641,28 @@ bool TrainController(Train *v, Vehicle *nomove, bool reverse)
 				v->x_pos = gp.x;
 				v->y_pos = gp.y;
 				v->UpdatePosition();
-				if (!v->vehstatus.Test(VehState::Hidden)) v->Vehicle::UpdateViewport(true);
+				if (!_train_defer_viewport && !v->vehstatus.Test(VehState::Hidden)) v->Vehicle::UpdateViewport(true);
 				continue;
 			}
 		}
 
-		/* update image of train, as well as delta XY */
-		v->UpdateDeltaXY();
+		/* update image of train, as well as delta XY (only used for drawing) */
+		if (!_train_defer_viewport) v->UpdateDeltaXY();
 
 		v->x_pos = gp.x;
 		v->y_pos = gp.y;
 		v->UpdatePosition();
 
 		/* update the Z position of the vehicle */
-		int old_z = v->UpdateInclination(gp.new_tile != gp.old_tile, false);
+		int old_z = v->z_pos;
+		if (gp.new_tile != gp.old_tile) {
+			v->UpdateZPositionAndInclination();
+		} else {
+			v->UpdateZPosition();
+		}
+		/* The viewport (sprite bounds, viewport hash, dirty blocks) is not game state; while the
+		 * train moves several steps in one tick it is updated once at the end of the tick. */
+		if (!_train_defer_viewport) v->UpdateViewport(true, false);
 
 		if (prev == nullptr) {
 			/* This is the first vehicle in the train */
@@ -4127,12 +4161,15 @@ static bool TrainLocoHandler(Train *consist, bool mode)
 
 	Train* moving_front = consist->GetMovingFront();
 	int adv_spd = moving_front->GetAdvanceDistance();
+	bool moved = false;
 	if (j < adv_spd) {
 		/* if the vehicle has speed 0, update the last_speed field. */
 		if (consist->cur_speed == 0) consist->SetLastSpeed();
 	} else {
 		TrainCheckIfLineEnds(moving_front);
 		moving_front = moving_front->GetMovingFront();
+		moved = true;
+		AutoRestoreBackup defer_viewport(_train_defer_viewport, true);
 		/* Loop until the train has finished moving. */
 		for (;;) {
 			j -= adv_spd;
@@ -4159,6 +4196,12 @@ static bool TrainLocoHandler(Train *consist, bool mode)
 	}
 
 	for (Train *u = consist; u != nullptr; u = u->Next()) {
+		if (moved) {
+			/* Movement skipped the per-step bounding box and viewport updates; catch up once,
+			 * including vehicles that became hidden this tick so their old image gets erased. */
+			u->UpdateViewport(true, true);
+			continue;
+		}
 		if (u->vehstatus.Test(VehState::Hidden)) continue;
 
 		u->UpdateViewport(false, false);
