@@ -2929,6 +2929,68 @@ void CcUpgradeStationCatchment(Commands, const CommandCost &result, StationID st
 }
 
 /**
+ * Get the towns a station may be assigned to: the #MAX_STATION_TOWN_CANDIDATES towns whose centre
+ * is closest to the station sign, nearest first (equal distances by town index, so every client gets the same list).
+ * @param st The station.
+ * @return The candidate towns.
+ */
+std::vector<Town *> GetStationTownCandidates(const Station *st)
+{
+	std::vector<std::pair<uint, Town *>> towns;
+	towns.reserve(Town::GetNumItems());
+	for (Town *t : Town::Iterate()) towns.emplace_back(DistanceManhattan(st->xy, t->xy), t);
+
+	size_t count = std::min<size_t>(towns.size(), MAX_STATION_TOWN_CANDIDATES);
+	auto less = [](const auto &a, const auto &b) { return a.first != b.first ? a.first < b.first : a.second->index < b.second->index; };
+	std::partial_sort(towns.begin(), towns.begin() + count, towns.end(), less);
+
+	std::vector<Town *> result;
+	result.reserve(count);
+	for (size_t i = 0; i < count; i++) result.push_back(towns[i].second);
+	return result;
+}
+
+/**
+ * Assign a station to another town: deliveries to the station count for that town (goods, valuables, town effects),
+ * its local authority acts on the station and its default name is made from that town.
+ * @param flags operation to perform
+ * @param station_id the station
+ * @param town_id the new town; it has to be one of #GetStationTownCandidates
+ * @return the cost of this operation (free) or an error
+ */
+CommandCost CmdSetStationTown(DoCommandFlags flags, StationID station_id, TownID town_id)
+{
+	Station *st = Station::GetIfValid(station_id);
+	if (st == nullptr) return CMD_ERROR;
+
+	if (_current_company != OWNER_DEITY) {
+		if (st->owner == OWNER_NONE) return CMD_ERROR;
+		CommandCost ret = CheckOwnership(st->owner);
+		if (ret.Failed()) return ret;
+	}
+
+	Town *t = Town::GetIfValid(town_id);
+	if (t == nullptr) return CMD_ERROR;
+
+	std::vector<Town *> candidates = GetStationTownCandidates(st);
+	if (std::ranges::find(candidates, t) == candidates.end()) return CommandCost(STR_ERROR_STATION_TOWN_TOO_FAR);
+
+	if (st->town == t) return CommandCost();
+
+	if (flags.Test(DoCommandFlag::Execute)) {
+		st->town = t;
+		RenameStationForNewTown(st);
+		st->cached_name.clear();
+		st->UpdateVirtCoord();
+
+		SetWindowDirty(WindowClass::StationView, st->index);
+		InvalidateWindowData(WindowClass::StationList, st->owner, 0);
+		SetWindowClassesDirty(WindowClass::TownView);
+	}
+	return CommandCost();
+}
+
+/**
  * Tests whether the company's vehicles have this station in orders
  * @param station station ID
  * @param include_company If true only check vehicles of \a company, if false only check vehicles of other companies

@@ -243,3 +243,11 @@ template <bool Tfrom, bool Tvia>
 
 	return ScriptObject::Command<Commands::OpenCloseAirport>::Do(station_id);
 }
+
+/* static */ bool ScriptStation::SetTown(StationID station_id, TownID town_id)
+{
+	EnforcePrecondition(false, IsValidStation(station_id));
+	EnforcePrecondition(false, ScriptTown::IsValidTown(town_id));
+
+	return ScriptObject::Command<Commands::SetStationTown>::Do(station_id, town_id);
+}

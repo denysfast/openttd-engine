@@ -2563,6 +2563,62 @@ static bool ConStationCatchment(std::span<std::string_view> argv)
 	return true;
 }
 
+/** Show the towns a station can belong to, or assign it to one of them. @copydoc IConsoleCmdProc */
+static bool ConStationTown(std::span<std::string_view> argv)
+{
+	if (argv.empty()) {
+		IConsolePrint(CC_HELP, "Show or change the town a station belongs to. Usage: 'station_town <station id> [<town id>]'.");
+		IConsolePrint(CC_HELP, "Without a town the {} nearest towns are listed (* = current); deliveries to the station count for its town.", MAX_STATION_TOWN_CANDIDATES);
+		return true;
+	}
+
+	if (argv.size() != 2 && argv.size() != 3) return false;
+
+	if (_game_mode == GameMode::Menu) {
+		IConsolePrint(CC_ERROR, "There is no game running.");
+		return true;
+	}
+
+	auto id = ParseType<StationID>(argv[1]);
+	const Station *st = id.has_value() ? Station::GetIfValid(*id) : nullptr;
+	if (st == nullptr) {
+		IConsolePrint(CC_ERROR, "Station '{}' does not exist.", argv[1]);
+		return true;
+	}
+
+	if (argv.size() == 2) {
+		IConsolePrint(CC_INFO, "Station {} '{}' belongs to town {} '{}'.", st->index, st->GetCachedName(), st->town->index, st->town->GetCachedName());
+		for (const Town *t : GetStationTownCandidates(st)) {
+			IConsolePrint(CC_INFO, "{} {:5} {:30} distance {:4}, population {}", t == st->town ? '*' : ' ', t->index, t->GetCachedName(), DistanceManhattan(st->xy, t->xy), t->cache.population);
+		}
+		return true;
+	}
+
+	auto town_id = ParseType<TownID>(argv[2]);
+	if (!town_id.has_value() || !Town::IsValidID(*town_id)) {
+		IConsolePrint(CC_ERROR, "Town '{}' does not exist.", argv[2]);
+		return true;
+	}
+
+	if (!_network_server && _networking && st->owner != _local_company) {
+		IConsolePrint(CC_ERROR, "Station {} is not owned by your company.", st->index);
+		return true;
+	}
+
+	/* The server acts as the owner of the station, or as deity for a station without owner (e.g. an oil rig). */
+	Backup<CompanyID> cur_company(_current_company, Company::IsValidID(st->owner) ? st->owner : OWNER_DEITY);
+	bool sent = Command<Commands::SetStationTown>::Post(STR_ERROR_CAN_T_CHANGE_STATION_TOWN, st->index, *town_id);
+	cur_company.Restore();
+
+	if (!sent) return true;
+	if (_networking) {
+		IConsolePrint(CC_INFO, "Sent; the town is changed with the next tick.");
+	} else {
+		IConsolePrint(CC_INFO, "Station {} '{}' now belongs to town {} '{}'.", st->index, st->GetCachedName(), st->town->index, st->town->GetCachedName());
+	}
+	return true;
+}
+
 /** Write the simulation line of every town to the debug output now. @copydoc IConsoleCmdProc */
 static bool ConTownSimLog(std::span<std::string_view> argv)
 {
@@ -4040,6 +4096,7 @@ void IConsoleStdLibRegister()
 	IConsole::CmdRegister("power_add_fuel",          ConPowerAddFuel,     ConHookServerOrNoNetwork);
 	IConsole::CmdRegister("townsim_log",             ConTownSimLog);
 	IConsole::CmdRegister("station_catchment",       ConStationCatchment, ConHookServerOrNoNetwork);
+	IConsole::CmdRegister("station_town",            ConStationTown,      ConHookServerOrNoNetwork);
 
 	/* networking functions */
 

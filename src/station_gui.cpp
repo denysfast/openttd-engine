@@ -868,6 +868,8 @@ static constexpr std::initializer_list<NWidgetPart> _nested_station_view_widgets
 		NWidget(WWT_PUSHTXTBTN, Colours::Grey, WID_SV_CATCHMENT_UPGRADE), SetMinimalSize(60, 12), SetFill(0, 1),
 				SetStringTip(STR_STATION_VIEW_CATCHMENT_UPGRADE, STR_STATION_VIEW_CATCHMENT_UPGRADE_TOOLTIP),
 	EndContainer(),
+	NWidget(WWT_DROPDOWN, Colours::Grey, WID_SV_TOWN), SetMinimalSize(249, 12), SetResize(1, 0), SetFill(1, 1),
+			SetStringTip(STR_STATION_VIEW_TOWN, STR_STATION_VIEW_TOWN_TOOLTIP),
 	NWidget(NWID_HORIZONTAL, NWidContainerFlag::EqualSize),
 		NWidget(WWT_PUSHTXTBTN, Colours::Grey, WID_SV_ACCEPTS_RATINGS), SetMinimalSize(46, 12), SetResize(1, 0), SetFill(1, 1),
 				SetStringTip(STR_STATION_VIEW_RATINGS_BUTTON, STR_STATION_VIEW_RATINGS_TOOLTIP),
@@ -1487,6 +1489,7 @@ struct StationViewWindow : public Window {
 		this->SetWidgetDisabledState(WID_SV_CATCHMENT, st->facilities.None());
 		this->SetWidgetDisabledState(WID_SV_CATCHMENT_UPGRADE, st->owner != _local_company || st->owner == OWNER_NONE || st->facilities.None() || st->catchment_level >= MAX_STATION_CATCHMENT_LEVEL);
 		this->SetWidgetLoweredState(WID_SV_CATCHMENT, _viewport_highlight_station == st);
+		this->SetWidgetDisabledState(WID_SV_TOWN, st->owner != _local_company || st->owner == OWNER_NONE);
 
 		this->DrawWidgets();
 
@@ -1537,6 +1540,11 @@ struct StationViewWindow : public Window {
 		if (widget == WID_SV_CATCHMENT_LEVEL) {
 			const Station *st = Station::Get(this->window_number);
 			return GetString(STR_STATION_VIEW_CATCHMENT_LEVEL, st->catchment_level, MAX_STATION_CATCHMENT_LEVEL, st->GetCatchmentRadius());
+		}
+
+		if (widget == WID_SV_TOWN) {
+			const Station *st = Station::Get(this->window_number);
+			return GetString(STR_STATION_VIEW_TOWN, st->town->index);
 		}
 
 		return this->Window::GetWidgetString(widget, stringid);
@@ -2075,6 +2083,18 @@ struct StationViewWindow : public Window {
 				Command<Commands::UpgradeStationCatchment>::Post(STR_ERROR_CAN_T_UPGRADE_STATION_CATCHMENT, CcUpgradeStationCatchment, this->window_number);
 				break;
 
+			case WID_SV_TOWN: {
+				const Station *st = Station::Get(this->window_number);
+				DropDownList list;
+				int selected = -1;
+				for (const Town *t : GetStationTownCandidates(st)) {
+					if (t == st->town) selected = t->index.base();
+					list.push_back(MakeDropDownListStringItem(GetString(STR_STATION_VIEW_TOWN_ITEM, t->index, DistanceManhattan(st->xy, t->xy), t->cache.population), t->index.base()));
+				}
+				ShowDropDownList(this, std::move(list), selected, WID_SV_TOWN);
+				break;
+			}
+
 			case WID_SV_TRAINS:   // Show list of scheduled trains to this station
 			case WID_SV_ROADVEHS: // Show list of scheduled road-vehicles to this station
 			case WID_SV_SHIPS:    // Show list of scheduled ships to this station
@@ -2198,7 +2218,9 @@ struct StationViewWindow : public Window {
 
 	void OnDropdownSelect(WidgetID widget, int index, int) override
 	{
-		if (widget == WID_SV_SORT_BY) {
+		if (widget == WID_SV_TOWN) {
+			Command<Commands::SetStationTown>::Post(STR_ERROR_CAN_T_CHANGE_STATION_TOWN, static_cast<StationID>(this->window_number), static_cast<TownID>(index));
+		} else if (widget == WID_SV_SORT_BY) {
 			this->SelectSortBy(index);
 		} else {
 			this->SelectGroupBy(index);

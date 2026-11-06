@@ -14,6 +14,7 @@
 #include "rail_type.h"
 #include "road_type.h"
 #include "station_type.h"
+#include "town_type.h"
 #include "newgrf_roadstop.h"
 #include "newgrf_station.h"
 #include "tilearea_airport.h"
@@ -36,6 +37,11 @@ CommandCost CmdRenameStation(DoCommandFlags flags, StationID station_id, const s
 std::tuple<CommandCost, StationID> CmdMoveStationName(DoCommandFlags flags, StationID station_id, TileIndex tile);
 CommandCost CmdOpenCloseAirport(DoCommandFlags flags, StationID station_id);
 CommandCost CmdUpgradeStationCatchment(DoCommandFlags flags, StationID station_id);
+CommandCost CmdSetStationTown(DoCommandFlags flags, StationID station_id, TownID town_id);
+
+/** Number of nearest towns a station can be assigned to. */
+static constexpr uint MAX_STATION_TOWN_CANDIDATES = 20;
+std::vector<Town *> GetStationTownCandidates(const Station *st);
 
 DEF_CMD_TRAIT(Commands::BuildAirport, CmdBuildAirport, CommandFlags({CommandFlag::Auto, CommandFlag::NoWater}), CommandType::LandscapeConstruction)
 DEF_CMD_TRAIT(Commands::BuildDock, CmdBuildDock, CommandFlag::Auto, CommandType::LandscapeConstruction)
@@ -47,6 +53,7 @@ DEF_CMD_TRAIT(Commands::RenameStation, CmdRenameStation, {}, CommandType::OtherM
 DEF_CMD_TRAIT(Commands::MoveStationName, CmdMoveStationName, {}, CommandType::OtherManagement)
 DEF_CMD_TRAIT(Commands::OpenCloseAirport, CmdOpenCloseAirport, {}, CommandType::RouteManagement)
 DEF_CMD_TRAIT(Commands::UpgradeStationCatchment, CmdUpgradeStationCatchment, {}, CommandType::LandscapeConstruction)
+DEF_CMD_TRAIT(Commands::SetStationTown, CmdSetStationTown, CommandFlag::Deity, CommandType::OtherManagement)
 
 void CcMoveStationName(Commands, const CommandCost &result, StationID station_id);
 void CcUpgradeStationCatchment(Commands, const CommandCost &result, StationID station_id);

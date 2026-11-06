@@ -313,6 +313,7 @@ enum class Commands : uint8_t {
 	UpgradeStationCatchment, ///< buy one catchment radius level of a station
 	DestroyTown, ///< destroy a town in a running game
 	CloneDepot, ///< buy copies of all vehicles in another depot
+	SetStationTown, ///< assign a station to one of the towns nearest to it
 
 	OrderRefit, ///< change the refit information of an order (for "goto depot" )
 	CloneOrder, ///< clone (and share) an order

@@ -32,6 +32,7 @@ enum StationViewWidgets : WidgetID {
 	WID_SV_CATCHMENT,          ///< Toggle catchment area highlight.
 	WID_SV_CATCHMENT_LEVEL,    ///< Text with the bought catchment level and the catchment radius.
 	WID_SV_CATCHMENT_UPGRADE,  ///< 'Radius +1' button: buy the next catchment level.
+	WID_SV_TOWN,               ///< Dropdown with the town of the station: pick one of the nearest towns.
 };
 
 /** Widgets of the #CompanyStationsWindow class. */

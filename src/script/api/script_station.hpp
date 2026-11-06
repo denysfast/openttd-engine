@@ -286,6 +286,17 @@ public:
 	 */
 	static bool OpenCloseAirport(StationID station_id);
 
+	/**
+	 * Assign a station to another town; see #GetNearestTown for the town it belongs to.
+	 * Deliveries to the station count for that town and the default station name is made from it.
+	 * @param station_id The station to modify.
+	 * @param town_id The new town; one of the 20 towns whose centre is nearest to the station.
+	 * @pre IsValidStation(station_id).
+	 * @pre ScriptTown::IsValidTown(town_id).
+	 * @return True if the station now belongs to the town.
+	 */
+	static bool SetTown(StationID station_id, TownID town_id);
+
 private:
 	template <bool Tfrom, bool Tvia>
 	static bool IsCargoRequestValid(StationID station_id, StationID from_station_id,
