@@ -4214,7 +4214,7 @@ STR_STATION_VIEW_CATCHMENT_UPGRADE                              :{BLACK}Radius +
 STR_STATION_VIEW_CATCHMENT_UPGRADE_TOOLTIP                      :{BLACK}Increase the catchment radius of the station by 1 tile for {CURRENCY_LONG}
 STR_STATION_VIEW_CATCHMENT_UPGRADE_MAX_TOOLTIP                  :{BLACK}The catchment radius of the station is already at the maximum level
 STR_STATION_VIEW_TOWN                                           :{BLACK}Town: {TOWN}
-STR_STATION_VIEW_TOWN_TOOLTIP                                   :{BLACK}Choose the town this station belongs to, one of the 20 nearest towns. Goods and other cargo delivered here count for that town, and the station is named after it
+STR_STATION_VIEW_TOWN_TOOLTIP                                   :{BLACK}Choose the town this station belongs to, one of the 200 nearest towns (type to search by name). Goods and other cargo delivered here count for that town, and the station is named after it
 STR_STATION_VIEW_TOWN_ITEM                                      :{TOWN} ({NUM} tile{P "" s}, population {COMMA})
 
 # Waypoint/buoy view window
@@ -5473,7 +5473,7 @@ STR_ERROR_CAN_T_RENAME_STATION                                  :Can't rename st
 STR_ERROR_CAN_T_MOVE_STATION_NAME                               :Can't move station sign...
 STR_ERROR_CAN_T_UPGRADE_STATION_CATCHMENT                       :Can't increase the catchment radius of the station...
 STR_ERROR_CAN_T_CHANGE_STATION_TOWN                             :Can't change the town of the station...
-STR_ERROR_STATION_TOWN_TOO_FAR                                  :{WHITE}... the town is not one of the 20 towns nearest to the station
+STR_ERROR_STATION_TOWN_TOO_FAR                                  :{WHITE}... the town is not one of the 200 towns nearest to the station
 STR_ERROR_STATION_CATCHMENT_MAX_LEVEL                           :catchment radius already at the maximum level
 STR_ERROR_DRIVE_THROUGH_ON_TOWN_ROAD                            :road owned by a town
 STR_ERROR_DRIVE_THROUGH_DIRECTION                               :road facing in the wrong direction

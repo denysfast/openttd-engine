@@ -4389,7 +4389,7 @@ STR_STATION_VIEW_CATCHMENT_UPGRADE                              :{BLACK}Ради
 STR_STATION_VIEW_CATCHMENT_UPGRADE_TOOLTIP                      :{BLACK}Увеличить радиус покрытия станции на 1 клетку за {CURRENCY_LONG}
 STR_STATION_VIEW_CATCHMENT_UPGRADE_MAX_TOOLTIP                  :{BLACK}Радиус покрытия станции уже максимальный
 STR_STATION_VIEW_TOWN                                           :{BLACK}Город: {TOWN}
-STR_STATION_VIEW_TOWN_TOOLTIP                                   :{BLACK}Выбрать город, к которому относится станция (один из 20 ближайших). Товары и другие грузы, доставленные сюда, засчитываются этому городу, станция называется по нему
+STR_STATION_VIEW_TOWN_TOOLTIP                                   :{BLACK}Выбрать город, к которому относится станция (один из 200 ближайших; можно искать по названию). Товары и другие грузы, доставленные сюда, засчитываются этому городу, станция называется по нему
 STR_STATION_VIEW_TOWN_ITEM                                      :{TOWN} ({NUM} клет{P ка ки ок}, население {COMMA})
 
 # Waypoint/buoy view window
@@ -5660,7 +5660,7 @@ STR_ERROR_CAN_T_RENAME_STATION                                  :Невозмо�
 STR_ERROR_CAN_T_MOVE_STATION_NAME                               :Невозможно переместить метку станции...
 STR_ERROR_CAN_T_UPGRADE_STATION_CATCHMENT                       :Невозможно увеличить радиус покрытия станции...
 STR_ERROR_CAN_T_CHANGE_STATION_TOWN                             :Невозможно сменить город станции...
-STR_ERROR_STATION_TOWN_TOO_FAR                                  :{WHITE}... этот город не входит в 20 ближайших к станции
+STR_ERROR_STATION_TOWN_TOO_FAR                                  :{WHITE}... этот город не входит в 200 ближайших к станции
 STR_ERROR_STATION_CATCHMENT_MAX_LEVEL                           :радиус покрытия уже максимальный
 STR_ERROR_DRIVE_THROUGH_ON_TOWN_ROAD                            :этот участок дороги принадлежит городу
 STR_ERROR_DRIVE_THROUGH_DIRECTION                               :неверное направление дороги

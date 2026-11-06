@@ -290,7 +290,7 @@ public:
 	 * Assign a station to another town; see #GetNearestTown for the town it belongs to.
 	 * Deliveries to the station count for that town and the default station name is made from it.
 	 * @param station_id The station to modify.
-	 * @param town_id The new town; one of the 20 towns whose centre is nearest to the station.
+	 * @param town_id The new town; one of the 200 towns whose centre is nearest to the station.
 	 * @pre IsValidStation(station_id).
 	 * @pre ScriptTown::IsValidTown(town_id).
 	 * @return True if the station now belongs to the town.

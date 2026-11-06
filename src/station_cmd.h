@@ -40,7 +40,7 @@ CommandCost CmdUpgradeStationCatchment(DoCommandFlags flags, StationID station_i
 CommandCost CmdSetStationTown(DoCommandFlags flags, StationID station_id, TownID town_id);
 
 /** Number of nearest towns a station can be assigned to. */
-static constexpr uint MAX_STATION_TOWN_CANDIDATES = 20;
+static constexpr uint MAX_STATION_TOWN_CANDIDATES = 200;
 std::vector<Town *> GetStationTownCandidates(const Station *st);
 
 DEF_CMD_TRAIT(Commands::BuildAirport, CmdBuildAirport, CommandFlags({CommandFlag::Auto, CommandFlag::NoWater}), CommandType::LandscapeConstruction)

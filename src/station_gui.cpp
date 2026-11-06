@@ -2091,7 +2091,8 @@ struct StationViewWindow : public Window {
 					if (t == st->town) selected = t->index.base();
 					list.push_back(MakeDropDownListStringItem(GetString(STR_STATION_VIEW_TOWN_ITEM, t->index, DistanceManhattan(st->xy, t->xy), t->cache.population), t->index.base()));
 				}
-				ShowDropDownList(this, std::move(list), selected, WID_SV_TOWN);
+				/* Up to #MAX_STATION_TOWN_CANDIDATES towns: the list scrolls and can be filtered by name. */
+				ShowDropDownList(this, std::move(list), selected, WID_SV_TOWN, 0, DropDownOption::Filterable);
 				break;
 			}
 
