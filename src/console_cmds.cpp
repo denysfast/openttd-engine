@@ -58,6 +58,8 @@
 #include "depot_func.h"
 #include "depot_map.h"
 #include "town_growth.h"
+#include "town_districts.h"
+#include "town_map.h"
 #include "station_base.h"
 #include "station_func.h"
 #include "station_cmd.h"
@@ -2169,6 +2171,80 @@ static bool ConTownNeeds(std::span<std::string_view> argv)
 	return true;
 }
 
+/** Show the districts of a town and what is built in them. @copydoc IConsoleCmdProc */
+static bool ConTownDistricts(std::span<std::string_view> argv)
+{
+	if (argv.empty()) {
+		IConsolePrint(CC_HELP, "Show the districts of a town and the house tiles in them by kind. Usage: 'town_districts <town id> [map]'.");
+		IConsolePrint(CC_HELP, "The map has one letter per block: O old town, B business, S sub-centre, H high-rise, M mid-rise, L low-rise, P park, . normal;");
+		IConsolePrint(CC_HELP, "upper case = the block has houses of the town. Districts start at {} residents.", TOWN_DISTRICTS_MIN_POPULATION);
+		return true;
+	}
+	if (argv.size() != 2 && argv.size() != 3) return false;
+	if (argv.size() == 3 && argv[2] != "map") return false;
+
+	auto town_id = ParseType<TownID>(argv[1]);
+	if (!town_id.has_value() || !Town::IsValidID(*town_id)) {
+		IConsolePrint(CC_ERROR, "Unknown town '{}'.", argv[1]);
+		return true;
+	}
+	const Town *t = Town::Get(*town_id);
+
+	uint radius = IntSqrt(t->cache.squared_town_zone_radius[to_underlying(HouseZone::TownEdge)]) + 4;
+	int x0 = std::max<int>(TileX(t->xy) - radius, 0) / 4 * 4;
+	int y0 = std::max<int>(TileY(t->xy) - radius, 0) / 4 * 4;
+	int x1 = std::min<int>(TileX(t->xy) + radius, Map::MaxX());
+	int y1 = std::min<int>(TileY(t->xy) + radius, Map::MaxY());
+
+	static constexpr size_t NUM_CATEGORIES = to_underlying(HouseCategory::End);
+	static constexpr size_t NUM_DISTRICTS = to_underlying(TownDistrict::End);
+	std::array<std::array<uint, NUM_CATEGORIES>, NUM_DISTRICTS> tiles{};
+	std::array<uint64_t, NUM_DISTRICTS> residents{};
+	for (int y = y0; y <= y1; y++) {
+		for (int x = x0; x <= x1; x++) {
+			TileIndex tile = TileXY(x, y);
+			if (!IsTileType(tile, TileType::House) || GetTownIndex(tile) != t->index) continue;
+			HouseID house = GetHouseType(tile);
+			const HouseSpec *hs = HouseSpec::Get(house);
+			size_t d = to_underlying(GetTownDistrict(t, tile));
+			tiles[d][to_underlying(GetHouseCategory(*hs))]++;
+			if (GetHouseNorthPart(house) == TileDiffXY(0, 0)) residents[d] += hs->population;
+		}
+	}
+
+	IConsolePrint(CC_INFO, "{} (id {}): population {}, radius {} tiles, centre {},{}, map from {},{}", GetString(STR_TOWN_NAME, t->index), t->index, t->cache.population,
+		IntSqrt(t->cache.squared_town_zone_radius[to_underlying(HouseZone::TownEdge)]), TileX(t->xy), TileY(t->xy), x0, y0);
+	IConsolePrint(CC_INFO, "{:<11} {:>6} {:>6} {:>6} {:>6} {:>6} {:>6} {:>6} {:>6} {:>6} {:>9}", "district", "tiles", "other", "houses", "flats", "office", "shops", "civic", "sports", "park", "residents");
+	for (size_t d = 0; d < NUM_DISTRICTS; d++) {
+		uint total = 0;
+		for (uint n : tiles[d]) total += n;
+		if (total == 0) continue;
+		const auto &c = tiles[d];
+		IConsolePrint(CC_INFO, "{:<11} {:>6} {:>6} {:>6} {:>6} {:>6} {:>6} {:>6} {:>6} {:>6} {:>9}", GetTownDistrictName(static_cast<TownDistrict>(d)), total,
+			c[0], c[1], c[2], c[3], c[4], c[5], c[6], c[7], residents[d] * std::max<uint16_t>(_settings_game.economy.town_density, 1));
+	}
+
+	if (argv.size() == 3) {
+		for (int by = y0; by + 4 <= y1 + 1; by += 4) {
+			std::string line;
+			for (int bx = x0; bx + 4 <= x1 + 1; bx += 4) {
+				TileIndex centre = TileXY(bx + 2, by + 2);
+				char c = GetTownDistrictLetter(GetTownDistrict(t, centre));
+				bool built = false;
+				for (int y = 1; y < 4 && !built; y++) {
+					for (int x = 1; x < 4 && !built; x++) {
+						TileIndex tile = TileXY(bx + x, by + y);
+						built = IsTileType(tile, TileType::House) && GetTownIndex(tile) == t->index;
+					}
+				}
+				line += built ? c : static_cast<char>(std::tolower(c));
+			}
+			IConsolePrint(CC_DEFAULT, "{}", line);
+		}
+	}
+	return true;
+}
+
 /** Force the level of town needs, or let them follow the supply again. @copydoc IConsoleCmdProc */
 static bool ConTownForceNeed(std::span<std::string_view> argv)
 {
@@ -4088,6 +4164,7 @@ void IConsoleStdLibRegister()
 	IConsole::AliasRegister("players",               "companies");
 
 	IConsole::CmdRegister("town_needs",              ConTownNeeds);
+	IConsole::CmdRegister("town_districts",          ConTownDistricts);
 	IConsole::CmdRegister("town_force_need",         ConTownForceNeed,    ConHookServerOrNoNetwork);
 	IConsole::CmdRegister("town_invest",             ConTownInvest);
 	IConsole::CmdRegister("town_delete",             ConTownDelete);

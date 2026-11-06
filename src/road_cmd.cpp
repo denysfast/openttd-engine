@@ -31,6 +31,7 @@
 #include "roadveh.h"
 #include "train.h"
 #include "town.h"
+#include "town_districts.h"
 #include "company_base.h"
 #include "core/random_func.hpp"
 #include "core/container_func.hpp"
@@ -2070,7 +2071,8 @@ static void TileLoop_Road(TileIndex tile)
 		}
 
 		{
-			/* Adjust road ground type depending on 'grp' (grp is the distance to the center) */
+			/* Adjust road ground type depending on 'grp' (grp is the distance to the center), and the district of big towns. */
+			if (t != nullptr) grp = GetTownRoadsideZone(t, tile, grp);
 			const Roadside *new_rs = (_settings_game.game_creation.landscape == LandscapeType::Toyland) ? _town_road_types_2[to_underlying(grp)] : _town_road_types[to_underlying(grp)];
 			Roadside cur_rs = GetRoadside(tile);
 

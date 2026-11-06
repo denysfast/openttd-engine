@@ -31,6 +31,7 @@
 #include "stdafx.h"
 #include "town.h"
 #include "town_blocks.h"
+#include "town_districts.h"
 #include "town_growth.h"
 #include "bridge.h"
 #include "bridge_map.h"
@@ -436,6 +437,7 @@ static bool FillOpenedBlocks(Town *t, TownBlockCache &cache, TownExpandModes mod
  */
 static bool DensifyOpenedBlocks(Town *t, TownBlockCache &cache, TownBuildResult &result)
 {
+	TownReplaceCache replace_cache;
 	for (const auto &[cost, key] : cache.order) {
 		TileIndex origin = GetBlockOrigin(key);
 		for (uint y = 1; y < TOWN_BLOCK_PITCH; y++) {
@@ -443,7 +445,7 @@ static bool DensifyOpenedBlocks(Town *t, TownBlockCache &cache, TownBuildResult 
 				TileIndex tile = origin + TileDiffXY(x, y);
 				if (!IsTileType(tile, TileType::House) || GetTownIndex(tile) != t->index) continue;
 
-				int32_t residents = TryReplaceTownHouse(t, tile);
+				int32_t residents = TryReplaceTownHouse(t, tile, &replace_cache);
 				if (residents < 0) continue;
 
 				/* The iteration must stop here: replacing the house may have changed the opened blocks. */

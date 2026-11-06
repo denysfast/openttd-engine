@@ -559,6 +559,8 @@ add_files(
     town.h
     town_blocks.cpp
     town_blocks.h
+    town_districts.cpp
+    town_districts.h
     town_cmd.cpp
     town_growth.cpp
     town_growth.h

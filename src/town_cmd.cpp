@@ -46,6 +46,7 @@
 #include "core/pool_func.hpp"
 #include "town.h"
 #include "town_kdtree.h"
+#include "town_districts.h"
 #include "townname_func.h"
 #include "core/random_func.hpp"
 #include "core/backup_type.hpp"
@@ -1873,23 +1874,19 @@ static void BuildTownHouse(Town *t, TileIndex tile, const HouseSpec *hs, HouseID
 }
 
 /**
- * Get the zones a house must be available in to be built on a tile: the town zone of the tile and the climate.
- * @param t The town the house will belong to.
+ * Get the climate zone a house must be available in to be built on a tile.
  * @param tile The tile.
- * @return The zones.
+ * @return The climate zone.
  */
-static HouseZones GetTownHouseZones(const Town *t, TileIndex tile)
+static HouseZone GetTownHouseClimate(TileIndex tile)
 {
-	HouseZones zones = GetTownRadiusGroup(t, tile);
-
 	switch (_settings_game.game_creation.landscape) {
-		case LandscapeType::Temperate: zones.Set(HouseZone::ClimateTemperate); break;
-		case LandscapeType::Arctic: zones.Set(GetTileMaxZ(tile) > HighestSnowLine() ? HouseZone::ClimateSubarcticAboveSnow : HouseZone::ClimateSubarcticBelowSnow); break;
-		case LandscapeType::Tropic: zones.Set(HouseZone::ClimateSubtropic); break;
-		case LandscapeType::Toyland: zones.Set(HouseZone::ClimateToyland); break;
+		default:
+		case LandscapeType::Temperate: return HouseZone::ClimateTemperate;
+		case LandscapeType::Arctic: return GetTileMaxZ(tile) > HighestSnowLine() ? HouseZone::ClimateSubarcticAboveSnow : HouseZone::ClimateSubarcticBelowSnow;
+		case LandscapeType::Tropic: return HouseZone::ClimateSubtropic;
+		case LandscapeType::Toyland: return HouseZone::ClimateToyland;
 	}
-
-	return zones;
 }
 
 /**
@@ -1927,6 +1924,28 @@ static TownFlags GetHouseOneOfFlags(const HouseSpec *hs)
 	if (hs->building_flags.Test(BuildingFlag::IsChurch)) return TownFlag::HasChurch;
 	if (hs->building_flags.Test(BuildingFlag::IsStadium)) return TownFlag::HasStadium;
 	return {};
+}
+
+/**
+ * Check whether a town may build one more of a special house: small towns have one church and one stadium, big towns more.
+ * @param t The town.
+ * @param hs The house type to build.
+ * @param replaced The house that the new one replaces, if any; it does not count.
+ * @return True if the house does not exceed the limit of its kind.
+ */
+static bool CanTownBuildLandmark(const Town *t, const HouseSpec *hs, const HouseSpec *replaced = nullptr)
+{
+	TownFlags oneof = GetHouseOneOfFlags(hs);
+	if (oneof.None()) return true;
+
+	BuildingFlag flag = oneof.Test(TownFlag::HasStadium) ? BuildingFlag::IsStadium : BuildingFlag::IsChurch;
+	uint count = 0;
+	const auto &counts = t->cache.building_counts.id_count;
+	for (const auto &spec : HouseSpec::Specs()) {
+		if (spec.building_flags.Test(flag) && spec.Index() < counts.size()) count += counts[spec.Index()];
+	}
+	if (replaced != nullptr && replaced->building_flags.Test(flag) && count > 0) count--;
+	return count < GetTownLandmarkLimit(t, flag == BuildingFlag::IsStadium);
 }
 
 /**
@@ -1978,6 +1997,8 @@ static bool IsHouseConstructionAllowed(Town *t, TileIndex tile, HouseID house, u
  * @param modes The parts of the town that are being grown.
  * @return The house that was built, or INVALID_HOUSE_ID if no house can be built on this tile.
  */
+static HouseID TryBuildTownHousePick(Town *t, TileIndex base_tile, const TownHousePick &pick, HouseZone climate, Slope slope, int maxz, bool &candidates);
+
 HouseID TryBuildTownHouse(Town *t, TileIndex tile, TownExpandModes modes)
 {
 	/* forbidden building here by town layout */
@@ -1989,19 +2010,50 @@ HouseID TryBuildTownHouse(Town *t, TileIndex tile, TownExpandModes modes)
 	Slope slope = GetTileSlope(tile);
 	int maxz = GetTileMaxZ(tile);
 
-	/* Get the town zone type of the current tile, as well as the climate.
-	 * This will allow to easily compare with the specs of the new house to build */
-	HouseZones zones = GetTownHouseZones(t, tile);
+	/* The climate, and the town zone and district of the tile: which houses fit here.
+	 * If the district allows nothing that can be built now (e.g. too early for its buildings), the town zone alone decides,
+	 * except in parks: they stay without houses then. */
+	HouseZone climate = GetTownHouseClimate(tile);
+	HouseZone zone = GetTownRadiusGroup(t, tile);
+	TownHousePick district_pick = GetTownHousePick(t, tile, zone);
+	bool candidates = false;
+	HouseID house = TryBuildTownHousePick(t, tile, district_pick, climate, slope, maxz, candidates);
+	if (candidates || district_pick.district == TownDistrict::Normal || district_pick.district == TownDistrict::Park) return house;
 
+	TownHousePick zone_pick = GetTownHousePick(t, tile, zone);
+	zone_pick.district = TownDistrict::Normal;
+	zone_pick.zones = zone;
+	zone_pick.categories = {HouseCategory::Other, HouseCategory::Houses, HouseCategory::Flats, HouseCategory::Office,
+		HouseCategory::Commercial, HouseCategory::Civic, HouseCategory::Sports, HouseCategory::Park};
+	zone_pick.prefer_dense = false;
+	zone_pick.min_population = 0;
+	zone_pick.max_population = UINT8_MAX;
+	return TryBuildTownHousePick(t, tile, zone_pick, climate, slope, maxz, candidates);
+}
+
+/**
+ * Try to build one of the houses a pick allows at this tile.
+ * @param t The town the house will belong to.
+ * @param base_tile The tile to try building on; multi-tile houses may extend from it to the north.
+ * @param pick The houses that are allowed.
+ * @param climate The climate the house must be available in.
+ * @param slope The slope of the tile.
+ * @param maxz The height of the tile.
+ * @param[out] candidates Set to whether any house type fits the pick, the climate and the year.
+ * @return The house that was built, or INVALID_HOUSE_ID.
+ */
+static HouseID TryBuildTownHousePick(Town *t, TileIndex base_tile, const TownHousePick &pick, HouseZone climate, Slope slope, int maxz, bool &candidates)
+{
 	static std::vector<std::pair<HouseID, uint>> probs;
 	probs.clear();
 
 	uint probability_max = 0;
+	TileIndex tile = base_tile;
 
 	/* Generate a list of all possible houses that can be built. */
 	for (const auto &hs : HouseSpec::Specs()) {
 		/* Verify that the candidate house spec matches the current tile status */
-		if (!hs.building_availability.All(zones) || !hs.enabled || hs.grf_prop.override_id != INVALID_HOUSE_ID) continue;
+		if (!hs.building_availability.Test(climate) || !pick.Allows(hs) || !hs.enabled || hs.grf_prop.override_id != INVALID_HOUSE_ID) continue;
 
 		/* Don't let these counters overflow. Global counters are 32bit, there will never be that many houses. */
 		if (hs.class_id != HOUSE_NO_CLASS) {
@@ -2012,12 +2064,13 @@ HouseID TryBuildTownHouse(Town *t, TileIndex tile, TownExpandModes modes)
 			if (t->cache.building_counts.id_count[hs.Index()] == UINT16_MAX) continue;
 		}
 
-		uint cur_prob = hs.probability;
+		uint cur_prob = pick.GetProbability(hs);
+		if (cur_prob == 0) continue;
+		if (TimerGameCalendar::year < hs.min_year || TimerGameCalendar::year > hs.max_year) continue;
 		probability_max += cur_prob;
 		probs.emplace_back(hs.Index(), cur_prob);
 	}
-
-	TileIndex base_tile = tile;
+	candidates = probability_max > 0;
 
 	while (probability_max > 0) {
 		/* Building a multitile building can change the location of tile.
@@ -2036,9 +2089,9 @@ HouseID TryBuildTownHouse(Town *t, TileIndex tile, TownExpandModes modes)
 
 		if (TimerGameCalendar::year < hs->min_year || TimerGameCalendar::year > hs->max_year) continue;
 
-		/* Special houses that there can be only one of. */
+		/* Special houses that a town can only have one of, or a few if it is big. */
 		TownFlags oneof = GetHouseOneOfFlags(hs);
-		if (t->flags.Any(oneof)) continue;
+		if (!CanTownBuildLandmark(t, hs)) continue;
 
 		/* Make sure there is no slope? */
 		bool noslope = hs->building_flags.Test(BuildingFlag::NotSloped);
@@ -2102,9 +2155,10 @@ static bool CanReplaceHouseTile(TileIndex tile, int maxz, bool noslope)
  * position, or the type can no longer be built. The new house is built on the plot of the old one.
  * @param t The town owning the house.
  * @param tile A tile of the house; only the northern tile of a house is considered.
+ * @param cache Memory of the current builder step, to skip houses that no allowed type can outgrow; may be nullptr.
  * @return The residents the replacement adds once it is completed, or -1 if the house was not replaced.
  */
-int32_t TryReplaceTownHouse(Town *t, TileIndex tile)
+int32_t TryReplaceTownHouse(Town *t, TileIndex tile, TownReplaceCache *cache)
 {
 	HouseID old_house = GetHouseType(tile);
 	HouseID north = old_house;
@@ -2120,15 +2174,42 @@ int32_t TryReplaceTownHouse(Town *t, TileIndex tile)
 	uint height = old_hs->building_flags.Any(BUILDING_2_TILES_Y) ? 2 : 1;
 	if (!IsTownBlockInteriorTile(tile) || !IsTownBlockInteriorTile(TileAddXY(tile, width - 1, height - 1))) return -1;
 
-	/* A house that suits its zone is only replaced by a much denser one. */
+	/* A house that suits its zone (or its district) is only replaced by a much denser one. */
 	bool outdated = !old_hs->enabled || TimerGameCalendar::year > old_hs->max_year;
-	bool suits_zone = !outdated && GetHighestHouseZone(old_hs) >= GetTownRadiusGroup(t, tile);
+	HouseZone zone = GetTownRadiusGroup(t, tile);
+	TownHousePick pick = GetTownHousePick(t, tile, zone);
+	HouseZone climate = GetTownHouseClimate(tile);
+	bool suits_zone;
+	if (pick.district == TownDistrict::Normal) {
+		suits_zone = !outdated && GetHighestHouseZone(old_hs) >= zone;
+	} else {
+		/* Parks, squares, churches and stadiums of a big town stay. */
+		HouseCategory old_category = GetHouseCategory(*old_hs);
+		if (!outdated && (old_category == HouseCategory::Park || old_category == HouseCategory::Civic || old_category == HouseCategory::Sports)) return -1;
+		suits_zone = !outdated && pick.Allows(*old_hs);
+	}
 	uint32_t min_population = old_hs->population + 1;
 	if (suits_zone) min_population = std::max<uint32_t>(min_population, old_hs->population * TownGrowthBalance::DENSIFY_SAME_ZONE_GAIN / 1000);
 
+	/* Nothing to do if no house type the pick allows can have that many residents. The bound ignores the
+	 * limits of this town (counters, special houses), so it is never below what the full search would find. */
+	if (cache != nullptr) {
+		uint64_t key = static_cast<uint64_t>(pick.zones.base()) | static_cast<uint64_t>(pick.categories.base()) << 16 |
+			static_cast<uint64_t>(pick.min_population) << 24 | static_cast<uint64_t>(pick.max_population) << 32 |
+			static_cast<uint64_t>(to_underlying(climate)) << 40 | static_cast<uint64_t>(to_underlying(pick.district)) << 48;
+		auto [it, inserted] = cache->max_population.try_emplace(key, 0);
+		if (inserted) {
+			for (const auto &hs : HouseSpec::Specs()) {
+				if (!hs.enabled || hs.grf_prop.override_id != INVALID_HOUSE_ID || !hs.building_availability.Test(climate) || !pick.Allows(hs)) continue;
+				if (TimerGameCalendar::year < hs.min_year || TimerGameCalendar::year > hs.max_year) continue;
+				it->second = std::max(it->second, hs.population);
+			}
+		}
+		if (min_population > it->second) return -1;
+	}
+
 	if (!CanDeleteHouse(tile)) return -1;
 
-	HouseZones zones = GetTownHouseZones(t, tile);
 	int maxz = GetTileMaxZ(tile);
 
 	/* Candidates: denser houses that fit the plot, with the place where they would go. */
@@ -2139,12 +2220,11 @@ int32_t TryReplaceTownHouse(Town *t, TileIndex tile)
 	uint probability_max = 0;
 
 	for (const auto &hs : HouseSpec::Specs()) {
-		if (hs.population < min_population || !hs.building_availability.All(zones)) continue;
+		if (hs.population < min_population || !hs.building_availability.Test(climate) || !pick.Allows(hs)) continue;
 		if (!IsHouseTypeBuildableByTown(t, hs)) continue;
 
-		/* The old house frees its flag of the special houses only if it has the same one. */
-		TownFlags oneof = GetHouseOneOfFlags(&hs);
-		if (t->flags.Any(oneof) && !GetHouseOneOfFlags(old_hs).Any(oneof)) continue;
+		/* Special houses: the old house does not count if it is of the same kind. */
+		if (!CanTownBuildLandmark(t, &hs, old_hs)) continue;
 
 		uint new_width = hs.building_flags.Any(BUILDING_2_TILES_X) ? 2 : 1;
 		uint new_height = hs.building_flags.Any(BUILDING_2_TILES_Y) ? 2 : 1;
@@ -2168,8 +2248,10 @@ int32_t TryReplaceTownHouse(Town *t, TileIndex tile)
 		}
 		if (place == INVALID_TILE) continue;
 
-		probability_max += hs.probability;
-		probs.emplace_back(hs.Index(), hs.probability);
+		uint probability = pick.GetProbability(hs);
+		if (probability == 0) continue;
+		probability_max += probability;
+		probs.emplace_back(hs.Index(), probability);
 		places.push_back(place);
 	}
 
