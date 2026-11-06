@@ -96,6 +96,7 @@
 #include "network/network_func.h"
 #include "framerate_type.h"
 #include "viewport_cmd.h"
+#include "worker_pool.h"
 
 #include <atomic>
 #include <condition_variable>
@@ -199,7 +200,7 @@ struct ViewportDrawer {
 
 static bool MarkViewportDirty(const Viewport &vp, int left, int top, int right, int bottom);
 
-static thread_local ViewportDrawer _vd; ///< Thread local: viewports may be drawn by several threads, see #ViewportDrawPool.
+static thread_local ViewportDrawer _vd; ///< Thread local: viewports may be drawn by several threads, see #GetViewportDrawPool.
 
 TileHighlightData _thd;
 static thread_local TileInfo _cur_ti; ///< Thread local, see #_vd.
@@ -1795,124 +1796,7 @@ static void ViewportDrawParentSprites(const ParentSpriteToSortVector *psd, const
 	}
 }
 
-/**
- * Threads that draw parts of a viewport at the same time.
- *
- * Collecting and sorting the sprites of a viewport stays on the drawing thread (it resolves NewGRF
- * sprites, which is not thread safe), but the actual blitting of the sorted sprites is split into
- * horizontal bands of the screen, drawn by these threads. Each band draws all sprites in the same
- * order, clipped to the band, so the result is exactly the same as drawing the whole area at once
- * (just like a viewport is already redrawn in arbitrary dirty rectangles).
- */
-class ViewportDrawPool {
-public:
-	/** Create the pool; threads are started on first use. */
-	ViewportDrawPool()
-	{
-		uint threads = std::thread::hardware_concurrency();
-		if (const char *env = std::getenv("OTTD_DRAW_THREADS"); env != nullptr) {
-			threads = 0;
-			for (; *env >= '0' && *env <= '9'; env++) threads = threads * 10 + (*env - '0');
-		}
-		/* The drawing thread itself takes part as well. */
-		this->wanted_workers = std::min<uint>(threads > 1 ? threads - 1 : 0, MAX_WORKERS);
-	}
-
-	~ViewportDrawPool()
-	{
-		{
-			std::lock_guard<std::mutex> lock(this->mutex);
-			this->stop = true;
-		}
-		this->start.notify_all();
-		for (auto &t : this->workers) {
-			if (t.joinable()) t.join();
-		}
-	}
-
-	/** @return Number of threads that draw, including the calling thread. */
-	uint Threads() const { return this->wanted_workers + 1; }
-
-	/**
-	 * Run \a job for every index in [0, \a count) on all threads; returns when all are done.
-	 * @param count Number of jobs.
-	 * @param job Function called with the job index.
-	 */
-	void Run(uint count, const std::function<void(uint)> &job)
-	{
-		this->StartWorkers();
-		{
-			std::lock_guard<std::mutex> lock(this->mutex);
-			this->job = &job;
-			this->job_count = count;
-			this->next_job.store(0, std::memory_order_relaxed);
-			this->busy = static_cast<uint>(this->workers.size());
-			this->generation++;
-		}
-		this->start.notify_all();
-		this->Work(job, count);
-
-		std::unique_lock<std::mutex> lock(this->mutex);
-		this->done.wait(lock, [this] { return this->busy == 0; });
-		this->job = nullptr;
-	}
-
-private:
-	static constexpr uint MAX_WORKERS = 15; ///< More threads hardly help: drawing is memory bound by then.
-
-	void StartWorkers()
-	{
-		while (this->workers.size() < this->wanted_workers) {
-			std::thread &t = this->workers.emplace_back();
-			if (!StartNewThread(&t, "ottd:draw", [this]() { this->WorkerMain(); })) {
-				this->workers.pop_back();
-				this->wanted_workers = static_cast<uint>(this->workers.size());
-				break;
-			}
-		}
-	}
-
-	void Work(const std::function<void(uint)> &job, uint count)
-	{
-		for (uint i; (i = this->next_job.fetch_add(1, std::memory_order_relaxed)) < count;) job(i);
-	}
-
-	void WorkerMain()
-	{
-		uint seen = 0;
-		for (;;) {
-			const std::function<void(uint)> *job;
-			uint count;
-			{
-				std::unique_lock<std::mutex> lock(this->mutex);
-				this->start.wait(lock, [this, seen] { return this->stop || this->generation != seen; });
-				if (this->stop) return;
-				seen = this->generation;
-				job = this->job;
-				count = this->job_count;
-			}
-			this->Work(*job, count);
-			{
-				std::lock_guard<std::mutex> lock(this->mutex);
-				if (--this->busy == 0) this->done.notify_one();
-			}
-		}
-	}
-
-	std::vector<std::thread> workers; ///< The worker threads.
-	uint wanted_workers = 0; ///< Number of worker threads to use.
-	std::mutex mutex; ///< Protects everything below except #next_job.
-	std::condition_variable start; ///< Signalled when a new run starts (or on #stop).
-	std::condition_variable done; ///< Signalled when the last worker finished a run.
-	const std::function<void(uint)> *job = nullptr; ///< Job of the current run.
-	uint job_count = 0; ///< Number of jobs of the current run.
-	std::atomic<uint> next_job = 0; ///< Next job index to take.
-	uint busy = 0; ///< Workers still busy with the current run.
-	uint generation = 0; ///< Number of the current run.
-	bool stop = false; ///< Set when the pool is destroyed.
-};
-
-bool _viewport_draw_parallel = true; ///< Whether viewports may be drawn by several threads, see #ViewportDrawPool.
+bool _viewport_draw_parallel = true; ///< Whether viewports may be drawn by several threads, see #GetViewportDrawPool.
 static const Viewport *_viewport_sprites_predrawn = nullptr; ///< Viewport whose sprites of the dirty areas are already drawn, see PredrawMainViewportSprites().
 
 static constexpr int MIN_BAND_ROWS = 48; ///< Thinner bands cost more in collecting tiles twice than they gain.
@@ -1965,9 +1849,9 @@ static void DrawViewportSpriteJob(ViewportSpriteJob &job)
 }
 
 /** @return The pool of threads that draw viewports. */
-static ViewportDrawPool &GetViewportDrawPool()
+static WorkerPool &GetViewportDrawPool()
 {
-	static ViewportDrawPool pool;
+	static WorkerPool pool("ottd:draw", "OTTD_DRAW_THREADS");
 	return pool;
 }
 
@@ -2018,7 +1902,7 @@ static void RunViewportSpriteJobs(std::vector<ViewportSpriteJob> &jobs)
 
 /**
  * Collect, sort and draw the landscape and vehicle sprites of the area in #_vd.dpi with several threads,
- * see #ViewportDrawPool and #ViewportSpriteJob. Signs, text effects and the overlay are left to the caller
+ * see #GetViewportDrawPool and #ViewportSpriteJob. Signs, text effects and the overlay are left to the caller
  * (drawing text is not thread safe).
  * @return False if the area is too small to be worth it; nothing is done then.
  */
@@ -2458,6 +2342,34 @@ static bool MarkViewportDirty(const Viewport &vp, int left, int top, int right, 
 	);
 
 	return true;
+}
+
+/**
+ * Whether MarkViewportDirty() would mark something of an area dirty.
+ * @param vp The viewport.
+ * @param left, top, right, bottom The area, as for MarkViewportDirty().
+ * @return Whether the viewport shows (part of) the area.
+ */
+static bool ViewportShowsArea(const Viewport &vp, int left, int top, int right, int bottom)
+{
+	right += (1 << to_underlying(vp.zoom)) - 1;
+	bottom += (1 << to_underlying(vp.zoom)) - 1;
+	return right - vp.virtual_left > 0 && bottom - vp.virtual_top > 0 &&
+			std::max(0, left - vp.virtual_left) < vp.virtual_width && std::max(0, top - vp.virtual_top) < vp.virtual_height;
+}
+
+/**
+ * Whether MarkAllViewportsDirty() would mark something of an area dirty, without marking it.
+ * This only reads, so it may run on several threads.
+ * @param left, top, right, bottom The area, as for MarkAllViewportsDirty().
+ * @return Whether any viewport shows (part of) the area.
+ */
+bool IsAreaInAnyViewport(int left, int top, int right, int bottom)
+{
+	for (const Window *w : Window::Iterate()) {
+		if (w->viewport != nullptr && ViewportShowsArea(*w->viewport, left, top, right, bottom)) return true;
+	}
+	return false;
 }
 
 /**

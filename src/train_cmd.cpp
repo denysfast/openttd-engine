@@ -45,6 +45,10 @@
 #include "script/api/script_event_types.hpp"
 #include "timer/timer_game_calendar.h"
 #include "timer/timer_game_economy.h"
+#include "worker_pool.h"
+#include "spritecache.h"
+#include "newgrf_profiling.h"
+#include "framerate_type.h"
 
 #include "widgets/vehicle_widget.h"
 
@@ -59,9 +63,13 @@ bool TrainController(Train *v, Vehicle *nomove, bool reverse = true); // Also us
 static TileIndex TrainApproachingCrossingTile(const Train *v);
 static void CheckIfTrainNeedsService(Train *v);
 static void CheckNextTrainTile(Train *v);
+static void CatchUpDeferredTrainMove(Train *consist);
 
 /** Set while TrainLocoHandler moves a train; TrainController then skips the per-step viewport updates. */
 static bool _train_defer_viewport = false;
+
+static bool _defer_train_moves = false; ///< Set during the vehicle tick loop: vehicles behind moving fronts follow later, see DeferredTrainMove.
+static uint32_t _train_follower_generation = 0; ///< Generation of the current vehicle tick loop, see TrainFollowerSummary.
 
 /**
  * Same as GroundVehicle::UpdateZPositionAndInclination(), but cheaper on the tiles trains mostly
@@ -160,6 +168,7 @@ void Train::ConsistChanged(ConsistChangeFlags allowed_changes)
 	uint16_t max_speed = UINT16_MAX;
 
 	assert(this->IsFrontEngine() || this->IsFreeWagon());
+	this->InvalidateFollowerSummary();
 
 	const RailVehicleInfo *rvi_v = RailVehInfo(this->engine_type);
 	EngineID first_engine = this->IsFrontEngine() ? this->engine_type : EngineID::Invalid();
@@ -429,6 +438,76 @@ uint16_t Train::GetCurveSpeedLimit() const
 }
 
 /**
+ * Slope resistance of a part of a train, see GroundVehicle::GetSlopeResistance().
+ * @param u The part.
+ * @return Its slope resistance.
+ */
+static inline int64_t GetPartSlopeResistance(const Train *u)
+{
+	if (u->gv_flags.Test(GroundVehicleFlag::GoingUp)) return u->gcache.cached_slope_resistance;
+	if (u->gv_flags.Test(GroundVehicleFlag::GoingDown)) return -static_cast<int64_t>(u->gcache.cached_slope_resistance);
+	return 0;
+}
+
+/**
+ * Gather the summary of the vehicles of a train other than its moving front, see #TrainFollowerSummary.
+ * @param consist Front engine.
+ * @param[out] s The summary.
+ */
+static void GatherFollowerSummary(const Train *consist, TrainFollowerSummary &s)
+{
+	const Train *moving_front = consist->GetMovingFront();
+	s.slope_resistance = 0;
+	s.bridge_speed_all = INT_MAX;
+	s.bridge_speed_before_depot = INT_MAX;
+	s.in_depot = false;
+	s.effects.clear();
+	for (const Train *u = consist; u != nullptr; u = u->Next()) {
+		if (u == moving_front) continue;
+		s.slope_resistance += GetPartSlopeResistance(u);
+		if (u->track == Track::Depot) s.in_depot = true;
+		if (u->track == Track::Wormhole && !u->vehstatus.Test(VehState::Hidden)) {
+			int speed = GetBridgeSpec(GetBridgeType(u->tile))->speed;
+			s.bridge_speed_all = std::min(s.bridge_speed_all, speed);
+			if (!s.in_depot) s.bridge_speed_before_depot = std::min(s.bridge_speed_before_depot, speed);
+		}
+		if (u->HasVisualEffectModel()) s.effects.push_back(u);
+	}
+}
+
+/**
+ * Get the summary of the vehicles of this train other than its moving front, when it is valid.
+ * @return The summary, or \c nullptr when the train has to be walked.
+ */
+const TrainFollowerSummary *Train::GetFollowerSummary() const
+{
+	if (!_defer_train_moves || !this->IsFrontEngine() || this->follower_summary.generation != _train_follower_generation) return nullptr;
+#ifdef WITH_ASSERT
+	/* The summary must be what walking the train gives. */
+	TrainFollowerSummary check;
+	GatherFollowerSummary(this, check);
+	assert(check.slope_resistance == this->follower_summary.slope_resistance);
+	assert(check.bridge_speed_all == this->follower_summary.bridge_speed_all);
+	assert(check.bridge_speed_before_depot == this->follower_summary.bridge_speed_before_depot);
+	assert(check.in_depot == this->follower_summary.in_depot);
+	assert(check.effects == this->follower_summary.effects);
+#endif
+	return &this->follower_summary;
+}
+
+/**
+ * Slope resistance of the whole train, see GroundVehicle::GetSlopeResistance().
+ * @return Slope resistance.
+ */
+int64_t Train::GetConsistSlopeResistance() const
+{
+	if (const TrainFollowerSummary *s = this->GetFollowerSummary(); s != nullptr) {
+		return s->slope_resistance + GetPartSlopeResistance(this->GetMovingFront());
+	}
+	return this->GetSlopeResistance();
+}
+
+/**
  * Calculates the maximum speed of the vehicle under its current conditions.
  * @return Maximum speed of the vehicle.
  */
@@ -464,16 +543,40 @@ int Train::GetCurrentMaxSpeed() const
 		}
 	}
 
-	for (const Train *u = this; u != nullptr; u = u->Next()) {
-		if (_settings_game.vehicle.train_acceleration_model == AccelerationModel::Realistic && u->track == Track::Depot) {
-			constexpr int DEPOT_SPEED_LIMIT = 61;
+	const bool realistic = _settings_game.vehicle.train_acceleration_model == AccelerationModel::Realistic;
+	static constexpr int DEPOT_SPEED_LIMIT = 61;
+	/* Limit by a part of the train: returns true when the parts after it do not matter. */
+	auto limit_by = [realistic, &max_speed](const Train *u) {
+		if (realistic && u->track == Track::Depot) {
 			max_speed = std::min(max_speed, DEPOT_SPEED_LIMIT);
-			break;
+			return true;
 		}
 
 		/* Vehicle is on the middle part of a bridge. */
 		if (u->track == Track::Wormhole && !u->vehstatus.Test(VehState::Hidden)) {
 			max_speed = std::min<int>(max_speed, GetBridgeSpec(GetBridgeType(u->tile))->speed);
+		}
+		return false;
+	};
+
+	if (const TrainFollowerSummary *s = this->GetFollowerSummary(); s != nullptr) {
+		/* The same as walking the train: the moving front is its first or last part. */
+		auto limit_by_others = [realistic, s, &max_speed]() {
+			if (realistic && s->in_depot) {
+				max_speed = std::min({max_speed, s->bridge_speed_before_depot, DEPOT_SPEED_LIMIT});
+				return true;
+			}
+			max_speed = std::min(max_speed, s->bridge_speed_all);
+			return false;
+		};
+		if (moving_front == this) {
+			if (!limit_by(moving_front)) limit_by_others();
+		} else {
+			if (!limit_by_others()) limit_by(moving_front);
+		}
+	} else {
+		for (const Train *u = this; u != nullptr; u = u->Next()) {
+			if (limit_by(u)) break;
 		}
 	}
 
@@ -2071,6 +2174,9 @@ static bool IsWholeTrainInsideDepot(const Train *v)
  */
 static void ReverseTrainDirection(Train *consist)
 {
+	/* The whole train has to be in place. */
+	CatchUpDeferredTrainMove(consist);
+
 	Train *moving_front = consist->GetMovingFront();
 	if (IsRailDepotTile(moving_front->tile)) {
 		if (IsWholeTrainInsideDepot(consist)) return;
@@ -3249,6 +3355,9 @@ uint Train::Crash(bool flooded)
 {
 	uint victims = 0;
 	if (this->IsFrontEngine()) {
+		/* The whole train has to be in place. */
+		CatchUpDeferredTrainMove(this);
+
 		victims += 2; // driver
 
 		/* Remove the reserved path in front of the train if it is not stuck.
@@ -3402,6 +3511,522 @@ static bool CheckTrainCollision(Train *moving_front)
 }
 
 /**
+ * Moving the vehicles of trains on several threads.
+ *
+ * Most of the work of moving trains is moving the vehicles behind the moving front: a train of
+ * 60 wagons moves 60 vehicles per step, and all of them just follow the vehicle in front of them.
+ * So while a train moves in the vehicle tick loop, only its moving front moves (it decides
+ * everything: signals, reservations, path finding, stations, collisions); its steps are recorded.
+ * After the loop the other vehicles of all trains follow those steps, a train per job on several
+ * threads (FollowFrontSteps()); such a vehicle only changes its own train and reads the map. What else
+ * following changes (the vehicle tile hash, and the last vehicle leaving a tile: freeing its
+ * reservation, signals, level crossings, see TrainFollowEvent) is recorded and done afterwards on
+ * the main thread, in the order of the trains. Following that needs the main thread (depots) stops
+ * there and is completed on the main thread.
+ *
+ * So during the loop the vehicles behind moving fronts are where they were at the start of the tick
+ * (just behind their moving front), and what the last vehicles free becomes free at the end of the
+ * tick. The result does not depend on the number of threads. Whatever needs a whole train in place
+ * first lets it catch up on the main thread (CatchUpDeferredTrainMove()): reversing, crashing, depots.
+ */
+
+/** A step of the moving front of a train, which the vehicles behind it follow later. */
+struct TrainFrontStep {
+	TileIndex tile; ///< Tile of the moving front after the step.
+	TrackBits track; ///< Track of the moving front after the step.
+};
+
+/** Something the last vehicle of a train did while following, which affects more than the train. */
+struct TrainFollowEvent {
+	const Train *v; ///< Leaving a tile (ClearPathReservation()): the vehicle; \c nullptr for having left a tile (signals, crossing).
+	TileIndex tile; ///< The tile left.
+	Trackdir trackdir; ///< Track direction on the tile left, for ClearPathReservation().
+	DiagDirection dir; ///< Direction to the tile left, for TrainMovedChangeSignals().
+};
+
+/** The steps of the moving front of a train during the vehicle tick loop, which the vehicles behind it still have to follow. */
+struct alignas(64) DeferredTrainMove {
+	Train *consist = nullptr; ///< Front engine of the train; \c nullptr when it has been deleted.
+	Train *moving_front = nullptr; ///< Moving front that made the steps.
+	std::vector<TrainFrontStep> steps; ///< The steps.
+	uint done_steps = 0; ///< Number of steps all vehicles have followed.
+	Train *resume = nullptr; ///< Following stopped (it needs the main thread) at this vehicle, in step #done_steps.
+	bool consist_changed = false; ///< A vehicle moved to another rail type: Train::ConsistChanged() is due.
+	bool direction_changed = false; ///< A vehicle changed direction: the curve speed limit has to be updated.
+	std::vector<Train *> moved; ///< Vehicles that moved to another tile (vehicle tile hash).
+	std::vector<TrainFollowEvent> events; ///< What the last vehicle did, in order.
+	uint8_t viewport = 0; ///< Viewport update at the end: 0 none, 1 visible vehicles (train did not move), 2 all (moved).
+	std::vector<Train *> apply; ///< Vehicles whose viewport update has to be finished on the main thread.
+};
+
+static std::vector<DeferredTrainMove> _deferred_train_moves; ///< Deferred moves of this tick (entries are reused).
+static uint _deferred_train_count = 0; ///< Number of used entries of #_deferred_train_moves.
+
+/**
+ * Get the deferred move of a train, creating it.
+ * @param consist Front engine.
+ * @return The deferred move.
+ */
+static DeferredTrainMove &GetDeferredTrainMove(Train *consist)
+{
+	assert(_defer_train_moves && consist->IsFrontEngine());
+	if (consist->deferred_move == UINT32_MAX) {
+		consist->deferred_move = _deferred_train_count++;
+		if (_deferred_train_count > _deferred_train_moves.size()) _deferred_train_moves.emplace_back();
+		DeferredTrainMove &d = _deferred_train_moves[consist->deferred_move];
+		d.consist = consist;
+		d.moving_front = nullptr;
+		d.steps.clear();
+		d.done_steps = 0;
+		d.resume = nullptr;
+		d.consist_changed = false;
+		d.direction_changed = false;
+		d.moved.clear();
+		d.events.clear();
+		d.viewport = 0;
+	}
+	return _deferred_train_moves[consist->deferred_move];
+}
+
+/**
+ * A front engine is deleted: forget its deferred move.
+ * @param consist Front engine.
+ */
+void ForgetDeferredTrainMove(Train *consist)
+{
+	if (consist->deferred_move < _deferred_train_count) {
+		DeferredTrainMove &d = _deferred_train_moves[consist->deferred_move];
+		if (d.consist == consist) d.consist = nullptr;
+	}
+	consist->deferred_move = UINT32_MAX;
+}
+
+/**
+ * Move a vehicle behind the moving front of a train one step: it follows the vehicle in front of it.
+ * This is what TrainController() does for such a vehicle.
+ * @param v The vehicle.
+ * @param prev_tile Tile of the vehicle in front of it (after its step).
+ * @param prev_track Track of the vehicle in front of it (after its step).
+ * @param defer When not \c nullptr, effects outside the train are recorded in it instead of done (and the vehicle tile
+ *              hash is not updated); this may then run for several trains at once.
+ * @param[in,out] direction_changed Set when the vehicle changed direction.
+ * @return False when \a defer is given and the step needs the main thread; nothing has been changed then.
+ */
+static bool TrainFollowerStep(Train *v, TileIndex prev_tile, TrackBits prev_track, DeferredTrainMove *defer, bool &direction_changed)
+{
+	Train *first = v->First();
+	const TileIndex start_tile = v->tile;
+	DiagDirection enterdir = DiagDirection::Begin;
+	bool update_signals_crossing = false; // will we update signals or crossing state?
+
+	GetNewVehiclePosResult gp = GetNewVehiclePos(v);
+
+	/* Fast path for by far the most common step: a vehicle that stays on a plain rail or station tile.
+	 * Such a step changes nothing but the vehicle's own position: VehicleEnterTile does nothing for it
+	 * (it only acts on depots, and on stations for the moving front), the tile and so the tile hash stay
+	 * the same, and signals, crossings and reservations are only touched on entering a tile.
+	 * This is exactly what the full code below does for this case, minus the no-ops. */
+	if (gp.old_tile == gp.new_tile && v->track != Track::Wormhole && v->track != Track::Depot) {
+		TileType tt = GetTileType(gp.new_tile);
+		if ((tt == TileType::Railway && !IsRailDepot(gp.new_tile)) || tt == TileType::Station) {
+			v->x_pos = gp.x;
+			v->y_pos = gp.y;
+			if (defer == nullptr) v->UpdatePosition();
+			v->UpdateZPosition();
+			if (!_train_defer_viewport) {
+				v->UpdateDeltaXY();
+				v->UpdateViewport(true, false);
+			}
+			return true;
+		}
+	}
+
+	/* Depots change vehicles in front of and behind the vehicle, and windows. */
+	if (defer != nullptr && (v->track == Track::Depot || IsRailDepotTile(gp.old_tile) || IsRailDepotTile(gp.new_tile))) return false;
+
+	if (v->track != Track::Wormhole) {
+		/* Not inside tunnel */
+		if (gp.old_tile == gp.new_tile) {
+			/* Staying in the old tile */
+			if (v->track == Track::Depot) {
+				/* Inside depot */
+				gp.x = v->x_pos;
+				gp.y = v->y_pos;
+			} else {
+				/* Not inside depot */
+				auto vets = VehicleEnterTile(v, gp.new_tile, gp.x, gp.y);
+				if (vets.Test(VehicleEnterTileState::CannotEnter)) FatalError("Disconnecting train");
+				assert(!vets.Test(VehicleEnterTileState::EnteredStation)); // only for the moving front
+			}
+		} else {
+			/* A new tile is about to be entered. */
+
+			/* Determine what direction we're entering the new tile from */
+			enterdir = DiagdirBetweenTiles(gp.old_tile, gp.new_tile);
+			assert(IsValidDiagDirection(enterdir));
+
+			/* Get the status of the tracks in the new tile and mask
+			 * away the bits that aren't reachable. */
+			TrackStatus ts = GetTileTrackStatus(gp.new_tile, TransportType::Rail, RoadTramType::Invalid, ReverseDiagDir(enterdir));
+			TrackdirBits reachable_trackdirs = DiagdirReachesTrackdirs(enterdir);
+
+			TrackdirBits trackdirbits = ts.trackdirs & reachable_trackdirs;
+			/* Wagons may make 90 deg turns, because forbid_90_deg can be switched on halfway a turn. */
+			TrackBits bits = TrackdirBitsToTrackBits(trackdirbits);
+
+			if (bits.None()) FatalError("Disconnecting train");
+
+			/* Check if the new tile constrains tracks that are compatible
+			 * with the current train, if not, bail out. */
+			if (!CheckCompatibleRail(first, gp.new_tile, false)) FatalError("Disconnecting train");
+
+			/* The wagon is active, simply follow the prev vehicle. */
+			TrackBits chosen_track;
+			if (prev_tile == gp.new_tile) {
+				/* Choose the same track as prev */
+				if (prev_track == Track::Wormhole) {
+					/* Vehicles entering tunnels enter the wormhole earlier than for bridges.
+					 * However, just choose the track into the wormhole. */
+					assert(IsTunnel(prev_tile));
+					chosen_track = bits;
+				} else {
+					chosen_track = prev_track;
+				}
+			} else {
+				/* Choose the track that leads to the tile where prev is.
+				 * This case is active if 'prev' is already on the second next tile, when 'v' just enters the next tile.
+				 * I.e. when the tile between them has only space for a single vehicle like
+				 *  1) horizontal/vertical track tiles and
+				 *  2) some orientations of tunnel entries, where the vehicle is already inside the wormhole at 8/16 from the tile edge.
+				 *     Is also the train just reversing, the wagon inside the tunnel is 'on' the tile of the opposite tunnel entry.
+				 */
+				static const DiagDirectionIndexArray<DiagDirectionIndexArray<TrackBits>> _connecting_track{{{
+					{{{Track::X,     Track::Lower, {},           Track::Left }}},
+					{{{Track::Upper, Track::Y,     Track::Left,  {}          }}},
+					{{{{},           Track::Right, Track::X,     Track::Upper}}},
+					{{{Track::Right, {},           Track::Lower, Track::Y    }}}
+				}}};
+				DiagDirection exitdir = DiagdirBetweenTiles(gp.new_tile, prev_tile);
+				assert(IsValidDiagDirection(exitdir));
+				chosen_track = _connecting_track[enterdir][exitdir];
+			}
+			chosen_track &= bits;
+
+			/* Update XY to reflect the entrance to the new tile, and select the direction to use */
+			Direction chosen_dir = VehicleEnterTileCoordinates(gp, enterdir, TrackBitsToTrack(chosen_track));
+
+			/* Call the landscape function and tell it that the vehicle entered the tile */
+			auto vets = VehicleEnterTile(v, gp.new_tile, gp.x, gp.y);
+			if (vets.Test(VehicleEnterTileState::CannotEnter)) FatalError("Disconnecting train");
+			assert(!vets.Test(VehicleEnterTileState::EnteredStation)); // only for the moving front
+
+			if (!vets.Test(VehicleEnterTileState::EnteredWormhole)) {
+				/* Clear any track reservation when the last vehicle leaves the tile */
+				if (v->GetMovingNext() == nullptr) {
+					if (defer != nullptr) {
+						defer->events.push_back({v, v->tile, v->GetVehicleTrackdir(), DiagDirection::Invalid});
+					} else {
+						ClearPathReservation(v, v->tile, v->GetVehicleTrackdir());
+					}
+				}
+
+				v->tile = gp.new_tile;
+
+				if (GetTileRailType(gp.new_tile) != GetTileRailType(gp.old_tile)) {
+					if (defer != nullptr) {
+						defer->consist_changed = true;
+					} else {
+						first->ConsistChanged(CCF_TRACK);
+					}
+				}
+
+				v->track = chosen_track;
+				assert(v->track.Any());
+			}
+
+			/* We need to update signal status, but after the vehicle position hash
+			 * has been updated by UpdateInclination() */
+			update_signals_crossing = true;
+
+			if (chosen_dir != v->GetMovingDirection()) {
+				direction_changed = true;
+				v->SetMovingDirection(chosen_dir);
+			}
+		}
+	} else {
+		if (!IsTileType(gp.new_tile, TileType::TunnelBridge) || !VehicleEnterTile(v, gp.new_tile, gp.x, gp.y).Test(VehicleEnterTileState::EnteredWormhole)) {
+			v->x_pos = gp.x;
+			v->y_pos = gp.y;
+			if (defer == nullptr) {
+				v->UpdatePosition();
+			} else if (v->tile != start_tile) {
+				defer->moved.push_back(v);
+			}
+			if (!_train_defer_viewport && !v->vehstatus.Test(VehState::Hidden)) v->Vehicle::UpdateViewport(true);
+			return true;
+		}
+		/* Prevent v->UpdateInclination() being called with wrong parameters.
+		 * This could happen if the train was reversed inside the tunnel/bridge. */
+		if (gp.old_tile == gp.new_tile) {
+			gp.old_tile = GetOtherTunnelBridgeEnd(gp.old_tile);
+		}
+	}
+
+	/* update image of train, as well as delta XY (only used for drawing) */
+	if (!_train_defer_viewport) v->UpdateDeltaXY();
+
+	v->x_pos = gp.x;
+	v->y_pos = gp.y;
+	if (defer == nullptr) {
+		v->UpdatePosition();
+	} else if (v->tile != start_tile) {
+		defer->moved.push_back(v);
+	}
+
+	/* update the Z position of the vehicle */
+	if (gp.new_tile != gp.old_tile) {
+		TrainUpdateZPositionAndInclination(v);
+	} else {
+		v->UpdateZPosition();
+	}
+	if (!_train_defer_viewport) v->UpdateViewport(true, false);
+
+	/* Signals can only change when the first or the last vehicle moves. */
+	if (update_signals_crossing && v->GetMovingNext() == nullptr) {
+		if (defer != nullptr) {
+			defer->events.push_back({nullptr, gp.old_tile, Trackdir::Invalid, ReverseDiagDir(enterdir)});
+		} else {
+			TrainMovedChangeSignals(gp.old_tile, ReverseDiagDir(enterdir));
+			if (IsLevelCrossingTile(gp.old_tile)) UpdateLevelCrossing(gp.old_tile);
+		}
+	}
+
+	return true;
+}
+
+/**
+ * Let the vehicles behind the moving front of a train follow its recorded steps.
+ * @param d The deferred move.
+ * @param defer Off the main thread: record effects outside the train, and stop when a step needs the main thread.
+ */
+static void FollowFrontSteps(DeferredTrainMove &d, bool defer)
+{
+	assert(d.moving_front != nullptr && d.moving_front->GetMovingFront() == d.moving_front);
+	for (; d.done_steps < d.steps.size(); d.done_steps++) {
+		const TrainFrontStep &step = d.steps[d.done_steps];
+		Train *v = d.resume != nullptr ? d.resume : d.moving_front->GetMovingNext();
+		d.resume = nullptr;
+		for (; v != nullptr; v = v->GetMovingNext()) {
+			const Train *prev = v->GetMovingPrev();
+			bool front = prev == d.moving_front;
+			if (!TrainFollowerStep(v, front ? step.tile : prev->tile, front ? step.track : prev->track, defer ? &d : nullptr, d.direction_changed)) {
+				d.resume = v;
+				return;
+			}
+		}
+	}
+}
+
+/**
+ * Let the vehicles of a train catch up with its moving front now, on the main thread, see #DeferredTrainMove.
+ * Needed before anything that needs the whole train in place.
+ * @param consist Front engine.
+ */
+static void CatchUpDeferredTrainMove(Train *consist)
+{
+	/* Whatever needs the whole train in place changes it. */
+	consist->InvalidateFollowerSummary();
+
+	if (consist->deferred_move == UINT32_MAX) return;
+	DeferredTrainMove &d = _deferred_train_moves[consist->deferred_move];
+	if (d.steps.empty()) return;
+	assert(d.done_steps == 0 && d.resume == nullptr && d.moved.empty() && d.events.empty() && !d.consist_changed);
+
+	FollowFrontSteps(d, false);
+	if (d.direction_changed) consist->tcache.cached_max_curve_speed = consist->GetCurveSpeedLimit();
+	d.direction_changed = false;
+	d.steps.clear();
+	d.done_steps = 0;
+	d.moving_front = nullptr;
+}
+
+/**
+ * Move the moving front of a train one step forward (TrainController()); during the vehicle tick loop the other
+ * vehicles follow later, see #DeferredTrainMove.
+ * @param moving_front The moving front.
+ */
+static void TrainMoveStep(Train *moving_front)
+{
+	Train *next = moving_front->GetMovingNext();
+	if (!_defer_train_moves || next == nullptr || IsRailDepotTile(moving_front->tile)) {
+		/* Depots change the vehicles behind the moving front. */
+		CatchUpDeferredTrainMove(moving_front->First());
+		TrainController(moving_front, nullptr);
+		return;
+	}
+
+	if (!TrainController(moving_front, next)) return;
+
+	DeferredTrainMove &d = GetDeferredTrainMove(moving_front->First());
+	if (d.steps.empty()) d.moving_front = moving_front;
+	assert(d.moving_front == moving_front);
+	d.steps.push_back({moving_front->tile, moving_front->track});
+}
+
+/** @return The threads that let the vehicles of trains follow their moving front. */
+static WorkerPool &GetTrainMovePool()
+{
+	return GetSimulationWorkers();
+}
+
+/** The vehicle tick loop starts: let vehicles behind moving fronts follow later, see #DeferredTrainMove. */
+void StartDeferringTrainMoves(std::vector<uint8_t> &skip)
+{
+	assert(_deferred_train_count == 0);
+	_defer_train_moves = true;
+	if (++_train_follower_generation == 0) ++_train_follower_generation;
+
+	/* On several threads: summarise the vehicles behind the moving fronts (see TrainFollowerSummary), and take the
+	 * parts of trains that only count (TickTrainPart()) out of the loop. Those before their front in the vehicle
+	 * pool count now, as the loop would have counted them before ticking the front; the others after the loop. */
+	static constexpr size_t CHUNK = 512;
+	const size_t pool_size = Vehicle::GetPoolSize();
+	const uint chunks = static_cast<uint>((pool_size + CHUNK - 1) / CHUNK);
+	skip.assign(pool_size, 0);
+	static std::vector<std::vector<Train *>> fronts;
+	if (fronts.size() < chunks) fronts.resize(chunks);
+	GetTrainMovePool().Run(chunks, [pool_size, &skip](uint chunk) {
+		std::vector<Train *> &list = fronts[chunk];
+		list.clear();
+		for (size_t i = chunk * CHUNK; i < std::min(pool_size, (chunk + 1) * CHUNK); i++) {
+			Vehicle *v = Vehicle::GetIfValid(i);
+			if (v == nullptr || v->type != VehicleType::Train || !Train::From(v)->IsFrontEngine()) continue;
+			Train *t = Train::From(v);
+			list.push_back(t);
+			GatherFollowerSummary(t, t->follower_summary);
+			t->follower_summary.generation = _train_follower_generation;
+			for (Train *u = t->Next(); u != nullptr; u = u->Next()) {
+				if (u->IsEngine()) continue;
+				skip[u->index.base()] = 1;
+				if (u->index < t->index) TickTrainPart(u);
+			}
+		}
+	});
+
+	/* Every train gets its deferred move now, in the order of the vehicle pool. */
+	for (uint chunk = 0; chunk < chunks; chunk++) {
+		for (Train *t : fronts[chunk]) GetDeferredTrainMove(t);
+	}
+}
+
+/**
+ * Count the parts of a train behind its front in the vehicle pool, see StartDeferringTrainMoves().
+ * @param consist Front engine.
+ */
+static void TickTrainPartsAfterFront(Train *consist)
+{
+	for (Train *u = consist->Next(); u != nullptr; u = u->Next()) {
+		if (!u->IsEngine() && u->index > consist->index) TickTrainPart(u);
+	}
+}
+
+/**
+ * Update the vehicles of a train on the viewport after the tick, as TrainLocoHandler() would do.
+ * Only what is local to the vehicles (sprites and bounds), see Vehicle::PrepareViewport(); remembers which vehicles
+ * need ApplyViewport() on the main thread.
+ * @param d The deferred move.
+ */
+static void PrepareTrainViewport(DeferredTrainMove &d)
+{
+	d.apply.clear();
+	if (d.viewport == 0) return;
+	for (Train *u = d.consist; u != nullptr; u = u->Next()) {
+		if (d.viewport == 2) {
+			/* Including vehicles that became hidden this tick, so their old image gets erased. */
+			u->PrepareViewportUpdate(true, true);
+		} else if (d.viewport == 1 && !u->vehstatus.Test(VehState::Hidden)) {
+			u->PrepareViewportUpdate(false, false);
+		}
+		if (u->sprite_cache.viewport_update_pending && u->FinishViewportIfUnseen()) d.apply.push_back(u);
+	}
+}
+
+/** The vehicle tick loop has finished: the vehicles behind the moving fronts follow them, see #DeferredTrainMove. */
+void FinishDeferredTrainMoves()
+{
+	PerformanceAccumulator framerate(PerformanceElement::GameLoopTrains);
+
+	_defer_train_moves = false;
+	/* Vehicles get their viewport updated once at the end. */
+	AutoRestoreBackup defer_viewport(_train_defer_viewport, true);
+	const uint count = _deferred_train_count;
+	std::span<DeferredTrainMove> moves(_deferred_train_moves.data(), count);
+
+	/* The viewport is not game state; resolving sprites on several threads does not work while profiling NewGRFs. */
+	const bool viewport = !_network_dedicated;
+	const bool parallel_viewport = viewport && _newgrf_profilers.empty();
+
+	/* Following changes only the train itself, so trains follow on several threads; then their parts count, and
+	 * they get their sprites and bounds updated (resolving sprites may load them). */
+	{
+		SpriteCacheSharedAccess shared_sprite_cache;
+		GetTrainMovePool().Run(count, [&moves, parallel_viewport](uint i) {
+			DeferredTrainMove &d = moves[i];
+			if (d.consist == nullptr) return;
+			if (!d.steps.empty()) FollowFrontSteps(d, true);
+			if (d.resume != nullptr) return; // done on the main thread
+			TickTrainPartsAfterFront(d.consist);
+			if (parallel_viewport) {
+				SpriteCacheSharedAccess shared_sprite_cache;
+				PrepareTrainViewport(d);
+			}
+		});
+	}
+
+	/* What changes more than the train, on this thread in a fixed order: first the positions of all vehicles... */
+	for (DeferredTrainMove &d : moves) {
+		if (d.consist == nullptr) continue;
+		for (Train *u : d.moved) u->UpdatePosition();
+	}
+
+	/* ... then what the last vehicles did, and the following that needs this thread. */
+	for (DeferredTrainMove &d : moves) {
+		if (d.consist == nullptr) continue;
+		for (const TrainFollowEvent &e : d.events) {
+			if (e.v != nullptr) {
+				ClearPathReservation(e.v, e.tile, e.trackdir);
+			} else {
+				TrainMovedChangeSignals(e.tile, e.dir);
+				if (IsLevelCrossingTile(e.tile)) UpdateLevelCrossing(e.tile);
+			}
+		}
+		if (d.consist_changed) d.consist->ConsistChanged(CCF_TRACK);
+		if (d.resume != nullptr) {
+			FollowFrontSteps(d, false);
+			if (d.consist == nullptr) continue;
+			TickTrainPartsAfterFront(d.consist);
+			if (viewport) PrepareTrainViewport(d);
+		} else if (viewport && !parallel_viewport) {
+			PrepareTrainViewport(d);
+		}
+		if (d.direction_changed) d.consist->tcache.cached_max_curve_speed = d.consist->GetCurveSpeedLimit();
+	}
+
+	/* The viewport hash and dirty areas of the vehicles that need it. */
+	if (viewport) {
+		for (const DeferredTrainMove &d : moves) {
+			if (d.consist == nullptr) continue;
+			for (Train *u : d.apply) u->ApplyViewport(true);
+		}
+	}
+
+	for (DeferredTrainMove &d : moves) {
+		if (d.consist != nullptr) d.consist->deferred_move = UINT32_MAX;
+	}
+	_deferred_train_count = 0;
+}
+
+/**
  * Move a vehicle chain one movement stop forwards.
  * @param v First vehicle to move.
  * @param nomove Stop moving this and all following vehicles.
@@ -3419,28 +4044,13 @@ bool TrainController(Train *v, Vehicle *nomove, bool reverse)
 		DiagDirection enterdir = DiagDirection::Begin;
 		bool update_signals_crossing = false; // will we update signals or crossing state?
 
-		GetNewVehiclePosResult gp = GetNewVehiclePos(v);
-
-		/* Fast path for by far the most common step: a vehicle behind the moving front that stays
-		 * on a plain rail or station tile. Such a step changes nothing but the vehicle's own
-		 * position: VehicleEnterTile does nothing for it (it only acts on depots, and on stations
-		 * for the moving front), the tile and so the tile hash stay the same, and signals,
-		 * crossings and reservations are only touched on entering a tile or by the moving front.
-		 * This is exactly what the full code below does for this case, minus the no-ops. */
-		if (prev != nullptr && gp.old_tile == gp.new_tile && v->track != Track::Wormhole && v->track != Track::Depot) {
-			TileType tt = GetTileType(gp.new_tile);
-			if ((tt == TileType::Railway && !IsRailDepot(gp.new_tile)) || tt == TileType::Station) {
-				v->x_pos = gp.x;
-				v->y_pos = gp.y;
-				v->UpdatePosition();
-				v->UpdateZPosition();
-				if (!_train_defer_viewport) {
-					v->UpdateDeltaXY();
-					v->UpdateViewport(true, false);
-				}
-				continue;
-			}
+		if (prev != nullptr) {
+			/* A vehicle behind the moving front follows the vehicle in front of it. */
+			TrainFollowerStep(v, prev->tile, prev->track, nullptr, direction_changed);
+			continue;
 		}
+
+		GetNewVehiclePosResult gp = GetNewVehiclePos(v);
 
 		if (v->track != Track::Wormhole) {
 			/* Not inside tunnel */
@@ -4145,7 +4755,20 @@ static bool TrainLocoHandler(Train *consist, bool mode)
 
 	if (CheckTrainStayInDepot(consist)) return true;
 
-	if (!mode) consist->ShowVisualEffect();
+	if (!mode) {
+		if (const TrainFollowerSummary *s = consist->GetFollowerSummary(); s != nullptr) {
+			/* Only the parts with a visual effect, in consist order: the moving front is the first or the last part. */
+			static std::vector<const Vehicle *> parts;
+			const Train *moving_front = consist->GetMovingFront();
+			parts.clear();
+			if (moving_front == consist) parts.push_back(moving_front);
+			parts.insert(parts.end(), s->effects.begin(), s->effects.end());
+			if (moving_front != consist) parts.push_back(moving_front);
+			consist->ShowVisualEffect(&parts);
+		} else {
+			consist->ShowVisualEffect();
+		}
+	}
 
 	/* We had no order but have an order now, do look ahead. */
 	if (!valid_order && !consist->current_order.IsType(OT_NOTHING)) {
@@ -4208,7 +4831,7 @@ static bool TrainLocoHandler(Train *consist, bool mode)
 		/* Loop until the train has finished moving. */
 		for (;;) {
 			j -= adv_spd;
-			TrainController(moving_front, nullptr);
+			TrainMoveStep(moving_front);
 			moving_front = moving_front->GetMovingFront();
 			/* Don't continue to move if the train crashed. */
 			if (CheckTrainCollision(moving_front)) break;
@@ -4230,16 +4853,22 @@ static bool TrainLocoHandler(Train *consist, bool mode)
 		consist->SetLastSpeed();
 	}
 
-	for (Train *u = consist; u != nullptr; u = u->Next()) {
-		if (moved) {
-			/* Movement skipped the per-step bounding box and viewport updates; catch up once,
-			 * including vehicles that became hidden this tick so their old image gets erased. */
-			u->UpdateViewport(true, true);
-			continue;
-		}
-		if (u->vehstatus.Test(VehState::Hidden)) continue;
+	if (_defer_train_moves) {
+		/* The vehicles behind the moving front have not moved yet: update the viewport after they did. */
+		DeferredTrainMove &d = GetDeferredTrainMove(consist);
+		d.viewport = std::max<uint8_t>(d.viewport, moved ? 2 : 1);
+	} else {
+		for (Train *u = consist; u != nullptr; u = u->Next()) {
+			if (moved) {
+				/* Movement skipped the per-step bounding box and viewport updates; catch up once,
+				 * including vehicles that became hidden this tick so their old image gets erased. */
+				u->UpdateViewport(true, true);
+				continue;
+			}
+			if (u->vehstatus.Test(VehState::Hidden)) continue;
 
-		u->UpdateViewport(false, false);
+			u->UpdateViewport(false, false);
+		}
 	}
 
 	if (consist->progress == 0) consist->progress = j; // Save unused spd for next time, if TrainController didn't set progress

@@ -92,6 +92,26 @@ struct TrainCache {
 };
 
 /**
+ * What the moving front of a train needs to know of the other vehicles of the train while it moves: gathered on
+ * several threads at the start of the vehicle tick loop, instead of walking the whole train several times per tick
+ * on the main thread. During the loop those vehicles do not move (see DeferredTrainMove); whatever changes them
+ * makes the summary invalid, and then the train is walked again.
+ */
+struct TrainFollowerSummary {
+	uint32_t generation = 0; ///< Valid while equal to the generation of the current vehicle tick loop.
+	int64_t slope_resistance = 0; ///< Slope resistance of the other vehicles, see GroundVehicle::GetSlopeResistance().
+	int bridge_speed_all = INT_MAX; ///< Lowest speed of the bridges the other vehicles are on (in the middle).
+	int bridge_speed_before_depot = INT_MAX; ///< Same, up to the first of them in a depot.
+	bool in_depot = false; ///< One of the other vehicles is in a depot.
+	std::vector<const Train *> effects; ///< The other vehicles that have a visual effect, in consist order.
+};
+
+void ForgetDeferredTrainMove(struct Train *consist);
+void StartDeferringTrainMoves(std::vector<uint8_t> &skip);
+void TickTrainPart(struct Train *u);
+void FinishDeferredTrainMoves();
+
+/**
  * 'Train' is either a loco or a wagon.
  */
 struct Train final : public GroundVehicle<Train, VehicleType::Train> {
@@ -110,10 +130,17 @@ struct Train final : public GroundVehicle<Train, VehicleType::Train> {
 	TrackBits track{}; ///< On which track the train currently is.
 	TrainForceProceeding force_proceed{}; ///< How the train should behave when it encounters next obstacle.
 
+	uint32_t deferred_move = UINT32_MAX; ///< Front engine, during the vehicle tick loop only: index of its deferred move, see DeferredTrainMove (not saved).
+	TrainFollowerSummary follower_summary{}; ///< Front engine, during the vehicle tick loop only (not saved).
+
 	/** Create new Train object. @copydoc GroundVehicle::GroundVehicle */
 	Train(VehicleID index) : GroundVehicleBase(index) {}
 	/** We want to 'destruct' the right class. */
-	~Train() override { this->PreDestructor(); }
+	~Train() override
+	{
+		if (this->deferred_move != UINT32_MAX) ForgetDeferredTrainMove(this);
+		this->PreDestructor();
+	}
 
 	friend struct GroundVehicle<Train, VehicleType::Train>; // GroundVehicle needs to use the acceleration functions defined at Train.
 
@@ -148,6 +175,9 @@ struct Train final : public GroundVehicle<Train, VehicleType::Train> {
 	void UpdateAcceleration();
 
 	int GetCurrentMaxSpeed() const override;
+	const TrainFollowerSummary *GetFollowerSummary() const;
+	void InvalidateFollowerSummary() { this->First()->follower_summary.generation = 0; }
+	int64_t GetConsistSlopeResistance() const;
 
 	/**
 	 * Get the next real (non-articulated part and non rear part of dualheaded engine) vehicle in the consist.

@@ -698,6 +698,9 @@ void ResetVehicleColourMap()
 using AutoreplaceMap = std::map<VehicleID, bool>;
 static AutoreplaceMap _vehicles_to_autoreplace;
 
+/** Per vehicle index, during the vehicle tick loop: the vehicle is not ticked by the loop itself (see TickTrainPart()). */
+static std::vector<uint8_t> _vehicle_tick_skip;
+
 void InitializeVehicles()
 {
 	_vehicles_to_autoreplace.clear();
@@ -829,6 +832,9 @@ void Vehicle::HandlePathfindingResult(bool path_found)
 void Vehicle::PreDestructor()
 {
 	if (CleaningPool()) return;
+
+	/* A vehicle added in its place during the vehicle tick loop has to be ticked. */
+	if (this->index.base() < _vehicle_tick_skip.size()) _vehicle_tick_skip[this->index.base()] = 0;
 
 	if (Station::IsValidID(this->last_station_visited)) {
 		Station *st = Station::Get(this->last_station_visited);
@@ -984,6 +990,40 @@ static void RunEconomyVehicleDayProc()
 	}
 }
 
+/**
+ * Age the cargo of a vehicle, as the vehicle tick loop does every tick.
+ * @param v The vehicle.
+ */
+static inline void AgeVehicleCargo(Vehicle *v)
+{
+	if (v->vcache.cached_cargo_age_period != 0) {
+		v->cargo_age_counter = std::min(v->cargo_age_counter, v->vcache.cached_cargo_age_period);
+		if (--v->cargo_age_counter == 0) {
+			v->cargo.AgeCargo();
+			v->cargo_age_counter = v->vcache.cached_cargo_age_period;
+		}
+	}
+}
+
+/**
+ * What the vehicle tick loop does for a part of a train that is neither the front nor an engine: such a part only
+ * counts (it plays no sounds). This changes only the part, so it may run for several parts at once.
+ * @param u The part.
+ */
+void TickTrainPart(Train *u)
+{
+	assert(!u->IsFrontEngine() && !u->IsEngine() && u->First()->IsFrontEngine());
+	/* Train::Tick() */
+	u->tick_counter++;
+
+	AgeVehicleCargo(u);
+
+	const Train *front = u->First();
+	if (front->vehstatus.Test(VehState::Crashed) || u->vehstatus.Test(VehState::Hidden)) return;
+	if (front->vehstatus.Test(VehState::Stopped) && front->cur_speed == 0) return;
+	u->motion_counter += front->cur_speed;
+}
+
 void CallVehicleTicks()
 {
 	_vehicles_to_autoreplace.clear();
@@ -999,14 +1039,35 @@ void CallVehicleTicks()
 	PerformanceAccumulator::Reset(PerformanceElement::GameLoopShips);
 	PerformanceAccumulator::Reset(PerformanceElement::GameLoopAircraft);
 
-	for (Vehicle *v : Vehicle::Iterate()) {
+	/* Vehicles behind the moving front of trains follow after the loop, see DeferredTrainMove. The parts of trains
+	 * that only count (TickTrainPart()) are done on several threads as well, so this loop skips them. */
+	StartDeferringTrainMoves(_vehicle_tick_skip);
+
+	auto skipped = [](size_t i) { return i < _vehicle_tick_skip.size() && _vehicle_tick_skip[i] != 0; };
+	/* Vehicles are allocated one by one, so with many of them nearly every vehicle is a cache miss.
+	 * Prefetch the vehicles a few ticked vehicles ahead; this is only a hint. */
+	static constexpr uint PREFETCH_DISTANCE = 8;
+	size_t prefetched = 0; // vehicles before this index have been prefetched (or skipped)
+	uint ahead = 0; // number of prefetched vehicles ahead of the current one
+	/* Vehicles may be added (or deleted) during the loop; added ones get ticked when their index is still ahead. */
+	for (size_t i = 0; i < Vehicle::GetPoolSize(); i++) {
+		if (skipped(i)) continue;
+		Vehicle *v = Vehicle::GetIfValid(i);
+		if (v == nullptr) continue;
 		[[maybe_unused]] VehicleID vehicle_index = v->index;
 
-		/* Vehicles are allocated one by one, so with many of them nearly every vehicle is a cache
-		 * miss. Prefetch the vehicle a few pool slots ahead; this is only a hint. */
-		static constexpr size_t PREFETCH_DISTANCE = 8;
-		if (const Vehicle *ahead = Vehicle::GetIfValid(vehicle_index.base() + PREFETCH_DISTANCE); ahead != nullptr) {
-			PrefetchRange(ahead, sizeof(Train));
+		if (prefetched <= i) {
+			prefetched = i + 1;
+			ahead = 0;
+		} else if (ahead > 0) {
+			ahead--;
+		}
+		for (; ahead < PREFETCH_DISTANCE && prefetched < Vehicle::GetPoolSize(); prefetched++) {
+			if (skipped(prefetched)) continue;
+			if (const Vehicle *u = Vehicle::GetIfValid(prefetched); u != nullptr) {
+				PrefetchRange(u, sizeof(Train));
+				ahead++;
+			}
 		}
 
 		/* Vehicle could be deleted in this tick */
@@ -1026,13 +1087,7 @@ void CallVehicleTicks()
 			case VehicleType::Ship: {
 				Vehicle *front = v->First();
 
-				if (v->vcache.cached_cargo_age_period != 0) {
-					v->cargo_age_counter = std::min(v->cargo_age_counter, v->vcache.cached_cargo_age_period);
-					if (--v->cargo_age_counter == 0) {
-						v->cargo.AgeCargo();
-						v->cargo_age_counter = v->vcache.cached_cargo_age_period;
-					}
-				}
+				AgeVehicleCargo(v);
 
 				/* Do not play any sound when crashed */
 				if (front->vehstatus.Test(VehState::Crashed)) continue;
@@ -1078,6 +1133,9 @@ void CallVehicleTicks()
 			}
 		}
 	}
+
+	FinishDeferredTrainMoves();
+	_vehicle_tick_skip.clear();
 
 	for (auto &it : _vehicles_to_autoreplace) {
 		Vehicle *v = Vehicle::Get(it.first);
@@ -1764,10 +1822,51 @@ void Vehicle::UpdateBoundingBoxCoordinates(bool update_cache) const
  */
 void Vehicle::UpdateViewport(bool dirty)
 {
-	/* If the existing cache is invalid we should ignore it, as it will be set to the current coords by UpdateBoundingBoxCoordinates */
-	bool ignore_cached_coords = this->sprite_cache.old_coord.left == INVALID_COORD;
+	this->PrepareViewport();
+	this->ApplyViewport(dirty);
+}
 
+/**
+ * First half of UpdateViewport(): the new bounding box of the vehicle. This only changes the vehicle itself
+ * (and may load sprites), so it can be done for several vehicles at once; ApplyViewport() has to follow.
+ */
+void Vehicle::PrepareViewport()
+{
+	/* If the existing cache is invalid we should ignore it, as it will be set to the current coords by UpdateBoundingBoxCoordinates */
+	this->sprite_cache.viewport_ignore_old_coord = this->sprite_cache.old_coord.left == INVALID_COORD;
 	this->UpdateBoundingBoxCoordinates(true);
+	this->sprite_cache.viewport_update_pending = true;
+}
+
+/**
+ * After PrepareViewport(): finish the update here when ApplyViewport(true) would change nothing but forget that the
+ * vehicle may be shown, i.e. when it stays in the same viewport hash bucket and no viewport shows it.
+ * This only reads the viewports, so it may run for several vehicles at once.
+ * @return Whether ApplyViewport() is still needed.
+ */
+bool Vehicle::FinishViewportIfUnseen()
+{
+	assert(this->sprite_cache.viewport_update_pending);
+	if (this->sprite_cache.viewport_ignore_old_coord) return true;
+
+	const Rect &old_coord = this->sprite_cache.old_coord;
+	if (GetViewportHash(this->coord.left, this->coord.top) != GetViewportHash(old_coord.left, old_coord.top)) return true;
+	if (IsAreaInAnyViewport(std::min(old_coord.left, this->coord.left), std::min(old_coord.top, this->coord.top),
+			std::max(old_coord.right, this->coord.right), std::max(old_coord.bottom, this->coord.bottom))) return true;
+
+	this->sprite_cache.is_viewport_candidate = false;
+	this->sprite_cache.viewport_update_pending = false;
+	return false;
+}
+
+/**
+ * Second half of UpdateViewport(), after PrepareViewport(): update the viewport hash and mark the areas dirty.
+ * @param dirty Mark the (new and old) coordinates of the vehicle as dirty.
+ */
+void Vehicle::ApplyViewport(bool dirty)
+{
+	this->sprite_cache.viewport_update_pending = false;
+	bool ignore_cached_coords = this->sprite_cache.viewport_ignore_old_coord;
 
 	if (ignore_cached_coords) {
 		UpdateVehicleViewportHash(this, this->coord.left, this->coord.top, INVALID_COORD, INVALID_COORD);
@@ -2840,10 +2939,24 @@ enum class VisualEffectSpawnModel : uint8_t {
 };
 
 /**
+ * Whether this part of a vehicle has a visual effect at all; ShowVisualEffect() does nothing for other parts.
+ * @return Whether the part may show a visual effect.
+ */
+bool Vehicle::HasVisualEffectModel() const
+{
+	if (HasBit(this->vcache.cached_vis_effect, VE_ADVANCED_EFFECT)) {
+		auto effect_model = static_cast<VisualEffectSpawnModel>(GB(this->vcache.cached_vis_effect, 0, VE_ADVANCED_EFFECT));
+		return effect_model != VisualEffectSpawnModel::None && effect_model < VisualEffectSpawnModel::End;
+	}
+	return static_cast<VisualEffectSpawnModel>(GB(this->vcache.cached_vis_effect, VE_TYPE_START, VE_TYPE_COUNT)) != VisualEffectSpawnModel::None;
+}
+
+/**
  * Draw visual effects (smoke and/or sparks) for a vehicle chain.
+ * @param parts When not `nullptr, the parts of the chain that may show an effect (all others do not), in chain order.
  * @pre this->IsPrimaryVehicle()
  */
-void Vehicle::ShowVisualEffect() const
+void Vehicle::ShowVisualEffect(const std::vector<const Vehicle *> *parts) const
 {
 	assert(this->IsPrimaryVehicle());
 	bool sound = false;
@@ -2876,9 +2989,7 @@ void Vehicle::ShowVisualEffect() const
 		}
 	}
 
-	const Vehicle *v = this;
-
-	do {
+	auto show = [&](const Vehicle *v) {
 		bool advanced = HasBit(v->vcache.cached_vis_effect, VE_ADVANCED_EFFECT);
 		int effect_offset = GB(v->vcache.cached_vis_effect, VE_OFFSET_START, VE_OFFSET_COUNT) - VE_OFFSET_CENTRE;
 		VisualEffectSpawnModel effect_model = VisualEffectSpawnModel::None;
@@ -2908,7 +3019,7 @@ void Vehicle::ShowVisualEffect() const
 				IsTunnelTile(v->tile) ||
 				(v->type == VehicleType::Train &&
 				!HasPowerOnRail(Train::From(v)->railtypes, GetTileRailType(v->tile)))) {
-			continue;
+			return;
 		}
 
 		EffectVehicleType evt = EV_END;
@@ -2986,7 +3097,14 @@ void Vehicle::ShowVisualEffect() const
 
 			CreateEffectVehicleRel(v, x, y, 10, evt);
 		}
-	} while ((v = v->Next()) != nullptr);
+	};
+
+	if (parts != nullptr) {
+		/* Only these parts can show an effect. */
+		for (const Vehicle *v : *parts) show(v);
+	} else {
+		for (const Vehicle *v = this; v != nullptr; v = v->Next()) show(v);
+	}
 
 	if (sound) PlayVehicleSound(this, VehicleSoundEvent::VisualEffect);
 }

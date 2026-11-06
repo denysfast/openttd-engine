@@ -29,6 +29,7 @@ Point GetTileBelowCursor();
 void UpdateViewportPosition(Window *w, uint32_t delta_ms);
 
 bool MarkAllViewportsDirty(int left, int top, int right, int bottom);
+bool IsAreaInAnyViewport(int left, int top, int right, int bottom);
 
 bool DoZoomInOutWindow(ZoomStateChange how, Window *w);
 void ZoomInOrOutToCursorWindow(bool in, Window * w);

@@ -13,6 +13,8 @@
 #include "newgrf_profiling.h"
 #include "core/pool_func.hpp"
 
+#include <mutex>
+
 #include "safeguards.h"
 
 SpriteGroupPool _spritegroup_pool("SpriteGroup");
@@ -171,6 +173,9 @@ void ResetUnhandledVariableWarnings()
 /* virtual */ void ResolverObject::UnhandledVariable(uint8_t variable) const
 {
 	if (!IsVisibleSeverity(Facility::Grf, Severity::Error)) return;
+	/* Resolving may run on several threads (drawing, moving trains). */
+	static std::mutex mutex;
+	std::lock_guard<std::mutex> lock(mutex);
 	if (!_unhandled_variables.emplace(this->grffile->grfid, this->GetFeature(), variable, this->callback).second) return;
 
 	Debug(Facility::Grf, Severity::Error, "[{}:{}] Unhandled feature 0x{:X} variable 0x{:X} during callback 0x{:X}", this->grffile->filename, this->root_spritegroup->nfo_line, this->GetFeature(), variable, this->callback);

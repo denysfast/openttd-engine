@@ -156,6 +156,8 @@ struct MutableSpriteCache {
 	bool is_viewport_candidate = false; ///< This vehicle can potentially be drawn on a viewport
 	Rect old_coord{}; ///< Co-ordinates from the last valid bounding box
 	VehicleSpriteSeq sprite_seq{}; ///< Vehicle appearance.
+	bool viewport_update_pending = false; ///< Vehicle::PrepareViewport() computed new bounds, Vehicle::ApplyViewport() still has to follow.
+	bool viewport_ignore_old_coord = false; ///< The old bounds were invalid when Vehicle::PrepareViewport() ran.
 };
 
 /** A vehicle pool for a little over 1 million vehicles. */
@@ -814,10 +816,14 @@ public:
 	CommandCost SendToDepot(DoCommandFlags flags, DepotCommandFlags command);
 
 	void UpdateVisualEffect(bool allow_power_change = true);
-	void ShowVisualEffect() const;
+	void ShowVisualEffect(const std::vector<const Vehicle *> *parts = nullptr) const;
+	bool HasVisualEffectModel() const;
 
 	void UpdatePosition();
 	void UpdateViewport(bool dirty);
+	void PrepareViewport();
+	void ApplyViewport(bool dirty);
+	bool FinishViewportIfUnseen();
 	void UpdateBoundingBoxCoordinates(bool update_cache) const;
 	void UpdatePositionAndViewport();
 	bool MarkAllViewportsDirty() const;
@@ -1227,6 +1233,18 @@ struct SpecializedVehicle : public Vehicle {
 	 */
 	inline void UpdateViewport(bool force_update, bool update_delta)
 	{
+		this->PrepareViewportUpdate(force_update, update_delta);
+		if (this->sprite_cache.viewport_update_pending) this->Vehicle::ApplyViewport(true);
+	}
+
+	/**
+	 * The part of UpdateViewport() that only changes this vehicle: its sprites and bounds. Vehicle::ApplyViewport()
+	 * has to follow when Vehicle::sprite_cache says so. This may run for vehicles of different consists at once.
+	 * @param force_update Force updating the vehicle on the viewport.
+	 * @param update_delta Also update the delta?
+	 */
+	inline void PrepareViewportUpdate(bool force_update, bool update_delta)
+	{
 		bool sprite_has_changed = false;
 
 		/* Skip updating sprites on dedicated servers without screen */
@@ -1263,7 +1281,7 @@ struct SpecializedVehicle : public Vehicle {
 		}
 
 		if (force_update || sprite_has_changed) {
-			this->Vehicle::UpdateViewport(true);
+			this->Vehicle::PrepareViewport();
 		}
 	}
 

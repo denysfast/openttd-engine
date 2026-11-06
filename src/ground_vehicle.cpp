@@ -79,6 +79,7 @@ template <class T, VehicleType Type>
 void GroundVehicle<T, Type>::CargoChanged()
 {
 	assert(this->First() == this);
+	if constexpr (std::is_same_v<T, Train>) T::From(this)->InvalidateFollowerSummary();
 	uint32_t weight = 0;
 
 	for (T *u = T::From(this); u != nullptr; u = u->Next()) {
@@ -143,7 +144,12 @@ int GroundVehicle<T, Type>::GetAcceleration() const
 	 * so we need some magic conversion factor. */
 	resistance += static_cast<int64_t>(area) * this->gcache.cached_air_drag * speed * speed / 1000;
 
-	resistance += this->GetSlopeResistance();
+	if constexpr (std::is_same_v<T, Train>) {
+		/* During the vehicle tick loop this need not walk the whole train. */
+		resistance += v->GetConsistSlopeResistance();
+	} else {
+		resistance += this->GetSlopeResistance();
+	}
 
 	/* This value allows to know if the vehicle is accelerating or braking. */
 	AccelStatus mode = v->GetAccelerationStatus();
