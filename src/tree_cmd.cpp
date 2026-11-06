@@ -847,6 +847,26 @@ static bool TreesOnTileCanSpread(TileIndex tile)
 }
 
 /** @copydoc TileLoopProc */
+/**
+ * Whether TileLoop_Trees() does nothing for a tile now; see TileLoopIsNoop().
+ * @param tile The tile.
+ * @return True if the tile loop has nothing to do.
+ */
+bool TreesTileLoopIsNoop(TileIndex tile)
+{
+	/* Shores, snow, desert and the ambient sound callback are not looked into. */
+	if (_settings_game.game_creation.landscape == LandscapeType::Tropic || _settings_game.game_creation.landscape == LandscapeType::Arctic) return false;
+	if (HasGrfMiscBit(GrfMiscBit::AmbientSoundCallback)) return false;
+	if (GetTreeGround(tile) == TreeGround::Shore) return false;
+
+	/* Same as TileLoop_Trees(). */
+	uint32_t cycle = 11 * TileX(tile) + 9 * TileY(tile) + (TimerGameTick::counter >> 8);
+	if ((cycle & 7) == 7 && GetTreeGround(tile) == TreeGround::Grass && GetTreeDensity(tile) < 3) return false;
+	if (_settings_game.construction.extra_tree_placement == ETP_NO_GROWTH_NO_SPREAD) return true;
+	static const uint32_t TREE_UPDATE_FREQUENCY = 16;
+	return cycle % TREE_UPDATE_FREQUENCY != TREE_UPDATE_FREQUENCY - 1;
+}
+
 static void TileLoop_Trees(TileIndex tile)
 {
 	if (GetTreeGround(tile) == TreeGround::Shore) {

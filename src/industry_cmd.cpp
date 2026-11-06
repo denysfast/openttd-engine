@@ -59,6 +59,8 @@
 #include "table/industry_land.h"
 #include "table/build_industry.h"
 
+#include "worker_pool.h"
+
 #include "safeguards.h"
 
 IndustryPool _industry_pool("Industry");
@@ -1167,6 +1169,22 @@ static void ProduceIndustryGoodsHelper(Industry *i, bool scale)
 	}
 }
 
+/**
+ * Whether ProduceIndustryGoods() does nothing for an industry in this tick but counting down.
+ * This only reads, so it may run for several industries at once.
+ * @param i The industry.
+ * @return True if it only counts down.
+ */
+static bool IndustryOnlyCountsThisTick(const Industry *i)
+{
+	const IndustrySpec *indsp = GetIndustrySpec(i->type);
+	if ((i->counter & 0x3F) == 0) return false; // sound
+	const uint16_t counter = i->counter - 1;
+	if (indsp->callback_mask.Test(IndustryCallbackMask::Production256Ticks) &&
+			counter % ScaleByInverseCargoScale(Ticks::INDUSTRY_PRODUCE_TICKS, false) == 0) return false;
+	return (counter % Ticks::INDUSTRY_PRODUCE_TICKS) != 0;
+}
+
 static void ProduceIndustryGoods(Industry *i)
 {
 	const IndustrySpec *indsp = GetIndustrySpec(i->type);
@@ -1255,11 +1273,37 @@ void OnTick_Industry()
 
 	if (_game_mode == GameMode::Editor) return;
 
-	for (Industry *i : Industry::Iterate()) {
-		ProduceIndustryGoods(i);
-
+	auto accumulate = [](Industry *i) {
 		if ((TimerGameTick::counter + i->index) % Ticks::DAY_TICKS == 0) {
 			for (auto &a : i->accepted) a.accumulated_waiting += a.waiting;
+		}
+	};
+
+	/* Most industries only count down in a tick, which changes nothing else: those count on several threads.
+	 * The others are done here, in the same order. */
+	static constexpr size_t CHUNK = 256;
+	const size_t pool_size = Industry::GetPoolSize();
+	const uint chunks = static_cast<uint>((pool_size + CHUNK - 1) / CHUNK);
+	static std::vector<std::vector<Industry *>> busy;
+	if (busy.size() < chunks) busy.resize(chunks);
+	GetSimulationWorkers().Run(chunks, [pool_size, &accumulate](uint chunk) {
+		std::vector<Industry *> &list = busy[chunk];
+		list.clear();
+		for (size_t index = chunk * CHUNK; index < std::min(pool_size, (chunk + 1) * CHUNK); index++) {
+			Industry *i = Industry::GetIfValid(index);
+			if (i == nullptr) continue;
+			if (IndustryOnlyCountsThisTick(i)) {
+				i->counter--;
+				accumulate(i);
+			} else {
+				list.push_back(i);
+			}
+		}
+	});
+	for (uint chunk = 0; chunk < chunks; chunk++) {
+		for (Industry *i : busy[chunk]) {
+			ProduceIndustryGoods(i);
+			accumulate(i);
 		}
 	}
 }

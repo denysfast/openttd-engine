@@ -349,6 +349,25 @@ static void TileLoop_Clear(TileIndex tile)
 }
 
 /**
+ * Whether TileLoop_Clear() does nothing for a tile now; see TileLoopIsNoop().
+ * @param tile The tile.
+ * @return True if the tile loop has nothing to do.
+ */
+bool ClearTileLoopIsNoop(TileIndex tile)
+{
+	/* Snow, desert and the ambient sound callback are not looked into. */
+	if (_settings_game.game_creation.landscape == LandscapeType::Tropic || _settings_game.game_creation.landscape == LandscapeType::Arctic) return false;
+	if (HasGrfMiscBit(GrfMiscBit::AmbientSoundCallback) || _game_mode == GameMode::Editor) return false;
+	if (IsSnowTile(tile)) return true;
+
+	switch (GetClearGround(tile)) {
+		case ClearGround::Grass: return GetClearDensity(tile) == 3;
+		case ClearGround::Fields: return false;
+		default: return true;
+	}
+}
+
+/**
  * Test if a tile may have rocks on.
  * @param tile The tile index.
  * @param allow_water Whether to consider plain water tiles.

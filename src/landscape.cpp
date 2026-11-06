@@ -48,6 +48,9 @@
 
 #include <unordered_set>
 
+#include "worker_pool.h"
+#include "water_map.h"
+#include "newgrf.h"
 #include "safeguards.h"
 
 extern const TileTypeProcs
@@ -802,6 +805,25 @@ TileIndex _cur_tileloop_tile;
 /**
  * Gradually iterate over all tiles on the map, calling their TileLoopProcs once every TILE_UPDATE_FREQUENCY ticks.
  */
+bool ClearTileLoopIsNoop(TileIndex tile);
+bool TreesTileLoopIsNoop(TileIndex tile);
+
+/**
+ * Whether the tile loop has nothing to do for a tile now. This only reads, so it may run for many tiles at once.
+ * @param tile The tile.
+ * @return True if calling its tile loop proc would change nothing.
+ */
+static bool TileLoopIsNoop(TileIndex tile)
+{
+	switch (GetTileType(tile)) {
+		case TileType::Clear: return ClearTileLoopIsNoop(tile);
+		case TileType::Trees: return TreesTileLoopIsNoop(tile);
+		/* Same as the start of TileLoop_Water(): water that cannot flood anything is skipped. */
+		case TileType::Water: return !HasGrfMiscBit(GrfMiscBit::AmbientSoundCallback) && IsNonFloodingWaterTile(tile);
+		default: return false;
+	}
+}
+
 void RunTileLoop()
 {
 	PerformanceAccumulator framerate(PerformanceElement::GameLoopLandscape);
@@ -837,6 +859,50 @@ void RunTileLoop()
 	 * prefetch the tiles it reaches; the visiting order (and so the game state) is unchanged. */
 	static constexpr uint PREFETCH_DISTANCE = 16;
 	auto next_tile = [feedback](TileIndex t) { return TileIndex{(t.base() >> 1) ^ (-(int32_t)(t.base() & 1) & feedback)}; };
+
+	/* Most tiles of a big map (trees, grass) have nothing to do most of the time. Find them on several threads
+	 * first (TileLoopIsNoop() only reads), so the loop does not even touch them; the order stays the same. */
+	static constexpr uint MIN_PARALLEL_TILES = 4096;
+	if (count >= MIN_PARALLEL_TILES && GetSimulationWorkers().Threads() > 1) {
+		static std::vector<TileIndex> tiles;
+		static std::vector<uint8_t> noop;
+		tiles.resize(count);
+		noop.resize(count);
+		for (uint i = 0; i < count; i++) {
+			tiles[i] = tile;
+			tile = next_tile(tile);
+		}
+		static constexpr uint CHUNK = 2048;
+		GetSimulationWorkers().Run((count + CHUNK - 1) / CHUNK, [count](uint chunk) {
+			const uint end = std::min(count, (chunk + 1) * CHUNK);
+			for (uint i = chunk * CHUNK; i < std::min(end, chunk * CHUNK + PREFETCH_DISTANCE); i++) Tile::Prefetch(tiles[i]);
+			for (uint i = chunk * CHUNK; i < end; i++) {
+				if (i + PREFETCH_DISTANCE < end) Tile::Prefetch(tiles[i + PREFETCH_DISTANCE]);
+				noop[i] = TileLoopIsNoop(tiles[i]);
+			}
+		});
+
+		uint prefetched = 0; // tiles before this one have been prefetched (or have nothing to do)
+		uint ahead = 0; // number of prefetched tiles ahead of the current one
+		for (uint i = 0; i < count; i++) {
+			if (noop[i]) continue;
+			if (prefetched <= i) {
+				prefetched = i + 1;
+				ahead = 0;
+			} else if (ahead > 0) {
+				ahead--;
+			}
+			for (; ahead < PREFETCH_DISTANCE && prefetched < count; prefetched++) {
+				if (noop[prefetched]) continue;
+				Tile::Prefetch(tiles[prefetched]);
+				ahead++;
+			}
+			_tile_type_procs[GetTileType(tiles[i])]->tile_loop_proc(tiles[i]);
+		}
+		_cur_tileloop_tile = tile;
+		return;
+	}
+
 	TileIndex ahead = tile;
 	for (uint i = 0; i < PREFETCH_DISTANCE && i < count; i++) {
 		ahead = next_tile(ahead);

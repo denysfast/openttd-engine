@@ -720,6 +720,35 @@ static void TownCustomGrowthTick(Town *t, TownExpandModes modes)
  * Towns are staggered by their index, so they do not all do their work in the same tick.
  * @param t The town.
  */
+/**
+ * Whether TownGrowthTick() only updates the counters of the town itself in this tick (it does not build).
+ * This only reads, so it may run for several towns at once.
+ * @param t The town.
+ * @return True if the tick only counts.
+ */
+bool TownGrowthTickOnlyCounts(const Town *t)
+{
+	if (t->flags.Test(TownFlag::CustomGrowth)) return false;
+
+	/* Same as TownGrowthTick(). */
+	const TownGrowthState &growth = t->growth;
+	const uint16_t retry_ticks = growth.retry_ticks != 0 ? growth.retry_ticks - 1 : 0;
+	if (growth.status != TownGrowthStatus::Growing && growth.status != TownGrowthStatus::NoSpace) return true;
+
+	const uint64_t tick = TimerGameTick::counter + t->index.base();
+	if (tick % TOWN_BUILDER_STEP_TICKS != 0 || retry_ticks != 0) return true;
+
+	int64_t budget = growth.budget;
+	if (tick % Ticks::DAY_TICKS == 0) {
+		int64_t cap = static_cast<int64_t>(TownGrowthBalance::BUDGET_CAP_YEARS) * growth.yearly_growth * 1000;
+		if (budget < cap) {
+			uint day = static_cast<uint>(tick / Ticks::DAY_TICKS % CalendarTime::DAYS_IN_YEAR);
+			budget = std::min<int64_t>(budget + CalcTownDailyBudget(growth.yearly_growth, day), cap);
+		}
+	}
+	return budget <= 0;
+}
+
 void TownGrowthTick(Town *t)
 {
 	TownExpandModes modes{TownExpandMode::Buildings};

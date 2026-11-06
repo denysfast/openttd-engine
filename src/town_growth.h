@@ -87,6 +87,7 @@ namespace TownGrowthBalance {
 
 void UpdateTownNeeds(Town *t);
 void TownGrowthTick(Town *t);
+bool TownGrowthTickOnlyCounts(const Town *t);
 uint32_t GetTownNeedDemand(const Town *t, TownNeed need);
 uint32_t ScaleTownNeedDemand(uint64_t linear_demand, uint32_t population);
 bool IsTownNeedUnlocked(const Town *t, TownNeed need);

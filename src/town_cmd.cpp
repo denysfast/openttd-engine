@@ -77,6 +77,8 @@
 #include "table/strings.h"
 #include "table/town_land.h"
 
+#include "worker_pool.h"
+
 #include "safeguards.h"
 
 /* Initialize the town-pool */
@@ -894,8 +896,28 @@ void OnTick_Town()
 {
 	if (_game_mode == GameMode::Editor) return;
 
-	for (Town *t : Town::Iterate()) {
-		TownTickHandler(t);
+	/* Most towns only update their own counters in a tick: those tick on several threads.
+	 * The ones that build are done here, in the same order. */
+	static constexpr size_t CHUNK = 256;
+	const size_t pool_size = Town::GetPoolSize();
+	const uint chunks = static_cast<uint>((pool_size + CHUNK - 1) / CHUNK);
+	static std::vector<std::vector<Town *>> busy;
+	if (busy.size() < chunks) busy.resize(chunks);
+	GetSimulationWorkers().Run(chunks, [pool_size](uint chunk) {
+		std::vector<Town *> &list = busy[chunk];
+		list.clear();
+		for (size_t index = chunk * CHUNK; index < std::min(pool_size, (chunk + 1) * CHUNK); index++) {
+			Town *t = Town::GetIfValid(index);
+			if (t == nullptr) continue;
+			if (TownGrowthTickOnlyCounts(t)) {
+				TownTickHandler(t);
+			} else {
+				list.push_back(t);
+			}
+		}
+	});
+	for (uint chunk = 0; chunk < chunks; chunk++) {
+		for (Town *t : busy[chunk]) TownTickHandler(t);
 	}
 }
 
