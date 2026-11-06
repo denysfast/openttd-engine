@@ -16,6 +16,7 @@
 class VideoDriver_Null : public VideoDriver {
 private:
 	uint ticks = 0; ///< Amount of ticks to run.
+	bool bench = false; ///< Print timing statistics of the game loop to stderr at the end.
 
 public:
 	std::optional<std::string_view> Start(const StringList &param) override;

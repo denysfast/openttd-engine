@@ -1058,6 +1058,23 @@ void ShowFrametimeGraphWindow(PerformanceElement elem)
 	AllocateWindowDescFront<FrametimeGraphWindow>(_frametime_graph_window_desc, elem);
 }
 
+/**
+ * Print the average duration of every measured element over the last
+ * #NUM_FRAMERATE_POINTS samples to stderr. Used by the null video driver's benchmark mode.
+ */
+void PrintFramerateToStderr()
+{
+	static const EnumIndexArray<std::string_view, PerformanceElement, PerformanceElement::End> NAMES = {
+		"game_loop", "station", "train", "road_vehicle", "ship", "aircraft", "landscape", "link_graph_delay",
+		"drawing", "viewport_drawing", "video", "sound", "scripts", "game_script",
+	};
+	for (PerformanceElement e : EnumRange(PerformanceElement::End)) {
+		auto &pf = _pf_data[e];
+		if (pf.num_valid == 0 || e >= PerformanceElement::AI0) continue;
+		fmt::print(stderr, "bench: {:<18} {:8.3f} ms\n", NAMES[e], pf.GetAverageDurationMilliseconds(NUM_FRAMERATE_POINTS));
+	}
+}
+
 /** Print performance statistics to game console */
 void ConPrintFramerate()
 {
