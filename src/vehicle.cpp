@@ -395,10 +395,12 @@ Vehicle::Vehicle(VehicleID index, VehicleType type) : VehiclePool::PoolItem<&_ve
 }
 
 /** @{
- * Size of the hash, 6 = 64 x 64, 7 = 128 x 128.
+ * Size of the hash, 6 = 64 x 64, 7 = 128 x 128, 9 = 512 x 512 (2 MiB).
+ * On big maps with many vehicles a small hash puts the vehicles of many tiles into one bucket,
+ * and finding the vehicles on (or near) a tile walks all of them.
  * Larger sizes will (in theory) reduce hash lookup times at the expense of memory usage.
  */
-constexpr uint TILE_HASH_BITS = 7;
+constexpr uint TILE_HASH_BITS = 9;
 constexpr uint TILE_HASH_SIZE = 1 << TILE_HASH_BITS;
 constexpr uint TILE_HASH_MASK = TILE_HASH_SIZE - 1;
 constexpr uint TOTAL_TILE_HASH_SIZE = 1 << (TILE_HASH_BITS * 2);
