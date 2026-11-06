@@ -2156,9 +2156,10 @@ static bool CanReplaceHouseTile(TileIndex tile, int maxz, bool noslope)
  * @param t The town owning the house.
  * @param tile A tile of the house; only the northern tile of a house is considered.
  * @param cache Memory of the current builder step, to skip houses that no allowed type can outgrow; may be nullptr.
+ * @param crowded The town has no more land: residential districts allow one step taller buildings.
  * @return The residents the replacement adds once it is completed, or -1 if the house was not replaced.
  */
-int32_t TryReplaceTownHouse(Town *t, TileIndex tile, TownReplaceCache *cache)
+int32_t TryReplaceTownHouse(Town *t, TileIndex tile, TownReplaceCache *cache, bool crowded)
 {
 	HouseID old_house = GetHouseType(tile);
 	HouseID north = old_house;
@@ -2177,7 +2178,7 @@ int32_t TryReplaceTownHouse(Town *t, TileIndex tile, TownReplaceCache *cache)
 	/* A house that suits its zone (or its district) is only replaced by a much denser one. */
 	bool outdated = !old_hs->enabled || TimerGameCalendar::year > old_hs->max_year;
 	HouseZone zone = GetTownRadiusGroup(t, tile);
-	TownHousePick pick = GetTownHousePick(t, tile, zone);
+	TownHousePick pick = GetTownHousePick(t, tile, zone, crowded);
 	HouseZone climate = GetTownHouseClimate(tile);
 	bool suits_zone;
 	if (pick.district == TownDistrict::Normal) {

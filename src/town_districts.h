@@ -71,7 +71,7 @@ struct TownReplaceCache {
 static constexpr uint32_t TOWN_DISTRICTS_MIN_POPULATION = 20000;
 
 TownDistrict GetTownDistrict(const Town *t, TileIndex tile);
-TownHousePick GetTownHousePick(const Town *t, TileIndex tile, HouseZone zone);
+TownHousePick GetTownHousePick(const Town *t, TileIndex tile, HouseZone zone, bool crowded = false);
 HouseCategory GetHouseCategory(const HouseSpec &hs);
 HouseZone GetTownRoadsideZone(const Town *t, TileIndex tile, HouseZone zone);
 uint GetTownLandmarkLimit(const Town *t, bool stadium);

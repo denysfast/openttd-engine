@@ -214,13 +214,18 @@ TownDistrict GetTownDistrict(const Town *t, TileIndex tile)
  * @param t The town.
  * @param tile The tile.
  * @param zone The town zone of the tile.
+ * @param crowded The town has no more land to grow on: residential districts allow one step taller buildings.
  * @return The district of the tile and what it allows.
  */
-TownHousePick GetTownHousePick(const Town *t, TileIndex tile, HouseZone zone)
+TownHousePick GetTownHousePick(const Town *t, TileIndex tile, HouseZone zone, bool crowded)
 {
 	using enum HouseZone;
 	using enum HouseCategory;
 	TownHousePick pick{GetTownDistrict(t, tile), {}, {}, false, (TileY(tile) / 4) << 16 | (TileX(tile) / 4)};
+	if (crowded) {
+		if (pick.district == TownDistrict::MidRise) pick.district = TownDistrict::HighRise;
+		if (pick.district == TownDistrict::LowRise) pick.district = TownDistrict::MidRise;
+	}
 	switch (pick.district) {
 		case TownDistrict::Normal:
 		case TownDistrict::End:

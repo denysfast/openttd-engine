@@ -41,7 +41,7 @@ uint32_t GetTownBlockRadiusSquared(Town *t);
 /* House placement used by the builder (town_cmd.cpp). */
 HouseID TryBuildTownHouse(Town *t, TileIndex tile, TownExpandModes modes);
 struct TownReplaceCache;
-int32_t TryReplaceTownHouse(Town *t, TileIndex tile, TownReplaceCache *cache = nullptr);
+int32_t TryReplaceTownHouse(Town *t, TileIndex tile, TownReplaceCache *cache = nullptr, bool crowded = false);
 void LevelTownLand(TileIndex tile);
 bool MakeTownTileNotSteep(TileIndex tile);
 

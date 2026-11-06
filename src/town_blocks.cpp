@@ -433,9 +433,10 @@ static bool FillOpenedBlocks(Town *t, TownBlockCache &cache, TownExpandModes mod
  * @param t The town.
  * @param cache The blocks of the town.
  * @param[out] result What the step built.
+ * @param crowded The town has no more land: residential districts of big towns allow one step taller buildings.
  * @return True if a house was replaced.
  */
-static bool DensifyOpenedBlocks(Town *t, TownBlockCache &cache, TownBuildResult &result)
+static bool DensifyOpenedBlocks(Town *t, TownBlockCache &cache, TownBuildResult &result, bool crowded = false)
 {
 	TownReplaceCache replace_cache;
 	for (const auto &[cost, key] : cache.order) {
@@ -445,7 +446,7 @@ static bool DensifyOpenedBlocks(Town *t, TownBlockCache &cache, TownBuildResult 
 				TileIndex tile = origin + TileDiffXY(x, y);
 				if (!IsTileType(tile, TileType::House) || GetTownIndex(tile) != t->index) continue;
 
-				int32_t residents = TryReplaceTownHouse(t, tile, &replace_cache);
+				int32_t residents = TryReplaceTownHouse(t, tile, &replace_cache, crowded);
 				if (residents < 0) continue;
 
 				/* The iteration must stop here: replacing the house may have changed the opened blocks. */
@@ -870,6 +871,9 @@ TownBuildResult TownBuilderStep(Town *t, TownExpandModes modes)
 		if (FillOpenedBlocks(t, *cache, modes, result)) return result;
 		if (DensifyOpenedBlocks(t, *cache, result)) return result;
 	}
-	OpenNewBlock(t, *cache, modes, result);
+	if (OpenNewBlock(t, *cache, modes, result)) return result;
+
+	/* No free plot, nothing to densify and no land for a new block: a big town grows upwards, its districts get taller. */
+	if (modes.Test(TownExpandMode::Buildings) && t->cache.population >= TOWN_DISTRICTS_MIN_POPULATION) DensifyOpenedBlocks(t, *cache, result, true);
 	return result;
 }
