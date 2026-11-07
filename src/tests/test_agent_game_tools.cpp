@@ -22,6 +22,7 @@
 #include "../aircraft.h"
 #include "../cargotype.h"
 #include "../company_base.h"
+#include "../road.h"
 #include "../roadveh.h"
 #include "../train.h"
 #include "../vehicle_base.h"
@@ -946,4 +947,45 @@ TEST_CASE("agent_game_tools: a vehicle row reports the engine's own raw wait cou
 	vehicles.road->current_order_time = -1;
 	const Json road_unknown = VehicleWaitJson(vehicles.road);
 	CHECK(road_unknown["current_order_time"] == -1);
+}
+
+TEST_CASE("agent_game_tools: a vehicle row reports the real road type, not the vehicle type")
+{
+	/* Without a game the road type masks are empty, so RoadTypeIsTram() would answer for nothing. The
+	 * engine's own defaults install the real road and tram bits; no other case in this binary reads
+	 * the masks, and they are the state a running game has. */
+	ResetRoadTypes();
+
+	/* The company is declared first, so the vehicles are removed before it. */
+	TestCompanyGuard company;
+	TestVehicles vehicles;
+
+	/* One real road vehicle is read as a bus, then as a tram, then without a road type at all. */
+	vehicles.road->owner = company.Id();
+	vehicles.road->type = VehicleType::Road;
+	vehicles.road->roadtype = ROADTYPE_ROAD;
+
+	const Json bus_fields = VehicleRoadTypeFieldsForTest(vehicles.road);
+	CHECK(bus_fields["road_type_id"] == 0);
+	CHECK(bus_fields["road_type"] == "road");
+	CHECK(bus_fields["is_tram"] == false);
+
+	vehicles.road->roadtype = ROADTYPE_TRAM;
+	const Json tram_fields = VehicleRoadTypeFieldsForTest(vehicles.road);
+	CHECK(tram_fields["road_type_id"] == 1);
+	CHECK(tram_fields["road_type"] == "tram");
+	CHECK(tram_fields["is_tram"] == true);
+
+	/* A road vehicle without a road type has no family: the fields are null, not false. */
+	vehicles.road->roadtype = INVALID_ROADTYPE;
+	const Json unknown = VehicleRoadTypeFieldsForTest(vehicles.road);
+	CHECK(unknown["road_type_id"].is_null());
+	CHECK(unknown["road_type"].is_null());
+	CHECK(unknown["is_tram"].is_null());
+
+	/* A train has no road type at all, so its row says nothing about one. */
+	const Json train_fields = VehicleRoadTypeFieldsForTest(vehicles.train);
+	CHECK(train_fields["road_type_id"].is_null());
+	CHECK(train_fields["road_type"].is_null());
+	CHECK(train_fields["is_tram"].is_null());
 }

@@ -616,6 +616,27 @@ void MakeReceiptRoom()
 }
 
 /**
+ * Reserve the receipt slot of a request that will answer from the draw tick.
+ *
+ * The slot is reserved before the request is scheduled, so its answer can always be stored when it
+ * runs. Acknowledged receipts are forgotten for it, exactly as an ordinary result forgets them, so a
+ * cache full of ordinary reads cannot block the camera and capture requests forever; without this,
+ * every draw-tick request would stay `busy` once the cache held MAX_RECEIPTS receipts, although
+ * their own receipts could be evicted.
+ *
+ * Unacknowledged receipts are never dropped (a replay would execute the request again), and the
+ * slots promised to the requests that already wait for the draw tick are preserved: only the room
+ * above them is freed, and the request asking here counts itself as well.
+ * @return True iff the slot was reserved.
+ */
+bool ReserveDeferredReceiptSlot()
+{
+	MakeReceiptRoom();
+	/* The request that asks here is not in `_deferred` yet, so it needs one slot on top. */
+	return _state.receipts.size() + _deferred.size() < MAX_RECEIPTS;
+}
+
+/**
  * Store the result of an executed request, so a replay is answered identically.
  * @param request_id The request the result belongs to.
  * @param result The result of the request.
@@ -2434,7 +2455,7 @@ Json ScheduleDeferred(std::string_view method, const Json &request, const std::s
 	 * always be stored and delivered when the draw tick runs. */
 	if (_deferred.size() >= MAX_PENDING_DEFERRED ||
 			_state.results.size() + _deferred.size() >= MAX_PENDING_RESULTS ||
-			_state.receipts.size() + _deferred.size() >= MAX_RECEIPTS) {
+			!ReserveDeferredReceiptSlot()) {
 		return Error("busy", "too many requests are waiting for the next draw tick");
 	}
 
@@ -3428,6 +3449,49 @@ void ArmPendingLoadForTest(std::string request_id, std::string file, std::string
 	_state.pending_load.epoch = _state.epoch;
 	_state.pending_load.actor = actor;
 	_state.pending_load.player = player;
+}
+
+void StoreReceiptForTest(std::string request_id, const Json &result)
+{
+	StoreReceipt(request_id, result);
+}
+
+void AcknowledgeReceiptForTest(const std::string &request_id)
+{
+	AcknowledgeReceipt(request_id);
+}
+
+bool ReserveDeferredForTest(std::string request_id)
+{
+	if (!ReserveDeferredReceiptSlot()) return false;
+	DeferredRequest request;
+	request.method = "world.camera.get";
+	request.world_id = _state.world_id;
+	request.epoch = _state.epoch;
+	_deferred[request_id] = std::move(request);
+	return true;
+}
+
+size_t ReceiptCountForTest()
+{
+	return _state.receipts.size();
+}
+
+size_t DeferredReservationCountForTest()
+{
+	return _deferred.size();
+}
+
+bool HasReceiptForTest(const std::string &request_id)
+{
+	return _state.receipts.find(request_id) != _state.receipts.end();
+}
+
+void ClearReceiptCacheForTest()
+{
+	_state.receipts.clear();
+	_state.receipt_order.clear();
+	_deferred.clear();
 }
 
 CompanyID PendingLoadPlayer()

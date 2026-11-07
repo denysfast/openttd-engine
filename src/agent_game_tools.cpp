@@ -29,6 +29,7 @@
 #include "order_type.h"
 #include "road_cmd.h"
 #include "road_type.h"
+#include "roadveh.h"
 #include "station_base.h"
 #include "station_cmd.h"
 #include "station_type.h"
@@ -966,6 +967,41 @@ Json OrderSummaryJson(VehicleOrderID index, const Order *order)
 }
 
 /**
+ * Add the road type of a vehicle to its row.
+ *
+ * A bus and a tram are both `road` vehicles, so the vehicle type cannot tell their family apart: only
+ * the road type the vehicle actually runs on can. The fields are null, not false, for a vehicle that
+ * has no road type at all (a train, a ship, an aircraft) and for a road vehicle whose road type is not
+ * set yet, so a caller never reads "not a tram" out of a missing answer.
+ *
+ * @param row The row to add the fields to.
+ * @param v The vehicle.
+ */
+void AddRoadTypeFields(Json &row, const Vehicle *v)
+{
+	if (v->type != VehicleType::Road) {
+		row["road_type_id"] = nullptr;
+		row["road_type"] = nullptr;
+		row["is_tram"] = nullptr;
+		return;
+	}
+
+	const RoadType roadtype = RoadVehicle::From(v)->roadtype;
+	if (roadtype == INVALID_ROADTYPE) {
+		row["road_type_id"] = nullptr;
+		row["road_type"] = nullptr;
+		row["is_tram"] = nullptr;
+		return;
+	}
+
+	/* The engine's own classification, not a name or a guess. */
+	const bool tram = RoadTypeIsTram(roadtype);
+	row["road_type_id"] = static_cast<uint8_t>(roadtype);
+	row["road_type"] = std::string(tram ? "tram" : "road");
+	row["is_tram"] = tram;
+}
+
+/**
  * Serialise one vehicle.
  * @param v The vehicle.
  * @return JSON row with the current state of the vehicle.
@@ -976,6 +1012,7 @@ Json VehicleRow(const Vehicle *v)
 	row["ref"] = PoolRef("vehicle", v);
 	row["id"] = v->index.base();
 	row["type"] = std::string(VehicleTypeName(v->type));
+	AddRoadTypeFields(row, v);
 	row["owner"] = v->owner.base();
 	row["name"] = v->name;
 	row["unit_number"] = v->unitnumber;
@@ -2940,6 +2977,13 @@ Json Capability(std::string_view method, std::string_view authority, std::initia
 }
 
 } // namespace
+
+Json VehicleRoadTypeFieldsForTest(const Vehicle *v)
+{
+	Json row = Json::object();
+	AddRoadTypeFields(row, v);
+	return row;
+}
 
 /* Outside the anonymous namespace: the header declares this helper, so the test binary has to link
  * it. `VehicleRow` above calls it through that declaration. */

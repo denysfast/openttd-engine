@@ -21,6 +21,8 @@
 #include <optional>
 #include <string_view>
 
+struct Vehicle;
+
 /** Game tool methods the agent bridge dispatches onto real OpenTTD commands. */
 namespace InGameAgent {
 
@@ -137,6 +139,17 @@ void AgentRefitVehicleCallback(Commands cmd, const CommandCost &result, uint ref
  * @param veh_id The vehicle that was created.
  */
 void AgentCloneVehicleCallback(Commands cmd, const CommandCost &result, VehicleID veh_id);
+
+/**
+ * The road type fields of a vehicle row, for the tests.
+ *
+ * The fields are exactly the ones VehicleRow adds: `road_type_id`, `road_type` and `is_tram`, null
+ * when the vehicle has no road type.
+ *
+ * @param v The vehicle.
+ * @return The three fields.
+ */
+Json VehicleRoadTypeFieldsForTest(const Vehicle *v);
 
 } // namespace InGameAgent
 

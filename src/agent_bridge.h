@@ -184,6 +184,57 @@ void ArmPendingLoadForTest(std::string request_id, std::string file, std::string
  */
 CompanyID PendingLoadPlayer();
 
+/*
+ * Receipt cache seams.
+ *
+ * A stored receipt answers a replay of its request, and a request that waits for the draw tick holds
+ * a receipt slot from the moment it is scheduled. The cache is bounded by MAX_RECEIPTS and only
+ * acknowledged receipts may be forgotten, so the rules are only observable with a backend and a
+ * video driver; these seams expose exactly the rules to the tests.
+ */
+
+/**
+ * Store an unacknowledged receipt, as an executed request does.
+ * @param request_id The request the receipt belongs to.
+ * @param result The result the receipt holds.
+ */
+void StoreReceiptForTest(std::string request_id, const Json &result);
+
+/**
+ * Mark a receipt as acknowledged by the backend, so it may be forgotten.
+ * @param request_id The request whose receipt is acknowledged.
+ */
+void AcknowledgeReceiptForTest(const std::string &request_id);
+
+/**
+ * Reserve the receipt slot of a request that waits for the draw tick, as ScheduleDeferred does.
+ * @param request_id The request that reserves the slot.
+ * @return True iff the slot was reserved; false means the caller would answer `busy`.
+ */
+bool ReserveDeferredForTest(std::string request_id);
+
+/**
+ * The number of receipts the cache holds.
+ * @return The number of receipts.
+ */
+size_t ReceiptCountForTest();
+
+/**
+ * The number of requests that reserved a receipt slot for the draw tick.
+ * @return The number of reservations.
+ */
+size_t DeferredReservationCountForTest();
+
+/**
+ * Whether a replay of the request would be answered from a stored receipt.
+ * @param request_id The request to look up.
+ * @return True iff a receipt is stored for it.
+ */
+bool HasReceiptForTest(const std::string &request_id);
+
+/** Empty the receipt cache and the draw-tick reservations. */
+void ClearReceiptCacheForTest();
+
 } // namespace InGameAgent
 
 #endif /* AGENT_BRIDGE_H */

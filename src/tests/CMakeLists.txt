@@ -28,6 +28,7 @@ add_test_files(
     test_agent_company_economy.cpp
     test_agent_game_tools.cpp
     test_agent_pause_contract.cpp
+    test_agent_receipt_cache.cpp
     test_main.cpp
     test_network_crypto.cpp
     test_network_http.cpp
