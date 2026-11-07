@@ -1061,6 +1061,12 @@ bool DecodeOrder(const Json &value, Order &out, Json &normalized, std::string &e
 		OrderStopLocation stop_location = OrderStopLocation::NearEnd;
 		if (!DecodeArg(value["stop_location"], stop_location, ignored, error)) return false;
 		order.SetStopLocation(stop_location);
+	} else if (type == OT_GOTO_STATION) {
+		/* CmdInsertOrder only accepts the near end and the middle of a platform for trains, and the
+		 * engine's default stop location is the near end: a bus, tram, ship or aircraft order that
+		 * names no stop location would be refused. Ask for the far end, the value the order window
+		 * uses for every non-train, which is valid for trains too. */
+		order.SetStopLocation(OrderStopLocation::FarEnd);
 	}
 	if (value.contains("load")) {
 		OrderLoadType load = OrderLoadType::LoadIfPossible;
@@ -1097,6 +1103,11 @@ bool DecodeOrder(const Json &value, Order &out, Json &normalized, std::string &e
 	normalized = value;
 	if (needs_destination) normalized["destination_entity"] = destination_entity;
 	return true;
+}
+
+bool DecodeOrderForTest(const Json &value, Order &out, Json &normalized, std::string &error)
+{
+	return DecodeOrder(value, out, normalized, error);
 }
 
 /**

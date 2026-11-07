@@ -20,6 +20,7 @@
 #include "../core/backup_type.hpp"
 #include "../goal_base.h"
 #include "../goal_type.h"
+#include "../order_base.h"
 
 #include "../safeguards.h"
 
@@ -763,4 +764,36 @@ TEST_CASE("AgentCommandCatalogRunsDeityCommandsInTheDeityContext")
 
 	/* The case created one goal; remove it so the pool is as empty as it was. */
 	delete const_cast<Goal *>(goal);
+}
+
+TEST_CASE("AgentCommandCatalogDefaultsStationOrdersToTheFarEnd")
+{
+	Json normalized;
+	std::string error;
+
+	/* A station order that names no stop location has to ask for the far end: the engine's default is
+	 * the near end, and CmdInsertOrder refuses the near end and the middle of a platform for every
+	 * vehicle but a train, so a bus, tram, ship or aircraft order used to fail in game. */
+	Order order;
+	REQUIRE(DecodeOrderForTest(Json{{"type", "goto_station"}, {"destination", 5}}, order, normalized, error));
+	CHECK(order.GetType() == OT_GOTO_STATION);
+	CHECK(order.GetDestination().ToStationID().base() == 5);
+	CHECK(order.GetStopLocation() == OrderStopLocation::FarEnd);
+
+	/* An explicit stop location is still decoded as sent, so a train keeps the near end and the middle. */
+	order = Order{};
+	REQUIRE(DecodeOrderForTest(Json{{"type", "goto_station"}, {"destination", 5}, {"stop_location", 0}}, order, normalized, error));
+	CHECK(order.GetStopLocation() == OrderStopLocation::NearEnd);
+
+	order = Order{};
+	REQUIRE(DecodeOrderForTest(Json{{"type", "goto_station"}, {"destination", 5}, {"stop_location", 1}}, order, normalized, error));
+	CHECK(order.GetStopLocation() == OrderStopLocation::Middle);
+
+	order = Order{};
+	REQUIRE(DecodeOrderForTest(Json{{"type", "goto_station"}, {"destination", 5}, {"stop_location", 2}}, order, normalized, error));
+	CHECK(order.GetStopLocation() == OrderStopLocation::FarEnd);
+
+	/* A stop location that is not a number is still refused before anything is posted. */
+	order = Order{};
+	CHECK_FALSE(DecodeOrderForTest(Json{{"type", "goto_station"}, {"destination", 5}, {"stop_location", "far_end"}}, order, normalized, error));
 }

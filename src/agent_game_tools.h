@@ -21,6 +21,7 @@
 #include <optional>
 #include <string_view>
 
+struct Order;
 struct Vehicle;
 
 /** Game tool methods the agent bridge dispatches onto real OpenTTD commands. */
@@ -150,6 +151,18 @@ void AgentCloneVehicleCallback(Commands cmd, const CommandCost &result, VehicleI
  * @return The three fields.
  */
 Json VehicleRoadTypeFieldsForTest(const Vehicle *v);
+
+/**
+ * Build one order from the tool's order object, for the tests.
+ *
+ * The seam exists so a test can check the order the tool actually builds - and the values
+ * CmdInsertOrder validates it against - without a running game.
+ *
+ * @param entry The order object.
+ * @param order Receives the order.
+ * @return Error result, or an empty optional when the order was built.
+ */
+std::optional<Json> ReadOrderForTest(const Json &entry, Order &order);
 
 } // namespace InGameAgent
 

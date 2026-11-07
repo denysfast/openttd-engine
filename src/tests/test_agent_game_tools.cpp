@@ -22,6 +22,7 @@
 #include "../aircraft.h"
 #include "../cargotype.h"
 #include "../company_base.h"
+#include "../order_base.h"
 #include "../road.h"
 #include "../roadveh.h"
 #include "../train.h"
@@ -988,4 +989,50 @@ TEST_CASE("agent_game_tools: a vehicle row reports the real road type, not the v
 	CHECK(train_fields["road_type_id"].is_null());
 	CHECK(train_fields["road_type"].is_null());
 	CHECK(train_fields["is_tram"].is_null());
+}
+
+TEST_CASE("agent_game_tools: a station order the tool builds is one CmdInsertOrder accepts")
+{
+	/* Order::MakeGoToStation() leaves the stop location at the near end, which CmdInsertOrder
+	 * refuses for everything but a train; a bus, tram, ship or aircraft order built from it failed
+	 * with a bare command failure in game. The tool has to ask for the far end, the value the order
+	 * window uses for every non-train. */
+	Order order;
+	const std::optional<Json> error = ReadOrderForTest(Json{{"type", "station"}, {"id", 0}, {"load", "full"}, {"unload", "transfer"}}, order);
+	REQUIRE_FALSE(error.has_value());
+
+	CHECK(order.GetType() == OT_GOTO_STATION);
+	CHECK(order.GetStopLocation() == OrderStopLocation::FarEnd);
+	CHECK(order.GetDestination().ToStationID().base() == 0);
+
+	/* The rest of the order stays at the defaults CmdInsertOrder insists on, and the load/unload
+	 * behaviour the caller asked for survives. */
+	CHECK(order.GetRefitCargo() == CARGO_NO_REFIT);
+	CHECK(order.GetWaitTime() == 0);
+	CHECK(order.GetTravelTime() == 0);
+	CHECK(order.GetMaxSpeed() == UINT16_MAX);
+	CHECK(order.GetLoadType() == OrderLoadType::FullLoad);
+	CHECK(order.GetUnloadType() == OrderUnloadType::Transfer);
+
+	/* The far end is the only stop location CmdInsertOrder accepts for road, tram, ship and air, and
+	 * it accepts it for trains too. The bare MakeGoToStation() order the tool used to post carried the
+	 * near end, which the engine refuses for every non-train. */
+	Order bare;
+	bare.MakeGoToStation(StationID(0));
+	CHECK(bare.GetStopLocation() == OrderStopLocation::NearEnd);
+	CHECK(order.GetStopLocation() != bare.GetStopLocation());
+}
+
+TEST_CASE("agent_game_tools: a station order with unusable parameters is still refused")
+{
+	Order order;
+
+	/* The fix only adds the stop location; every argument error the tool already reported stays. */
+	CHECK(ReadOrderForTest(Json{{"type", "station"}}, order).has_value());
+	CHECK(ReadOrderForTest(Json{{"type", "station"}, {"id", -1}}, order).has_value());
+	CHECK(ReadOrderForTest(Json{{"type", "station"}, {"id", "zero"}}, order).has_value());
+	CHECK(ReadOrderForTest(Json{{"type", "station"}, {"id", 0}, {"load", "bogus"}}, order).has_value());
+	CHECK(ReadOrderForTest(Json{{"type", "station"}, {"id", 0}, {"unload", "bogus"}}, order).has_value());
+	CHECK(ReadOrderForTest(Json{{"type", "station"}, {"id", 0}, {"refit_cargo_id", static_cast<int64_t>(NUM_CARGO)}}, order).has_value());
+	CHECK(ReadOrderForTest(Json{{"type", "platform"}, {"id", 0}}, order).has_value());
 }

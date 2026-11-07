@@ -218,6 +218,8 @@
  * `world.command` is already classified as a write by the bridge (`IsMutation`), the catalog reads
  * run in parallel with the other read methods.
  */
+struct Order;
+
 namespace InGameAgent {
 
 /** JSON value type used by the agent tool protocol. */
@@ -270,6 +272,20 @@ std::optional<Json> DispatchCommandCatalog(std::string_view method, const Json &
  * @param tile Location the command was posted for.
  */
 void AgentCommandCatalogCallback(Commands cmd, const CommandCost &result, TileIndex tile);
+
+/**
+ * Decode one Order from its catalog JSON, for the tests.
+ *
+ * The seam exists so a test can check the order the catalog actually builds - the packed type and
+ * flags bytes the engine validates in CmdInsertOrder - without a running game.
+ *
+ * @param value The order JSON.
+ * @param out Receives the order.
+ * @param normalized Receives the order as the catalog reports it back.
+ * @param error Receives the reason when the value is rejected.
+ * @return True when the order was decoded.
+ */
+bool DecodeOrderForTest(const Json &value, Order &out, Json &normalized, std::string &error);
 
 } // namespace InGameAgent
 

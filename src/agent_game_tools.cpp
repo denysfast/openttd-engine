@@ -2397,6 +2397,12 @@ std::optional<Json> ReadOrder(const Json &entry, Order &order)
 		if (const std::optional<Json> error = ReadPoolIdParam(entry, "id", station); error.has_value()) return error;
 		if (type == "station") {
 			order.MakeGoToStation(station);
+			/* CmdInsertOrder only accepts the near end and the middle of a platform for trains, and
+			 * MakeGoToStation() leaves the stop location at the near end: a bus, tram, ship or
+			 * aircraft order built here would be refused with a bare command failure. Ask for the
+			 * far end, the value the order window uses for every non-train and the one old savegames
+			 * are given, which is valid for trains too. */
+			order.SetStopLocation(OrderStopLocation::FarEnd);
 		} else {
 			order.MakeGoToWaypoint(station);
 		}
@@ -2445,6 +2451,11 @@ std::optional<Json> ReadOrder(const Json &entry, Order &order)
 	if (refit_cargo != INVALID_CARGO) order.SetRefit(refit_cargo);
 
 	return std::nullopt;
+}
+
+std::optional<Json> ReadOrderForTest(const Json &entry, Order &order)
+{
+	return ReadOrder(entry, order);
 }
 
 /**
