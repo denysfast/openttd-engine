@@ -10,9 +10,11 @@
 #include "stdafx.h"
 #include "agent_game_tools.h"
 
+#include "articulated_vehicles.h"
 #include "command_func.h"
 #include "company_base.h"
 #include "depot_base.h"
+#include "depot_map.h"
 #include "direction_type.h"
 #include "engine_base.h"
 #include "group_cmd.h"
@@ -28,9 +30,12 @@
 #include "station_cmd.h"
 #include "station_type.h"
 #include "strings_func.h"
+#include "timetable_cmd.h"
 #include "vehicle_base.h"
 #include "vehicle_cmd.h"
+#include "vehicle_func.h"
 #include "vehiclelist.h"
+#include "waypoint_base.h"
 
 #include <vector>
 
@@ -51,8 +56,11 @@ namespace {
 struct PostedCommand {
 	bool captured = false; ///< The engine reported a result, so the command really ran.
 	CommandCost cost; ///< Actual cost, or the failure of the command.
-	VehicleID vehicle = VehicleID::Invalid(); ///< Vehicle created by `Commands::BuildVehicle`.
+	VehicleID vehicle = VehicleID::Invalid(); ///< Vehicle created by `Commands::BuildVehicle` or `Commands::CloneVehicle`.
 	GroupID group = GroupID::Invalid(); ///< Group a vehicle ended up in.
+	uint refit_capacity = 0; ///< Capacity of a refitted consist for the new cargo.
+	uint16_t mail_capacity = 0; ///< Secondary (mail) capacity of a refitted aircraft.
+	CargoArray cargo_capacities{}; ///< Capacities of a refitted consist per cargo.
 };
 
 /** Capture slot of the command that is currently being posted. */
@@ -78,6 +86,22 @@ void AgentAddVehicleToGroupCallback(Commands, const CommandCost &result, GroupID
 	_posted.captured = true;
 	_posted.cost = result;
 	_posted.group = group_id;
+}
+
+void AgentRefitVehicleCallback(Commands, const CommandCost &result, uint refit_capacity, uint16_t mail_capacity, CargoArray cargo_capacities)
+{
+	_posted.captured = true;
+	_posted.cost = result;
+	_posted.refit_capacity = refit_capacity;
+	_posted.mail_capacity = mail_capacity;
+	_posted.cargo_capacities = cargo_capacities;
+}
+
+void AgentCloneVehicleCallback(Commands, const CommandCost &result, VehicleID veh_id)
+{
+	_posted.captured = true;
+	_posted.cost = result;
+	_posted.vehicle = veh_id;
 }
 
 namespace {
@@ -367,6 +391,76 @@ bool ReadOptionalBool(const Json &params, const char *key, bool &value)
 	return true;
 }
 
+/**
+ * Read a cargo id parameter and check it against the cargo types of the game.
+ * @param params Method parameters.
+ * @param key Parameter name.
+ * @param cargo Receives the cargo type.
+ * @return Error result, or an empty optional when the parameter is absent or a valid cargo.
+ */
+std::optional<Json> ReadCargoId(const Json &params, const char *key, CargoType &cargo)
+{
+	if (!params.contains(key)) return std::nullopt;
+	int64_t cargo_id = 0;
+	if (!ReadOptionalInt(params, key, cargo_id)) return MakeError("invalid_arguments", std::string(key) + " must be an integer");
+	if (cargo_id < 0 || cargo_id >= static_cast<int64_t>(NUM_CARGO)) {
+		Json detail = Json::object();
+		detail["cargo_id"] = cargo_id;
+		detail["max"] = NUM_CARGO - 1;
+		return MakeError("invalid_arguments", "cargo_id is not a cargo", std::move(detail));
+	}
+	cargo = static_cast<CargoType>(static_cast<uint8_t>(cargo_id));
+	return std::nullopt;
+}
+
+/**
+ * Reject parameters the op does not read, so nothing is silently ignored.
+ *
+ * `op`, `kind`, `company_id` and `expected_refs` belong to the family or to the parent bridge and
+ * are accepted everywhere; `expected_refs` is validated by the bridge before the call is
+ * dispatched, never here.
+ *
+ * @param params Method parameters.
+ * @param method Engine method name, used in the error message.
+ * @param op Op or kind that is being dispatched.
+ * @param known Parameters the op actually reads.
+ * @return Error result, or an empty optional when every parameter is read.
+ */
+std::optional<Json> CheckKnownParams(const Json &params, std::string_view method, std::string_view op, std::initializer_list<std::string_view> known)
+{
+	static constexpr std::string_view common[] = {"op", "kind", "company_id", "expected_refs"};
+
+	Json unknown = Json::array();
+	for (const auto &item : params.items()) {
+		const std::string &key = item.key();
+		bool found = false;
+		for (const std::string_view name : common) {
+			if (key == name) {
+				found = true;
+				break;
+			}
+		}
+		if (!found) {
+			for (const std::string_view name : known) {
+				if (key == name) {
+					found = true;
+					break;
+				}
+			}
+		}
+		if (!found) unknown.push_back(key);
+	}
+	if (unknown.empty()) return std::nullopt;
+
+	Json detail = Json::object();
+	detail["method"] = std::string(method);
+	detail["op"] = std::string(op);
+	detail["unknown"] = std::move(unknown);
+	detail["supported"] = Json::array();
+	for (const std::string_view name : known) detail["supported"].push_back(std::string(name));
+	return MakeError("invalid_arguments", "parameter is not read by this op", std::move(detail));
+}
+
 /** A tile as sent by the backend, before it is checked against the map. */
 struct RawTile {
 	int64_t x; ///< X coordinate on the map.
@@ -414,6 +508,47 @@ Json TileJson(TileIndex tile)
 	result["x"] = TileX(tile);
 	result["y"] = TileY(tile);
 	return result;
+}
+
+/**
+ * Generation of a pooled object, when the pool tracks one.
+ *
+ * The bridge kernel gives every pooled object a generation counter, so a typed reference can name
+ * the lifetime of the object it was read from and an id that was deleted and reused is reported
+ * as stale instead of being resolved to the new object. This module is also compiled against trees
+ * that do not have the counter yet; it then reports 0, which the kernel reads as "no generation".
+ *
+ * @param item The pooled object.
+ * @return The generation of the object, or 0 when the pool does not track one.
+ */
+template <typename Titem>
+uint64_t ItemGeneration(const Titem *item)
+{
+	if constexpr (requires { item->generation; }) {
+		return item->generation;
+	} else {
+		return 0;
+	}
+}
+
+/**
+ * Serialise a typed reference to a pooled object.
+ *
+ * The reference is the protocol shape `{type, id, generation}`; the world id and the epoch are the
+ * outer world binding the bridge adds around a whole result, not part of a single reference.
+ *
+ * @param type Protocol name of the object type.
+ * @param item The pooled object.
+ * @return JSON reference with the type, the id and the generation.
+ */
+template <typename Titem>
+Json PoolRef(std::string_view type, const Titem *item)
+{
+	Json ref = Json::object();
+	ref["type"] = std::string(type);
+	ref["id"] = item->index.base();
+	ref["generation"] = ItemGeneration(item);
+	return ref;
 }
 
 /**
@@ -513,6 +648,161 @@ bool ReadDiagDirection(const Json &params, DiagDirection &dir)
 /* -- read-only inventory ----------------------------------------------------------------- */
 
 /**
+ * Map the state of a vehicle onto the protocol name.
+ * @param v The vehicle.
+ * @return Protocol name of the state the vehicle is in.
+ */
+std::string_view VehicleStatusName(const Vehicle *v)
+{
+	if (v->vehstatus.Test(VehState::Crashed)) return "crashed";
+	if (v->breakdown_ctr == 1) return "broken_down";
+	if (v->vehstatus.Test(VehState::Stopped)) return v->IsStoppedInDepot() ? "in_depot" : "stopped";
+	if (v->current_order.IsType(OT_LOADING)) return "loading";
+	return "travelling";
+}
+
+/**
+ * Map an order type onto the protocol name.
+ * @param type The order type.
+ * @return Protocol name of the order type.
+ */
+std::string_view OrderTypeName(OrderType type)
+{
+	switch (type) {
+		case OT_GOTO_STATION: return "station";
+		case OT_GOTO_DEPOT: return "depot";
+		case OT_GOTO_WAYPOINT: return "waypoint";
+		case OT_CONDITIONAL: return "conditional";
+		case OT_IMPLICIT: return "implicit";
+		case OT_LOADING: return "loading";
+		case OT_LEAVESTATION: return "leave_station";
+		case OT_DUMMY: return "dummy";
+		default: return "nothing";
+	}
+}
+
+/**
+ * Map a load behaviour onto the protocol name.
+ * @param type The load behaviour.
+ * @return Protocol name of the load behaviour.
+ */
+std::string_view LoadTypeName(OrderLoadType type)
+{
+	switch (type) {
+		case OrderLoadType::FullLoad: return "full";
+		case OrderLoadType::FullLoadAny: return "any";
+		case OrderLoadType::NoLoad: return "none";
+		default: return "if_possible";
+	}
+}
+
+/**
+ * Map an unload behaviour onto the protocol name.
+ * @param type The unload behaviour.
+ * @return Protocol name of the unload behaviour.
+ */
+std::string_view UnloadTypeName(OrderUnloadType type)
+{
+	switch (type) {
+		case OrderUnloadType::Unload: return "all";
+		case OrderUnloadType::Transfer: return "transfer";
+		case OrderUnloadType::NoUnload: return "none";
+		default: return "if_possible";
+	}
+}
+
+/**
+ * Map the non-stop flags of an order onto the protocol name.
+ * @param flags The non-stop flags.
+ * @return Protocol name of the non-stop behaviour.
+ */
+std::string_view NonStopName(OrderNonStopFlags flags)
+{
+	if (flags.Test(OrderNonStopFlag::GoVia)) return "via";
+	if (flags.Test(OrderNonStopFlag::NonStop)) return "non_stop";
+	return "none";
+}
+
+/**
+ * Map the stop location of an order onto the protocol name.
+ * @param location The stop location.
+ * @return Protocol name of the stop location.
+ */
+std::string_view StopLocationName(OrderStopLocation location)
+{
+	switch (location) {
+		case OrderStopLocation::Middle: return "middle";
+		case OrderStopLocation::FarEnd: return "far_end";
+		default: return "near_end";
+	}
+}
+
+/**
+ * Map the depot action of an order onto the protocol name.
+ * @param flags The depot action flags.
+ * @return Protocol name of the depot action.
+ */
+std::string_view DepotActionName(OrderDepotActionFlags flags)
+{
+	if (flags.Test(OrderDepotActionFlag::Unbunch)) return "unbunch";
+	if (flags.Test(OrderDepotActionFlag::NearestDepot)) return "nearest_depot";
+	return "halt";
+}
+
+/**
+ * Serialise the cargo a vehicle carries, with the capacity it has for that cargo.
+ * @param v The vehicle.
+ * @return JSON object with the cargo type, subtype, load and capacity.
+ */
+Json VehicleCargoJson(const Vehicle *v)
+{
+	Json cargo = Json::object();
+	cargo["type"] = static_cast<uint8_t>(v->cargo_type);
+	cargo["subtype"] = v->cargo_subtype;
+	cargo["load"] = v->cargo.TotalCount();
+	cargo["capacity"] = v->cargo_cap;
+	return cargo;
+}
+
+/**
+ * Union of the refit masks of every part of a vehicle chain.
+ *
+ * `Commands::RefitVehicle` refits the whole chain, and a train wagon or an articulated part may be
+ * refittable to a cargo the front engine is not, so the compatibility check has to look at the
+ * whole consist instead of the vehicle that was named.
+ *
+ * @param v The vehicle.
+ * @return Cargo types at least one part of the chain can be refitted to.
+ */
+CargoTypes ConsistRefitMasks(const Vehicle *v)
+{
+	CargoTypes masks{};
+	for (const Vehicle *part = v->First(); part != nullptr; part = part->Next()) {
+		masks.Set(GetUnionOfArticulatedRefitMasks(part->engine_type, true));
+	}
+	return masks;
+}
+
+/**
+ * Serialise the order a vehicle is currently executing.
+ * @param v The vehicle.
+ * @return JSON object with the order type and its destination.
+ */
+Json CurrentOrderJson(const Vehicle *v)
+{
+	const Order &order = v->current_order;
+	Json current = Json::object();
+	current["type"] = std::string(OrderTypeName(order.GetType()));
+	current["index"] = v->cur_real_order_index;
+	if (order.IsType(OT_GOTO_STATION) || order.IsType(OT_GOTO_WAYPOINT) || order.IsType(OT_GOTO_DEPOT) || order.IsType(OT_LOADING)) {
+		current["destination_id"] = order.GetDestination().base();
+	} else {
+		current["destination_id"] = nullptr;
+	}
+	return current;
+}
+
+/**
  * Serialise one vehicle.
  * @param v The vehicle.
  * @return JSON row with the current state of the vehicle.
@@ -520,26 +810,50 @@ bool ReadDiagDirection(const Json &params, DiagDirection &dir)
 Json VehicleRow(const Vehicle *v)
 {
 	Json row = Json::object();
+	row["ref"] = PoolRef("vehicle", v);
 	row["id"] = v->index.base();
 	row["type"] = std::string(VehicleTypeName(v->type));
 	row["owner"] = v->owner.base();
 	row["name"] = v->name;
+	row["unit_number"] = v->unitnumber;
 	row["engine_id"] = v->engine_type.base();
+	const Engine *engine = Engine::GetIfValid(v->engine_type);
+	if (engine != nullptr) row["engine_ref"] = PoolRef("engine", engine);
 	row["tile"] = TileJson(v->tile);
+	row["status"] = std::string(VehicleStatusName(v));
 	row["stopped"] = v->vehstatus.Test(VehState::Stopped);
+	row["in_depot"] = v->IsStoppedInDepot();
+	row["crashed"] = v->vehstatus.Test(VehState::Crashed);
+	row["broken_down"] = v->breakdown_ctr == 1;
 	row["speed"] = v->cur_speed;
+	row["max_speed"] = v->GetDisplayMaxSpeed();
+	row["age_days"] = v->age.base();
+	row["max_age_days"] = v->max_age.base();
+	row["reliability"] = v->reliability;
+	row["breakdowns_since_last_service"] = v->breakdowns_since_last_service;
+	row["service_interval"] = v->GetServiceInterval();
+	row["profit_this_year"] = static_cast<int64_t>(v->GetDisplayProfitThisYear());
 	row["profit_last_year"] = static_cast<int64_t>(v->GetDisplayProfitLastYear());
+	row["value"] = static_cast<int64_t>(v->value);
+	row["group_id"] = v->group_id == GroupID::Invalid() ? Json(nullptr) : Json(v->group_id.base());
+	row["orders"] = v->GetNumOrders();
+	row["cargo"] = VehicleCargoJson(v);
+	row["current_order"] = CurrentOrderJson(v);
+	row["last_station_id"] = v->last_station_visited == StationID::Invalid() ? Json(nullptr) : Json(v->last_station_visited.base());
+	row["last_loading_station_id"] = v->last_loading_station == StationID::Invalid() ? Json(nullptr) : Json(v->last_loading_station.base());
 	return row;
 }
 
 /**
  * Serialise one engine.
  * @param e The engine.
+ * @param company Company the availability is reported for, or an invalid company to omit it.
  * @return JSON row with the purchase data of the engine.
  */
-Json EngineRow(const Engine *e)
+Json EngineRow(const Engine *e, CompanyID company)
 {
 	Json row = Json::object();
+	row["ref"] = PoolRef("engine", e);
 	row["id"] = e->index.base();
 	row["type"] = std::string(VehicleTypeName(e->type));
 	row["name"] = e->name;
@@ -547,35 +861,260 @@ Json EngineRow(const Engine *e)
 	row["running_cost"] = static_cast<int64_t>(e->GetRunningCost());
 	row["max_speed"] = e->GetDisplayMaxSpeed();
 	row["cargo_id"] = static_cast<uint8_t>(e->GetDefaultCargoType());
+	row["capacity"] = e->GetDisplayDefaultCapacity();
+	row["refittable"] = e->info.refit_mask.Any();
+	row["refit_cargo_ids"] = Json::array();
+	for (const CargoType cargo : e->info.refit_mask) row["refit_cargo_ids"].push_back(static_cast<uint8_t>(cargo));
+	row["intro_date"] = e->intro_date.base();
+	row["life_length_days"] = e->GetLifeLengthInDays().base();
+	row["reliability"] = e->reliability;
+	row["enabled"] = e->IsEnabled();
+	if (e->IsGroundVehicle()) {
+		row["power"] = e->GetPower();
+		row["weight"] = e->GetDisplayWeight();
+		row["tractive_effort"] = e->GetDisplayMaxTractiveEffort();
+	}
+	if (company != CompanyID::Invalid()) row["available"] = e->company_avail.Test(company);
 	return row;
 }
 
 /**
- * Read the vehicle inventory.
- * @param params Method parameters: `limit`, `offset`, `company_id`.
- * @param company Company of the call, used when `company_id` is absent.
- * @return Tool result with the matching rows and the total count.
+ * Serialise the destination of a goto order as a typed reference.
+ * @param order The order.
+ * @return Reference to the station, waypoint or depot, or null for other orders.
  */
-Json QueryVehicles(const Json &params, CompanyID company)
+Json OrderDestinationRef(const Order *order)
 {
-	int64_t limit = 100;
-	int64_t offset = 0;
-	int64_t company_id = 0;
+	if (order->IsType(OT_GOTO_STATION)) {
+		const Station *st = Station::GetIfValid(order->GetDestination().ToStationID());
+		return st == nullptr ? Json(nullptr) : PoolRef("station", st);
+	}
+	if (order->IsType(OT_GOTO_WAYPOINT)) {
+		const Waypoint *wp = Waypoint::GetIfValid(order->GetDestination().ToStationID());
+		return wp == nullptr ? Json(nullptr) : PoolRef("waypoint", wp);
+	}
+	if (order->IsType(OT_GOTO_DEPOT)) {
+		const Depot *depot = Depot::GetIfValid(order->GetDestination().ToDepotID());
+		return depot == nullptr ? Json(nullptr) : PoolRef("depot", depot);
+	}
+	return Json(nullptr);
+}
+
+/**
+ * Serialise one order of a vehicle.
+ * @param v The vehicle the order belongs to.
+ * @param index Index of the order in the order list.
+ * @param order The order.
+ * @return JSON row with the order and its timetable.
+ */
+Json OrderRow(const Vehicle *v, VehicleOrderID index, const Order *order)
+{
+	Json row = Json::object();
+	row["vehicle_ref"] = PoolRef("vehicle", v);
+	row["vehicle_id"] = v->index.base();
+	row["index"] = index;
+	row["type"] = std::string(OrderTypeName(order->GetType()));
+	if (order->IsType(OT_GOTO_STATION) || order->IsType(OT_GOTO_WAYPOINT) || order->IsType(OT_GOTO_DEPOT)) {
+		row["destination_id"] = order->GetDestination().base();
+		row["destination_ref"] = OrderDestinationRef(order);
+	} else {
+		row["destination_id"] = nullptr;
+		row["destination_ref"] = nullptr;
+	}
+	row["load"] = std::string(LoadTypeName(order->GetLoadType()));
+	row["unload"] = std::string(UnloadTypeName(order->GetUnloadType()));
+	row["refit_cargo_id"] = order->IsRefit() ? Json(static_cast<uint8_t>(order->GetRefitCargo())) : Json(nullptr);
+	row["wait_time"] = order->GetWaitTime();
+	row["travel_time"] = order->GetTravelTime();
+	row["max_speed"] = order->GetMaxSpeed();
+	row["wait_timetabled"] = order->IsWaitTimetabled();
+	row["travel_timetabled"] = order->IsTravelTimetabled();
+	row["non_stop"] = std::string(NonStopName(order->GetNonStopType()));
+	row["stop_location"] = std::string(StopLocationName(order->GetStopLocation()));
+	row["depot_action"] = std::string(DepotActionName(order->GetDepotActionType()));
+	return row;
+}
+
+/** Filters of a `world.query` call, already validated. */
+struct QueryFilters {
+	CompanyID company = CompanyID::Invalid(); ///< Restrict to one company.
+	std::optional<VehicleType> vehicle_type; ///< Restrict to one vehicle type.
+	VehicleID vehicle_id = VehicleID::Invalid(); ///< Restrict to one vehicle.
+	EngineID engine_id = EngineID::Invalid(); ///< Restrict to one engine model.
+	CargoType cargo = INVALID_CARGO; ///< Restrict to vehicles carrying this cargo, or engines that can carry it.
+	std::string name_contains; ///< Restrict to names containing this text.
+	std::optional<bool> in_depot; ///< Restrict to vehicles inside or outside a depot.
+	std::optional<bool> stopped; ///< Restrict to stopped or running vehicles.
+	std::optional<bool> refittable; ///< Restrict to refittable or non-refittable engines.
+};
+
+/**
+ * Read a company id value without truncating it to the width of a company id.
+ *
+ * A plain `static_cast<uint8_t>` would silently turn 300 into 44 and read another company's rows;
+ * an id that does not fit is rejected instead.
+ *
+ * @param value JSON value holding the company id.
+ * @param company Receives the company id.
+ * @return Error result, or an empty optional when the value is a company id.
+ */
+std::optional<Json> ReadCompanyIdValue(const Json &value, CompanyID &company)
+{
+	if (!value.is_number_integer()) return MakeError("invalid_arguments", "company_id must be an integer");
+	const int64_t company_id = value.get<int64_t>();
+	if (company_id < 0 || company_id > UINT8_MAX) {
+		Json detail = Json::object();
+		detail["company_id"] = company_id;
+		detail["max"] = UINT8_MAX;
+		return MakeError("invalid_arguments", "company_id does not fit in a company id", std::move(detail));
+	}
+	company = CompanyID(static_cast<uint8_t>(company_id));
+	return std::nullopt;
+}
+
+/**
+ * Read the `filters` object of a `world.query` call.
+ *
+ * Every filter name is checked against the ones the kind understands, so a filter that would
+ * not be applied is an error instead of being silently dropped.
+ *
+ * @param params Method parameters.
+ * @param kind Query kind, used in the error message.
+ * @param allowed Filter names this kind understands.
+ * @param filters Receives the filters.
+ * @return Error result, or an empty optional when the filters are usable.
+ */
+std::optional<Json> ReadQueryFilters(const Json &params, std::string_view kind, std::initializer_list<std::string_view> allowed, QueryFilters &filters)
+{
+	const auto it = params.find("filters");
+	if (it == params.end()) return std::nullopt;
+	if (!it->is_object()) return MakeError("invalid_arguments", "filters must be an object");
+
+	for (const auto &item : it->items()) {
+		const std::string &key = item.key();
+		const Json &value = item.value();
+
+		bool known = false;
+		for (const std::string_view name : allowed) {
+			if (key == name) {
+				known = true;
+				break;
+			}
+		}
+		if (!known) {
+			Json detail = Json::object();
+			detail["kind"] = std::string(kind);
+			detail["filter"] = key;
+			detail["supported"] = Json::array();
+			for (const std::string_view name : allowed) detail["supported"].push_back(std::string(name));
+			return MakeError("invalid_arguments", "filter is not read by this query kind", std::move(detail));
+		}
+
+		if (key == "company_id") {
+			if (const std::optional<Json> error = ReadCompanyIdValue(value, filters.company); error.has_value()) return error;
+		} else if (key == "vehicle_type") {
+			if (!value.is_string()) return MakeError("invalid_arguments", "filters.vehicle_type must be a string");
+			const std::string name = value.get<std::string>();
+			if (name == "train") {
+				filters.vehicle_type = VehicleType::Train;
+			} else if (name == "road") {
+				filters.vehicle_type = VehicleType::Road;
+			} else if (name == "ship") {
+				filters.vehicle_type = VehicleType::Ship;
+			} else if (name == "aircraft") {
+				filters.vehicle_type = VehicleType::Aircraft;
+			} else {
+				return MakeError("invalid_arguments", "filters.vehicle_type must be one of train, road, ship, aircraft");
+			}
+		} else if (key == "vehicle_id") {
+			if (!value.is_number_integer()) return MakeError("invalid_arguments", "filters.vehicle_id must be an integer");
+			filters.vehicle_id = VehicleID(static_cast<uint32_t>(value.get<int64_t>()));
+		} else if (key == "engine_id") {
+			if (!value.is_number_integer()) return MakeError("invalid_arguments", "filters.engine_id must be an integer");
+			filters.engine_id = EngineID(static_cast<uint16_t>(value.get<int64_t>()));
+		} else if (key == "cargo_id") {
+			if (!value.is_number_integer()) return MakeError("invalid_arguments", "filters.cargo_id must be an integer");
+			const int64_t cargo_id = value.get<int64_t>();
+			if (cargo_id < 0 || cargo_id >= static_cast<int64_t>(NUM_CARGO)) {
+				Json detail = Json::object();
+				detail["cargo_id"] = cargo_id;
+				detail["max"] = NUM_CARGO - 1;
+				return MakeError("invalid_arguments", "filters.cargo_id is not a cargo", std::move(detail));
+			}
+			filters.cargo = static_cast<CargoType>(static_cast<uint8_t>(cargo_id));
+		} else if (key == "name_contains") {
+			if (!value.is_string()) return MakeError("invalid_arguments", "filters.name_contains must be a string");
+			filters.name_contains = value.get<std::string>();
+		} else if (key == "in_depot") {
+			if (!value.is_boolean()) return MakeError("invalid_arguments", "filters.in_depot must be a boolean");
+			filters.in_depot = value.get<bool>();
+		} else if (key == "stopped") {
+			if (!value.is_boolean()) return MakeError("invalid_arguments", "filters.stopped must be a boolean");
+			filters.stopped = value.get<bool>();
+		} else if (key == "refittable") {
+			if (!value.is_boolean()) return MakeError("invalid_arguments", "filters.refittable must be a boolean");
+			filters.refittable = value.get<bool>();
+		}
+	}
+	return std::nullopt;
+}
+
+/**
+ * Read the pagination and company parameters shared by every query kind.
+ *
+ * A top-level `company_id` wins over `filters.company_id`, and the company of the call is used
+ * when neither is given.
+ *
+ * @param params Method parameters.
+ * @param company Company of the call.
+ * @param filters Receives the company filter.
+ * @param limit Receives the row limit.
+ * @param offset Receives the row offset.
+ * @return Error result, or an empty optional when the parameters are usable.
+ */
+std::optional<Json> ReadQueryPaging(const Json &params, CompanyID company, QueryFilters &filters, int64_t &limit, int64_t &offset)
+{
+	limit = 100;
+	offset = 0;
 	if (!ReadOptionalInt(params, "limit", limit)) return MakeError("invalid_arguments", "limit must be an integer");
 	if (!ReadOptionalInt(params, "offset", offset)) return MakeError("invalid_arguments", "offset must be an integer");
 	if (limit < 1) limit = 1;
 	if (offset < 0) offset = 0;
 
-	CompanyID filter = company;
-	if (params.contains("company_id")) {
-		if (!ReadOptionalInt(params, "company_id", company_id)) return MakeError("invalid_arguments", "company_id must be an integer");
-		filter = CompanyID(static_cast<uint8_t>(company_id));
+	const auto company_param = params.find("company_id");
+	if (company_param != params.end()) {
+		if (const std::optional<Json> error = ReadCompanyIdValue(*company_param, filters.company); error.has_value()) return error;
 	}
+	if (filters.company == CompanyID::Invalid()) filters.company = company;
+	return std::nullopt;
+}
+
+/**
+ * Read the vehicle inventory.
+ * @param params Method parameters: `limit`, `offset`, `company_id`, `filters`.
+ * @param company Company of the call, used when no company filter is given.
+ * @return Tool result with the matching rows and the total count.
+ */
+Json QueryVehicles(const Json &params, CompanyID company)
+{
+	QueryFilters filters;
+	if (const std::optional<Json> error = ReadQueryFilters(params, "vehicles",
+			{"company_id", "vehicle_type", "vehicle_id", "cargo_id", "name_contains", "in_depot", "stopped"}, filters); error.has_value()) return *error;
+
+	int64_t limit = 0;
+	int64_t offset = 0;
+	if (const std::optional<Json> error = ReadQueryPaging(params, company, filters, limit, offset); error.has_value()) return *error;
 
 	Json rows = Json::array();
 	int64_t total = 0;
 	for (const Vehicle *v : Vehicle::Iterate()) {
-		if (filter != CompanyID::Invalid() && v->owner != filter) continue;
+		if (filters.company != CompanyID::Invalid() && v->owner != filters.company) continue;
+		if (filters.vehicle_type.has_value() && v->type != *filters.vehicle_type) continue;
+		if (filters.vehicle_id != VehicleID::Invalid() && v->index != filters.vehicle_id) continue;
+		if (IsValidCargoType(filters.cargo) && v->cargo_type != filters.cargo) continue;
+		if (!filters.name_contains.empty() && v->name.find(filters.name_contains) == std::string::npos) continue;
+		if (filters.in_depot.has_value() && v->IsStoppedInDepot() != *filters.in_depot) continue;
+		if (filters.stopped.has_value() && v->vehstatus.Test(VehState::Stopped) != *filters.stopped) continue;
 		if (total++ < offset) continue;
 		if (static_cast<int64_t>(rows.size()) >= limit) continue;
 		rows.push_back(VehicleRow(v));
@@ -591,33 +1130,75 @@ Json QueryVehicles(const Json &params, CompanyID company)
 
 /**
  * Read the engine inventory.
- * @param params Method parameters: `limit`, `offset`, `vehicle_type`.
+ * @param params Method parameters: `limit`, `offset`, `company_id`, `filters`.
+ * @param company Company of the call, used for the availability flag.
  * @return Tool result with the matching rows and the total count.
  */
-Json QueryEngines(const Json &params)
+Json QueryEngines(const Json &params, CompanyID company)
 {
-	int64_t limit = 100;
-	int64_t offset = 0;
-	if (!ReadOptionalInt(params, "limit", limit)) return MakeError("invalid_arguments", "limit must be an integer");
-	if (!ReadOptionalInt(params, "offset", offset)) return MakeError("invalid_arguments", "offset must be an integer");
-	if (limit < 1) limit = 1;
-	if (offset < 0) offset = 0;
+	QueryFilters filters;
+	if (const std::optional<Json> error = ReadQueryFilters(params, "engines",
+			{"company_id", "vehicle_type", "engine_id", "cargo_id", "name_contains", "refittable"}, filters); error.has_value()) return *error;
 
-	std::string type_filter;
-	if (!ReadOptionalString(params, "vehicle_type", type_filter)) return MakeError("invalid_arguments", "vehicle_type must be a string");
+	int64_t limit = 0;
+	int64_t offset = 0;
+	if (const std::optional<Json> error = ReadQueryPaging(params, company, filters, limit, offset); error.has_value()) return *error;
 
 	Json rows = Json::array();
 	int64_t total = 0;
 	for (const Engine *e : Engine::Iterate()) {
-		if (!type_filter.empty() && VehicleTypeName(e->type) != type_filter) continue;
+		if (filters.vehicle_type.has_value() && e->type != *filters.vehicle_type) continue;
+		if (filters.engine_id != EngineID::Invalid() && e->index != filters.engine_id) continue;
+		if (IsValidCargoType(filters.cargo) && e->GetDefaultCargoType() != filters.cargo && !e->info.refit_mask.Test(filters.cargo)) continue;
+		if (!filters.name_contains.empty() && e->name.find(filters.name_contains) == std::string::npos) continue;
+		if (filters.refittable.has_value() && e->info.refit_mask.Any() != *filters.refittable) continue;
 		if (total++ < offset) continue;
 		if (static_cast<int64_t>(rows.size()) >= limit) continue;
-		rows.push_back(EngineRow(e));
+		rows.push_back(EngineRow(e, filters.company));
 	}
 
 	Json result = Json::object();
 	result["ok"] = true;
 	result["kind"] = "engines";
+	result["rows"] = std::move(rows);
+	result["total"] = total;
+	return result;
+}
+
+/**
+ * Read the order lists of the vehicles of a company.
+ * @param params Method parameters: `limit`, `offset`, `company_id`, `filters`.
+ * @param company Company of the call, used when no company filter is given.
+ * @return Tool result with one row per order and the total count.
+ */
+Json QueryOrders(const Json &params, CompanyID company)
+{
+	QueryFilters filters;
+	if (const std::optional<Json> error = ReadQueryFilters(params, "orders",
+			{"company_id", "vehicle_id"}, filters); error.has_value()) return *error;
+
+	int64_t limit = 0;
+	int64_t offset = 0;
+	if (const std::optional<Json> error = ReadQueryPaging(params, company, filters, limit, offset); error.has_value()) return *error;
+
+	Json rows = Json::array();
+	int64_t total = 0;
+	for (const Vehicle *v : Vehicle::Iterate()) {
+		if (!v->IsPrimaryVehicle()) continue;
+		if (filters.company != CompanyID::Invalid() && v->owner != filters.company) continue;
+		if (filters.vehicle_id != VehicleID::Invalid() && v->index != filters.vehicle_id) continue;
+		for (VehicleOrderID index = 0; index < v->GetNumOrders(); index++) {
+			const Order *order = v->GetOrder(index);
+			if (order == nullptr) continue;
+			if (total++ < offset) continue;
+			if (static_cast<int64_t>(rows.size()) >= limit) continue;
+			rows.push_back(OrderRow(v, index, order));
+		}
+	}
+
+	Json result = Json::object();
+	result["ok"] = true;
+	result["kind"] = "orders";
 	result["rows"] = std::move(rows);
 	result["total"] = total;
 	return result;
@@ -959,7 +1540,10 @@ Json VehicleBuild(const Json &params, CompanyID company)
 		return MakeError("invalid_arguments", "share_orders_from must be an integer");
 	}
 
-	if (const std::optional<Json> error = CheckWriteContext(company, false); error.has_value()) return *error;
+	bool dry_run = false;
+	if (!ReadOptionalBool(params, "dry_run", dry_run)) return MakeError("invalid_arguments", "dry_run must be a boolean");
+
+	if (const std::optional<Json> error = CheckWriteContext(company, dry_run); error.has_value()) return *error;
 
 	const Engine *e = Engine::GetIfValid(EngineID(static_cast<uint16_t>(engine_id)));
 	if (e == nullptr) {
@@ -989,7 +1573,7 @@ Json VehicleBuild(const Json &params, CompanyID company)
 
 	VehicleID source_id = VehicleID::Invalid();
 	if (share) {
-		const Vehicle *source = Vehicle::GetIfValid(VehicleID(static_cast<uint16_t>(share_from)));
+		const Vehicle *source = Vehicle::GetIfValid(VehicleID(static_cast<uint32_t>(share_from)));
 		if (source == nullptr) {
 			Json detail = Json::object();
 			detail["share_orders_from"] = share_from;
@@ -1020,37 +1604,37 @@ Json VehicleBuild(const Json &params, CompanyID company)
 	Money spent = 0;
 	Json created = Json::array();
 	for (int64_t i = 0; i < count; i++) {
-		if (!RunCommand<Commands::BuildVehicle>(false, &AgentBuildVehicleCallback, tile, e->index, false, cargo, ClientID::Invalid)) {
+		if (!RunCommand<Commands::BuildVehicle>(dry_run, &AgentBuildVehicleCallback, tile, e->index, false, cargo, ClientID::Invalid)) {
 			Json result = Json::object();
 			result["op"] = "build";
 			result["vehicle_ids"] = std::move(created);
 			if (!_posted.captured) return NotExecuted(std::move(result));
-			return PartialResult(std::move(result), spent, _posted);
+			return MarkExecution(PartialResult(std::move(result), spent, _posted), dry_run);
 		}
 		const VehicleID veh_id = _posted.vehicle;
 		spent += _posted.cost.GetCost();
-		created.push_back(veh_id.base());
+		if (!dry_run) created.push_back(veh_id.base());
 
-		if (rename) {
+		if (rename && !dry_run) {
 			if (!RunCommand<Commands::RenameVehicle>(false, &AgentCommandCallback, veh_id, name)) {
 				Json result = Json::object();
 				result["op"] = "build";
 				result["vehicle_ids"] = std::move(created);
 				result["renamed"] = false;
 				if (!_posted.captured) return NotExecuted(std::move(result));
-				return PartialResult(std::move(result), spent, _posted);
+				return MarkExecution(PartialResult(std::move(result), spent, _posted), dry_run);
 			}
 			spent += _posted.cost.GetCost();
 		}
 
-		if (source_id != VehicleID::Invalid()) {
+		if (source_id != VehicleID::Invalid() && !dry_run) {
 			if (!RunCommandAt<Commands::CloneOrder>(false, tile, &AgentCommandCallback, CO_SHARE, veh_id, source_id)) {
 				Json result = Json::object();
 				result["op"] = "build";
 				result["vehicle_ids"] = std::move(created);
 				result["orders_shared"] = false;
 				if (!_posted.captured) return NotExecuted(std::move(result));
-				return PartialResult(std::move(result), spent, _posted);
+				return MarkExecution(PartialResult(std::move(result), spent, _posted), dry_run);
 			}
 			spent += _posted.cost.GetCost();
 		}
@@ -1063,7 +1647,7 @@ Json VehicleBuild(const Json &params, CompanyID company)
 	result["cost"] = static_cast<int64_t>(spent);
 	if (rename) result["name"] = name;
 	if (source_id != VehicleID::Invalid()) result["share_orders_from"] = source_id.base();
-	return result;
+	return MarkExecution(std::move(result), dry_run);
 }
 
 /**
@@ -1078,9 +1662,12 @@ Json VehicleStartStop(const Json &params, CompanyID company, bool start)
 	int64_t vehicle_id = 0;
 	if (!ReadInt(params, "vehicle_id", vehicle_id)) return MakeError("invalid_arguments", "start/stop needs vehicle_id");
 
-	if (const std::optional<Json> error = CheckWriteContext(company, false); error.has_value()) return *error;
+	bool dry_run = false;
+	if (!ReadOptionalBool(params, "dry_run", dry_run)) return MakeError("invalid_arguments", "dry_run must be a boolean");
 
-	Vehicle *v = Vehicle::GetIfValid(VehicleID(static_cast<uint16_t>(vehicle_id)));
+	if (const std::optional<Json> error = CheckWriteContext(company, dry_run); error.has_value()) return *error;
+
+	Vehicle *v = Vehicle::GetIfValid(VehicleID(static_cast<uint32_t>(vehicle_id)));
 	if (v == nullptr) {
 		Json detail = Json::object();
 		detail["vehicle_id"] = vehicle_id;
@@ -1103,16 +1690,16 @@ Json VehicleStartStop(const Json &params, CompanyID company, bool start)
 
 	CompanyContext context(company);
 
-	if (!RunCommandAt<Commands::StartStopVehicle>(false, v->tile, &AgentCommandCallback, veh_id, false)) {
+	if (!RunCommandAt<Commands::StartStopVehicle>(dry_run, v->tile, &AgentCommandCallback, veh_id, false)) {
 		result["changed"] = false;
 		if (!_posted.captured) return NotExecuted(std::move(result));
-		return CommandResult(_posted, std::move(result));
+		return MarkExecution(CommandResult(_posted, std::move(result)), dry_run);
 	}
 
-	result["changed"] = true;
+	result["changed"] = !dry_run;
 	const Vehicle *after = Vehicle::GetIfValid(veh_id);
 	result["stopped"] = after != nullptr ? after->vehstatus.Test(VehState::Stopped) : stopped;
-	return CommandResult(_posted, std::move(result));
+	return MarkExecution(CommandResult(_posted, std::move(result)), dry_run);
 }
 
 /**
@@ -1126,13 +1713,35 @@ Json VehicleSell(const Json &params, CompanyID company)
 	int64_t vehicle_id = 0;
 	if (!ReadInt(params, "vehicle_id", vehicle_id)) return MakeError("invalid_arguments", "sell needs vehicle_id");
 
-	if (const std::optional<Json> error = CheckWriteContext(company, false); error.has_value()) return *error;
+	bool dry_run = false;
+	if (!ReadOptionalBool(params, "dry_run", dry_run)) return MakeError("invalid_arguments", "dry_run must be a boolean");
 
-	Vehicle *v = Vehicle::GetIfValid(VehicleID(static_cast<uint16_t>(vehicle_id)));
+	if (const std::optional<Json> error = CheckWriteContext(company, dry_run); error.has_value()) return *error;
+
+	Vehicle *v = Vehicle::GetIfValid(VehicleID(static_cast<uint32_t>(vehicle_id)));
 	if (v == nullptr) {
 		Json detail = Json::object();
 		detail["vehicle_id"] = vehicle_id;
 		return MakeError("not_found", "vehicle does not exist", std::move(detail));
+	}
+
+	/* `depot_id` is documented for sell as well; when it is given the vehicle has to be there. */
+	if (params.contains("depot_id")) {
+		int64_t depot_id = 0;
+		if (!ReadOptionalInt(params, "depot_id", depot_id)) return MakeError("invalid_arguments", "depot_id must be an integer");
+		const Depot *d = Depot::GetIfValid(DepotID(static_cast<uint16_t>(depot_id)));
+		if (d == nullptr) {
+			Json detail = Json::object();
+			detail["depot_id"] = depot_id;
+			return MakeError("not_found", "depot does not exist", std::move(detail));
+		}
+		if (v->tile != d->xy) {
+			Json detail = Json::object();
+			detail["vehicle_id"] = vehicle_id;
+			detail["depot_id"] = depot_id;
+			detail["tile"] = TileJson(v->tile);
+			return MakeError("invalid_arguments", "the vehicle is not in that depot", std::move(detail));
+		}
 	}
 
 	CompanyContext context(company);
@@ -1140,10 +1749,236 @@ Json VehicleSell(const Json &params, CompanyID company)
 	Json result = Json::object();
 	result["op"] = "sell";
 	result["vehicle_id"] = v->index.base();
-	if (!RunCommandAt<Commands::SellVehicle>(false, v->tile, &AgentCommandCallback, v->index, false, false, ClientID::Invalid)) {
+	if (!RunCommandAt<Commands::SellVehicle>(dry_run, v->tile, &AgentCommandCallback, v->index, false, false, ClientID::Invalid)) {
 		if (!_posted.captured) return NotExecuted(std::move(result));
 	}
-	return CommandResult(_posted, std::move(result));
+	return MarkExecution(CommandResult(_posted, std::move(result)), dry_run);
+}
+
+/**
+ * Refit a vehicle to another cargo.
+ *
+ * The refit masks of the whole consist (the engine, its articulated parts and every wagon) are
+ * what the engine itself tests, so an incompatible cargo is rejected before the command is posted.
+ * The result reports the capacities the engine actually produced, not the ones that were asked for.
+ *
+ * @param params Method parameters.
+ * @param company Company the vehicle belongs to.
+ * @return Tool result with the new cargo, the capacities and the cost.
+ */
+Json VehicleRefit(const Json &params, CompanyID company)
+{
+	int64_t vehicle_id = 0;
+	if (!ReadInt(params, "vehicle_id", vehicle_id)) return MakeError("invalid_arguments", "refit needs vehicle_id");
+
+	CargoType cargo = INVALID_CARGO;
+	if (const std::optional<Json> error = ReadCargoId(params, "cargo_id", cargo); error.has_value()) return *error;
+	if (!IsValidCargoType(cargo)) return MakeError("invalid_arguments", "refit needs cargo_id");
+
+	bool only_this = false;
+	if (!ReadOptionalBool(params, "only_this", only_this)) return MakeError("invalid_arguments", "only_this must be a boolean");
+
+	bool dry_run = false;
+	if (!ReadOptionalBool(params, "dry_run", dry_run)) return MakeError("invalid_arguments", "dry_run must be a boolean");
+
+	if (const std::optional<Json> error = CheckWriteContext(company, dry_run); error.has_value()) return *error;
+
+	Vehicle *v = Vehicle::GetIfValid(VehicleID(static_cast<uint32_t>(vehicle_id)));
+	if (v == nullptr) {
+		Json detail = Json::object();
+		detail["vehicle_id"] = vehicle_id;
+		return MakeError("not_found", "vehicle does not exist", std::move(detail));
+	}
+	if (v->owner != company) {
+		Json detail = Json::object();
+		detail["vehicle_id"] = vehicle_id;
+		detail["owner"] = v->owner.base();
+		return MakeError("not_owned", "vehicle belongs to another company", std::move(detail));
+	}
+	if (!IsCompanyBuildableVehicleType(v)) {
+		Json detail = Json::object();
+		detail["vehicle_id"] = vehicle_id;
+		detail["type"] = std::string(VehicleTypeName(v->type));
+		return MakeError("invalid_arguments", "this vehicle type cannot be refitted", std::move(detail));
+	}
+
+	/* `Commands::RefitVehicle` refits the whole chain unless `only_this` is set, and the chain has
+	 * to be stopped in a depot. Both are checked before anything is mutated. */
+	Vehicle *front = v->First();
+	if (front->vehstatus.Test(VehState::Crashed)) {
+		Json detail = Json::object();
+		detail["vehicle_id"] = vehicle_id;
+		return MakeError("invalid_arguments", "a crashed vehicle cannot be refitted", std::move(detail));
+	}
+	if (!only_this && !front->IsStoppedInDepot()) {
+		Json detail = Json::object();
+		detail["vehicle_id"] = vehicle_id;
+		detail["tile"] = TileJson(front->tile);
+		return MakeError("invalid_arguments", "the vehicle must be stopped in a depot to be refitted", std::move(detail));
+	}
+
+	/* `only_this` refits just the named vehicle, so only its own parts have to accept the cargo. */
+	const CargoTypes refittable = only_this ? GetUnionOfArticulatedRefitMasks(v->engine_type, true) : ConsistRefitMasks(v);
+	if (!refittable.Test(cargo)) {
+		Json detail = Json::object();
+		detail["vehicle_id"] = vehicle_id;
+		detail["engine_id"] = v->engine_type.base();
+		detail["cargo_id"] = static_cast<uint8_t>(cargo);
+		detail["refit_cargo_ids"] = Json::array();
+		for (const CargoType option : refittable) detail["refit_cargo_ids"].push_back(static_cast<uint8_t>(option));
+		return MakeError("invalid_arguments", "the vehicle cannot be refitted to that cargo", std::move(detail));
+	}
+
+	CompanyContext context(company);
+
+	Json result = Json::object();
+	result["op"] = "refit";
+	result["vehicle_id"] = v->index.base();
+	result["cargo_id"] = static_cast<uint8_t>(cargo);
+	result["only_this"] = only_this;
+	/* 0xFF asks the engine for the best fitting subtype, which is what the depot window does. */
+	if (!RunCommandAt<Commands::RefitVehicle>(dry_run, v->tile, &AgentRefitVehicleCallback, v->index, cargo, 0xFF, false, only_this, 0)) {
+		if (!_posted.captured) return NotExecuted(std::move(result));
+		return MarkExecution(CommandResult(_posted, std::move(result)), dry_run);
+	}
+
+	if (!dry_run) {
+		result["refit_capacity"] = _posted.refit_capacity;
+		result["mail_capacity"] = _posted.mail_capacity;
+		result["cargo_capacities"] = Json::object();
+		for (const CargoType option : EnumRange(NUM_CARGO)) {
+			if (_posted.cargo_capacities[option] == 0) continue;
+			result["cargo_capacities"][fmt::format("{}", static_cast<uint8_t>(option))] = _posted.cargo_capacities[option];
+		}
+		const Vehicle *after = Vehicle::GetIfValid(v->index);
+		if (after != nullptr) result["cargo"] = VehicleCargoJson(after);
+	}
+	return MarkExecution(CommandResult(_posted, std::move(result)), dry_run);
+}
+
+/**
+ * Clone a vehicle, optionally sharing its orders.
+ *
+ * The depot the clone is built in, its owner and the availability of the engine are checked
+ * before the command is posted, so a clone the engine would reject never reaches the world.
+ *
+ * @param params Method parameters.
+ * @param company Company that pays and owns the clone.
+ * @return Tool result with the created vehicle ids and the cost.
+ */
+Json VehicleClone(const Json &params, CompanyID company)
+{
+	int64_t vehicle_id = 0;
+	if (!ReadInt(params, "vehicle_id", vehicle_id)) return MakeError("invalid_arguments", "clone needs vehicle_id");
+
+	int64_t count = 1;
+	if (!ReadOptionalInt(params, "count", count)) return MakeError("invalid_arguments", "count must be an integer");
+	if (count < 1 || count > 100) {
+		Json detail = Json::object();
+		detail["count"] = count;
+		detail["min"] = 1;
+		detail["max"] = 100;
+		return MakeError("invalid_arguments", "count must be between 1 and 100", std::move(detail));
+	}
+
+	bool share_orders = false;
+	if (!ReadOptionalBool(params, "share_orders", share_orders)) return MakeError("invalid_arguments", "share_orders must be a boolean");
+
+	bool dry_run = false;
+	if (!ReadOptionalBool(params, "dry_run", dry_run)) return MakeError("invalid_arguments", "dry_run must be a boolean");
+
+	if (const std::optional<Json> error = CheckWriteContext(company, dry_run); error.has_value()) return *error;
+
+	Vehicle *v = Vehicle::GetIfValid(VehicleID(static_cast<uint32_t>(vehicle_id)));
+	if (v == nullptr) {
+		Json detail = Json::object();
+		detail["vehicle_id"] = vehicle_id;
+		return MakeError("not_found", "vehicle does not exist", std::move(detail));
+	}
+	if (v->owner != company) {
+		Json detail = Json::object();
+		detail["vehicle_id"] = vehicle_id;
+		detail["owner"] = v->owner.base();
+		return MakeError("not_owned", "vehicle belongs to another company", std::move(detail));
+	}
+	if (!IsCompanyBuildableVehicleType(v) || !v->IsPrimaryVehicle()) {
+		Json detail = Json::object();
+		detail["vehicle_id"] = vehicle_id;
+		detail["type"] = std::string(VehicleTypeName(v->type));
+		return MakeError("invalid_arguments", "clone needs a primary vehicle of a buildable type", std::move(detail));
+	}
+
+	/* The clone is built in a depot of the company; the tile of the source vehicle is used when
+	 * the caller names neither a depot nor a tile, which is what the depot window does. */
+	TileIndex tile = v->tile;
+	if (params.contains("depot_id")) {
+		int64_t depot_id = 0;
+		if (!ReadOptionalInt(params, "depot_id", depot_id)) return MakeError("invalid_arguments", "depot_id must be an integer");
+		const Depot *d = Depot::GetIfValid(DepotID(static_cast<uint16_t>(depot_id)));
+		if (d == nullptr) {
+			Json detail = Json::object();
+			detail["depot_id"] = depot_id;
+			return MakeError("not_found", "depot does not exist", std::move(detail));
+		}
+		tile = d->xy;
+	} else if (params.contains("tile")) {
+		RawTile raw{};
+		if (!ReadRawTile(params["tile"], raw)) return MakeError("invalid_arguments", "tile must be a tile object with integer x and y");
+		if (!ToTileIndex(raw, tile)) return MakeError("invalid_arguments", "tile must be inside the map");
+	}
+
+	if (!IsDepotTile(tile)) {
+		Json detail = Json::object();
+		detail["tile"] = TileJson(tile);
+		return MakeError("invalid_arguments", "clone needs a depot tile", std::move(detail));
+	}
+	if (GetDepotVehicleType(tile) != v->type) {
+		Json detail = Json::object();
+		detail["tile"] = TileJson(tile);
+		detail["depot_type"] = std::string(VehicleTypeName(GetDepotVehicleType(tile)));
+		detail["vehicle_type"] = std::string(VehicleTypeName(v->type));
+		return MakeError("invalid_arguments", "the depot holds another vehicle type", std::move(detail));
+	}
+	if (!IsTileOwner(tile, company)) {
+		Json detail = Json::object();
+		detail["tile"] = TileJson(tile);
+		return MakeError("not_owned", "the depot belongs to another company", std::move(detail));
+	}
+	if (!Engine::Get(v->engine_type)->company_avail.Test(company)) {
+		Json detail = Json::object();
+		detail["engine_id"] = v->engine_type.base();
+		return MakeError("invalid_arguments", "the engine is not available to the company", std::move(detail));
+	}
+
+	const VehicleID source_id = v->index;
+	CompanyContext context(company);
+
+	Money spent = 0;
+	Json created = Json::array();
+	for (int64_t i = 0; i < count; i++) {
+		if (!RunCommand<Commands::CloneVehicle>(dry_run, &AgentCloneVehicleCallback, tile, source_id, share_orders)) {
+			Json result = Json::object();
+			result["op"] = "clone";
+			result["vehicle_id"] = source_id.base();
+			result["share_orders"] = share_orders;
+			result["tile"] = TileJson(tile);
+			result["vehicle_ids"] = std::move(created);
+			if (!_posted.captured) return NotExecuted(std::move(result));
+			return MarkExecution(PartialResult(std::move(result), spent, _posted), dry_run);
+		}
+		spent += _posted.cost.GetCost();
+		if (!dry_run) created.push_back(_posted.vehicle.base());
+	}
+
+	Json result = Json::object();
+	result["ok"] = true;
+	result["op"] = "clone";
+	result["vehicle_id"] = source_id.base();
+	result["share_orders"] = share_orders;
+	result["tile"] = TileJson(tile);
+	result["vehicle_ids"] = std::move(created);
+	result["cost"] = static_cast<int64_t>(spent);
+	return MarkExecution(std::move(result), dry_run);
 }
 
 /* -- orders ------------------------------------------------------------------------------ */
@@ -1270,7 +2105,7 @@ Json OrdersSet(const Json &params, CompanyID company, bool replace)
 
 	if (const std::optional<Json> error = CheckWriteContext(company, false); error.has_value()) return *error;
 
-	Vehicle *v = Vehicle::GetIfValid(VehicleID(static_cast<uint16_t>(vehicle_id)));
+	Vehicle *v = Vehicle::GetIfValid(VehicleID(static_cast<uint32_t>(vehicle_id)));
 	if (v == nullptr) {
 		Json detail = Json::object();
 		detail["vehicle_id"] = vehicle_id;
@@ -1343,13 +2178,13 @@ Json OrdersShared(const Json &params, CompanyID company)
 
 	if (const std::optional<Json> error = CheckWriteContext(company, false); error.has_value()) return *error;
 
-	Vehicle *v = Vehicle::GetIfValid(VehicleID(static_cast<uint16_t>(vehicle_id)));
+	Vehicle *v = Vehicle::GetIfValid(VehicleID(static_cast<uint32_t>(vehicle_id)));
 	if (v == nullptr) {
 		Json detail = Json::object();
 		detail["vehicle_id"] = vehicle_id;
 		return MakeError("not_found", "vehicle does not exist", std::move(detail));
 	}
-	Vehicle *source = Vehicle::GetIfValid(VehicleID(static_cast<uint16_t>(source_id)));
+	Vehicle *source = Vehicle::GetIfValid(VehicleID(static_cast<uint32_t>(source_id)));
 	if (source == nullptr) {
 		Json detail = Json::object();
 		detail["share_orders_from"] = source_id;
@@ -1389,7 +2224,7 @@ Json OrdersGroup(const Json &params, CompanyID company)
 
 	if (const std::optional<Json> error = CheckWriteContext(company, false); error.has_value()) return *error;
 
-	Vehicle *v = Vehicle::GetIfValid(VehicleID(static_cast<uint16_t>(vehicle_id)));
+	Vehicle *v = Vehicle::GetIfValid(VehicleID(static_cast<uint32_t>(vehicle_id)));
 	if (v == nullptr) {
 		Json detail = Json::object();
 		detail["vehicle_id"] = vehicle_id;
@@ -1410,34 +2245,238 @@ Json OrdersGroup(const Json &params, CompanyID company)
 	return CommandResult(_posted, std::move(result));
 }
 
+/**
+ * Map a timetable field onto the protocol name.
+ * @param field The timetable field.
+ * @return Protocol name of the field.
+ */
+std::string_view TimetableFieldName(ModifyTimetableFlags field)
+{
+	switch (field) {
+		case MTF_WAIT_TIME: return "wait_time";
+		case MTF_TRAVEL_TIME: return "travel_time";
+		case MTF_TRAVEL_SPEED: return "max_speed";
+		default: return "unknown";
+	}
+}
+
+/**
+ * Set the timetable of the orders of a vehicle.
+ *
+ * Every entry is validated against the current order list before the first command is posted, so
+ * a bad entry cannot leave a half-applied timetable. The result reports the timetable the engine
+ * actually stored, not the values that were asked for.
+ *
+ * @param params Method parameters.
+ * @param company Company the vehicle belongs to.
+ * @return Tool result with the applied entries, the resulting timetable and the cost.
+ */
+Json OrdersTimetable(const Json &params, CompanyID company)
+{
+	int64_t vehicle_id = 0;
+	if (!ReadInt(params, "vehicle_id", vehicle_id)) return MakeError("invalid_arguments", "timetable needs vehicle_id");
+
+	const auto entries = params.find("timetable");
+	if (entries == params.end() || !entries->is_array() || entries->empty()) {
+		return MakeError("invalid_arguments", "timetable needs a non-empty `timetable` array");
+	}
+
+	bool dry_run = false;
+	if (!ReadOptionalBool(params, "dry_run", dry_run)) return MakeError("invalid_arguments", "dry_run must be a boolean");
+
+	/** One timetable field to set on one order. */
+	struct TimetableChange {
+		VehicleOrderID index; ///< Order the change applies to.
+		ModifyTimetableFlags field; ///< Field that is set.
+		uint16_t value; ///< Value that is set.
+	};
+
+	/* The entries are checked on their own first, so a malformed request is rejected before the
+	 * company and the vehicle are even looked at. */
+	std::vector<TimetableChange> changes;
+	for (const Json &entry : *entries) {
+		if (!entry.is_object()) return MakeError("invalid_arguments", "timetable entries must be objects");
+		if (const std::optional<Json> error = CheckKnownParams(entry, "world.orders", "timetable", {"index", "wait_time", "travel_time", "max_speed"}); error.has_value()) return *error;
+
+		int64_t index = 0;
+		if (!ReadInt(entry, "index", index)) return MakeError("invalid_arguments", "timetable entry needs an order index");
+		if (index < 0 || index > UINT16_MAX) {
+			Json detail = Json::object();
+			detail["index"] = index;
+			detail["max"] = UINT16_MAX;
+			return MakeError("invalid_arguments", "timetable entry index must fit in 16 bits", std::move(detail));
+		}
+
+		const bool has_wait = entry.contains("wait_time");
+		const bool has_travel = entry.contains("travel_time");
+		const bool has_speed = entry.contains("max_speed");
+		if (!has_wait && !has_travel && !has_speed) {
+			return MakeError("invalid_arguments", "timetable entry needs wait_time, travel_time or max_speed");
+		}
+
+		int64_t wait_time = 0;
+		int64_t travel_time = 0;
+		int64_t max_speed = 0;
+		if (!ReadOptionalInt(entry, "wait_time", wait_time)) return MakeError("invalid_arguments", "wait_time must be an integer");
+		if (!ReadOptionalInt(entry, "travel_time", travel_time)) return MakeError("invalid_arguments", "travel_time must be an integer");
+		if (!ReadOptionalInt(entry, "max_speed", max_speed)) return MakeError("invalid_arguments", "max_speed must be an integer");
+		if (wait_time < 0 || wait_time > UINT16_MAX || travel_time < 0 || travel_time > UINT16_MAX || max_speed < 0 || max_speed > UINT16_MAX) {
+			Json detail = Json::object();
+			detail["max"] = UINT16_MAX;
+			return MakeError("invalid_arguments", "timetable values must fit in 16 bits", std::move(detail));
+		}
+
+		const VehicleOrderID order_index = static_cast<VehicleOrderID>(index);
+		if (has_wait) changes.push_back({order_index, MTF_WAIT_TIME, static_cast<uint16_t>(wait_time)});
+		if (has_travel) changes.push_back({order_index, MTF_TRAVEL_TIME, static_cast<uint16_t>(travel_time)});
+		if (has_speed) changes.push_back({order_index, MTF_TRAVEL_SPEED, static_cast<uint16_t>(max_speed)});
+	}
+
+	if (const std::optional<Json> error = CheckWriteContext(company, dry_run); error.has_value()) return *error;
+
+	Vehicle *v = Vehicle::GetIfValid(VehicleID(static_cast<uint32_t>(vehicle_id)));
+	if (v == nullptr) {
+		Json detail = Json::object();
+		detail["vehicle_id"] = vehicle_id;
+		return MakeError("not_found", "vehicle does not exist", std::move(detail));
+	}
+	if (v->owner != company) {
+		Json detail = Json::object();
+		detail["vehicle_id"] = vehicle_id;
+		detail["owner"] = v->owner.base();
+		return MakeError("not_owned", "vehicle belongs to another company", std::move(detail));
+	}
+	if (!IsCompanyBuildableVehicleType(v) || !v->IsPrimaryVehicle()) {
+		Json detail = Json::object();
+		detail["vehicle_id"] = vehicle_id;
+		detail["type"] = std::string(VehicleTypeName(v->type));
+		return MakeError("invalid_arguments", "timetable needs a primary vehicle of a buildable type", std::move(detail));
+	}
+
+	/* Now that the order list is known, every index has to name a real, non-implicit order. */
+	for (const TimetableChange &change : changes) {
+		if (change.index >= v->GetNumOrders()) {
+			Json detail = Json::object();
+			detail["index"] = change.index;
+			detail["orders"] = v->GetNumOrders();
+			return MakeError("invalid_arguments", "timetable entry index is not an order of the vehicle", std::move(detail));
+		}
+		const Order *order = v->GetOrder(change.index);
+		if (order == nullptr || order->IsType(OT_IMPLICIT)) {
+			Json detail = Json::object();
+			detail["index"] = change.index;
+			return MakeError("invalid_arguments", "an implicit order has no timetable", std::move(detail));
+		}
+	}
+
+	const VehicleID veh_id = v->index;
+	CompanyContext context(company);
+
+	Money spent = 0;
+	Json applied = Json::array();
+	for (const TimetableChange &change : changes) {
+		if (!RunCommand<Commands::ChangeTimetable>(dry_run, &AgentCommandCallback, veh_id, change.index, change.field, change.value)) {
+			Json result = Json::object();
+			result["op"] = "timetable";
+			result["vehicle_id"] = veh_id.base();
+			result["applied"] = std::move(applied);
+			if (!_posted.captured) return NotExecuted(std::move(result));
+			return MarkExecution(PartialResult(std::move(result), spent, _posted), dry_run);
+		}
+		spent += _posted.cost.GetCost();
+
+		Json receipt = Json::object();
+		receipt["index"] = change.index;
+		receipt["field"] = std::string(TimetableFieldName(change.field));
+		receipt["value"] = change.value;
+		applied.push_back(std::move(receipt));
+	}
+
+	Json result = Json::object();
+	result["ok"] = true;
+	result["op"] = "timetable";
+	result["vehicle_id"] = veh_id.base();
+	result["applied"] = std::move(applied);
+	result["cost"] = static_cast<int64_t>(spent);
+
+	if (!dry_run) {
+		/* Read back what the engine stored, so the caller sees the real timetable. */
+		const Vehicle *after = Vehicle::GetIfValid(veh_id);
+		Json timetable = Json::array();
+		std::vector<VehicleOrderID> seen;
+		if (after != nullptr) {
+			for (const TimetableChange &change : changes) {
+				if (std::find(seen.begin(), seen.end(), change.index) != seen.end()) continue;
+				seen.push_back(change.index);
+				const Order *order = after->GetOrder(change.index);
+				if (order == nullptr) continue;
+				Json row = Json::object();
+				row["index"] = change.index;
+				row["wait_time"] = order->GetWaitTime();
+				row["travel_time"] = order->GetTravelTime();
+				row["max_speed"] = order->GetMaxSpeed();
+				row["wait_timetabled"] = order->IsWaitTimetabled();
+				row["travel_timetabled"] = order->IsTravelTimetabled();
+				timetable.push_back(std::move(row));
+			}
+		}
+		result["timetable"] = std::move(timetable);
+	}
+	return MarkExecution(std::move(result), dry_run);
+}
+
 /* -- method dispatch --------------------------------------------------------------------- */
+
+/**
+ * Map a `world.query` kind onto the canonical kind this module implements.
+ *
+ * The protocol names kinds in the plural; the singular spelling is accepted as an alias so a
+ * caller that names one object still reaches the same rows. The result always reports the
+ * canonical name, so a caller never has to know which spelling it used.
+ *
+ * @param kind The kind as sent by the caller.
+ * @return The canonical kind, or an empty view for a kind another module owns.
+ */
+std::string_view CanonicalQueryKind(std::string_view kind)
+{
+	if (kind == "vehicles" || kind == "vehicle") return "vehicles";
+	if (kind == "engines" || kind == "engine") return "engines";
+	if (kind == "orders" || kind == "order") return "orders";
+	return {};
+}
 
 /**
  * Dispatch `world.query`.
  * @param params Method parameters.
  * @param company Company of the call.
- * @return Tool result.
+ * @return Tool result, or an empty optional for a kind another module owns.
  */
-Json DispatchQuery(const Json &params, CompanyID company)
+std::optional<Json> DispatchQuery(const Json &params, CompanyID company)
 {
 	std::string kind;
 	if (!ReadString(params, "kind", kind)) return MakeError("invalid_arguments", "world.query needs kind");
-	if (kind == "vehicles") return QueryVehicles(params, company);
-	if (kind == "engines") return QueryEngines(params);
-	return MakeGap("world.query", kind);
+	const std::string_view canonical = CanonicalQueryKind(kind);
+	/* The other kinds belong to the bridge kernel or to another module; do not shadow them. */
+	if (canonical.empty()) return std::nullopt;
+
+	if (const std::optional<Json> error = CheckKnownParams(params, "world.query", kind, {"filters", "limit", "offset"}); error.has_value()) return error;
+	if (canonical == "vehicles") return QueryVehicles(params, company);
+	if (canonical == "engines") return QueryEngines(params, company);
+	return QueryOrders(params, company);
 }
 
 /**
  * Dispatch `world.construct`.
  * @param params Method parameters.
  * @param company Company that pays.
- * @return Tool result.
+ * @return Tool result, or an empty optional for an op another module owns.
  */
-Json DispatchConstruct(const Json &params, CompanyID company)
+std::optional<Json> DispatchConstruct(const Json &params, CompanyID company)
 {
 	std::string op;
 	if (!ReadString(params, "op", op)) return MakeError("invalid_arguments", "world.construct needs op");
-	if (op != "road" && op != "tram" && op != "station" && op != "depot" && op != "demolish") return MakeGap("world.construct", op);
+	/* Rail, air, water and terrain construction belong to another module; do not shadow it. */
+	if (op != "road" && op != "tram" && op != "station" && op != "depot" && op != "demolish") return std::nullopt;
 
 	bool dry_run = false;
 	if (!ReadOptionalBool(params, "dry_run", dry_run)) return MakeError("invalid_arguments", "dry_run must be a boolean");
@@ -1458,53 +2497,83 @@ Json DispatchConstruct(const Json &params, CompanyID company)
 
 /**
  * Dispatch `world.vehicles`.
+ *
+ * Every op declares the parameters it reads, so a parameter that would not be applied is an
+ * error instead of being silently dropped.
+ *
  * @param params Method parameters.
  * @param company Company that pays and owns the vehicles.
- * @return Tool result.
+ * @return Tool result, or an empty optional for an op another module owns.
  */
-Json DispatchVehicles(const Json &params, CompanyID company)
+std::optional<Json> DispatchVehicles(const Json &params, CompanyID company)
 {
 	std::string op;
 	if (!ReadString(params, "op", op)) return MakeError("invalid_arguments", "world.vehicles needs op");
 
-	if (op != "build" && op != "sell" && op != "start" && op != "stop") return MakeGap("world.vehicles", op);
-
-	if (op == "build") return VehicleBuild(params, company);
-	if (op == "sell") return VehicleSell(params, company);
-	if (op == "start") return VehicleStartStop(params, company, true);
-	return VehicleStartStop(params, company, false);
+	if (op == "build") {
+		if (const std::optional<Json> error = CheckKnownParams(params, "world.vehicles", op,
+				{"engine_id", "depot_id", "tile", "cargo_id", "count", "name", "share_orders_from", "dry_run"}); error.has_value()) return error;
+		return VehicleBuild(params, company);
+	}
+	if (op == "sell") {
+		if (const std::optional<Json> error = CheckKnownParams(params, "world.vehicles", op,
+				{"vehicle_id", "depot_id", "dry_run"}); error.has_value()) return error;
+		return VehicleSell(params, company);
+	}
+	if (op == "start" || op == "stop") {
+		if (const std::optional<Json> error = CheckKnownParams(params, "world.vehicles", op,
+				{"vehicle_id", "dry_run"}); error.has_value()) return error;
+		return VehicleStartStop(params, company, op == "start");
+	}
+	if (op == "refit") {
+		if (const std::optional<Json> error = CheckKnownParams(params, "world.vehicles", op,
+				{"vehicle_id", "cargo_id", "only_this", "dry_run"}); error.has_value()) return error;
+		return VehicleRefit(params, company);
+	}
+	if (op == "clone") {
+		if (const std::optional<Json> error = CheckKnownParams(params, "world.vehicles", op,
+				{"vehicle_id", "depot_id", "tile", "count", "share_orders", "dry_run"}); error.has_value()) return error;
+		return VehicleClone(params, company);
+	}
+	return std::nullopt;
 }
 
 /**
  * Dispatch `world.orders`.
+ *
+ * Every op declares the parameters it reads, so a parameter that would not be applied is an
+ * error instead of being silently dropped.
+ *
  * @param params Method parameters.
  * @param company Company the vehicle belongs to.
- * @return Tool result.
+ * @return Tool result, or an empty optional for an op another module owns.
  */
-Json DispatchOrders(const Json &params, CompanyID company)
+std::optional<Json> DispatchOrders(const Json &params, CompanyID company)
 {
 	std::string op;
 	if (!ReadString(params, "op", op)) return MakeError("invalid_arguments", "world.orders needs op");
 
-	if (op != "set" && op != "append" && op != "shared" && op != "group") return MakeGap("world.orders", op);
-
-	if (op == "set") return OrdersSet(params, company, true);
-	if (op == "append") return OrdersSet(params, company, false);
-	if (op == "shared") return OrdersShared(params, company);
-	return OrdersGroup(params, company);
-}
-
-/**
- * Is this one of the engine methods the protocol knows about?
- * @param method Engine method name.
- * @return True for a known engine method.
- */
-bool IsKnownEngineMethod(std::string_view method)
-{
-	return method == "world.info" || method == "world.query" || method == "world.objects" ||
-			method == "world.pause" || method == "world.rename" || method == "world.settings.get" ||
-			method == "world.settings.set" || method == "world.construct" || method == "world.vehicles" ||
-			method == "world.orders" || method == "world.capture" || method == "task.barrier";
+	if (op == "set" || op == "append") {
+		if (const std::optional<Json> error = CheckKnownParams(params, "world.orders", op,
+				{"vehicle_id", "orders"}); error.has_value()) return error;
+		return OrdersSet(params, company, op == "set");
+	}
+	if (op == "shared") {
+		if (const std::optional<Json> error = CheckKnownParams(params, "world.orders", op,
+				{"vehicle_id", "share_orders_from"}); error.has_value()) return error;
+		return OrdersShared(params, company);
+	}
+	if (op == "group") {
+		if (const std::optional<Json> error = CheckKnownParams(params, "world.orders", op,
+				{"vehicle_id", "group_id"}); error.has_value()) return error;
+		return OrdersGroup(params, company);
+	}
+	if (op == "timetable") {
+		if (const std::optional<Json> error = CheckKnownParams(params, "world.orders", op,
+				{"vehicle_id", "timetable", "dry_run"}); error.has_value()) return error;
+		return OrdersTimetable(params, company);
+	}
+	return std::nullopt;
 }
 
 /**
@@ -1533,40 +2602,50 @@ Json GameToolCapabilities()
 {
 	Json methods = Json::array();
 	methods.push_back(Capability("world.query", "read",
-			{"vehicles", "engines"},
-			{"towns", "companies", "tiles", "stations", "industries", "cargos", "settings", "groups", "orders", "waypoints", "signs", "houses", "depots", "finances"}));
+			{"vehicles", "engines", "orders"},
+			{"towns", "companies", "tiles", "stations", "industries", "cargos", "settings", "groups", "waypoints", "signs", "houses", "depots", "finances"}));
 	methods.push_back(Capability("world.construct", "write",
 			{"road", "tram", "station", "depot", "demolish"},
 			{"rail", "signal", "airport", "dock", "bridge", "tunnel", "canal", "terraform"}));
 	methods.push_back(Capability("world.vehicles", "write",
-			{"build", "sell", "start", "stop"},
-			{"refit", "clone"}));
+			{"build", "sell", "start", "stop", "refit", "clone"},
+			{}));
 	methods.push_back(Capability("world.orders", "write",
-			{"set", "append", "shared", "group"},
-			{"timetable"}));
+			{"set", "append", "shared", "group", "timetable"},
+			{}));
 
 	Json result = Json::object();
+	/* The exact `world.query` kind spellings this module answers, so the bridge can map a
+	 * canonical name onto them without guessing. */
+	Json aliases = Json::object();
+	for (const std::string_view kind : {"vehicles", "engines", "orders"}) aliases[std::string(kind)] = std::string(kind);
+	for (const std::string_view kind : {"vehicle", "engine", "order"}) aliases[std::string(kind)] = std::string(CanonicalQueryKind(kind));
+
 	result["module"] = "agent_game_tools";
 	result["methods"] = std::move(methods);
+	result["query_aliases"] = std::move(aliases);
 	result["unimplemented_methods"] = Json::array({"world.info", "world.objects", "world.pause", "world.rename", "world.settings.get", "world.settings.set", "world.capture", "task.barrier"});
 	result["notes"] = Json::array({
 		"Actual mutations go through Command::Post, the normal player command path, so the engine's own eligibility, pause and finance checks apply; results carry the actual cost and the created ids.",
+		"Ops and kinds this module does not implement are left to the other modules: DispatchGameTool returns nullopt instead of a gap, so nothing shadows the bridge kernel, transport or admin.",
+		"Every op declares the parameters it reads; a parameter that would not be applied is rejected with `invalid_arguments` instead of being silently dropped.",
 		"world.construct accepts `dry_run`, which only queries the cost and reports `estimated: true`.",
 		"world.construct op=demolish clears the tile (Commands::LandscapeClear); the `demolish` flag on the other ops is reported as a gap.",
 		"world.construct op=station builds one road stop rectangle; `stop_type` is `bus` (default) or `truck`, and a span above 255 tiles is rejected instead of truncated.",
 		"world.construct op=station/depot take one tile per call; a longer `tiles` array is rejected with `unsupported_multi_item` instead of using only the first tile.",
 		"world.vehicles op=build honours `cargo_id` (build cargo), `name` (Commands::RenameVehicle) and `share_orders_from` (Commands::CloneOrder); a batch reports partial receipts and the money it actually spent.",
-		"world.query kind=vehicles/engines is read-only inventory; the other kinds are reported as gaps.",
+		"world.vehicles op=refit needs the consist stopped in a depot, checks the refit masks of every part of the chain before posting, and reports the capacities the engine actually produced.",
+		"world.vehicles op=clone needs a depot tile of the company (`depot_id`, `tile`, or the source vehicle's own tile when it stands in a depot), checks the owner and the engine availability before posting, and reports the created vehicle ids and the cost the engine charged; a `dry_run` clone cost is an estimate, because the command is flagged NoTest.",
+		"world.vehicles and world.orders accept `dry_run`, which only queries the cost and reports `estimated: true`.",
+		"world.orders op=timetable validates every entry against the current order list before the first command, and reads the stored timetable back.",
+		"world.query kind=vehicles/engines/orders is read-only inventory with validated filters; the other kinds are left to the other modules.",
 	});
 	return result;
 }
 
 std::optional<Json> DispatchGameTool(std::string_view method, const Json &params, CompanyID company)
 {
-	if (method != "world.query" && method != "world.construct" && method != "world.vehicles" && method != "world.orders") {
-		if (IsKnownEngineMethod(method)) return MakeGap(method, {});
-		return std::nullopt;
-	}
+	if (method != "world.query" && method != "world.construct" && method != "world.vehicles" && method != "world.orders") return std::nullopt;
 
 	if (!params.is_object()) return MakeError("invalid_arguments", "params must be an object");
 

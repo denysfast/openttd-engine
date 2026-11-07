@@ -56,10 +56,16 @@ Json GameToolCapabilities();
 std::optional<Json> DispatchGameTool(std::string_view method, const Json &params, CompanyID company);
 
 /*
- * Command callbacks. `Command<Tcmd>::Post` only accepts callbacks that are registered for the
- * network command dispatch, so these are declared here and listed in network_command.cpp. They
- * capture the actual result of the command that was just posted; in single player the callback
- * runs synchronously, before `Post` returns.
+ * Command callbacks. `Command<Tcmd>::Post` asserts that the callback is registered for the
+ * network command dispatch, so these are declared here and must be listed in the
+ * `_callback_tuple` of `src/network/network_command.cpp`. That file is a shared anchor owned by
+ * the parent bridge integration, so this module does not edit it: the parent has to register
+ * every callback declared below. They capture the actual result of the command that was just
+ * posted; in single player the callback runs synchronously, before `Post` returns.
+ *
+ * PARENT REGISTRATION REQUIRED: `AgentRefitVehicleCallback` and `AgentCloneVehicleCallback` are
+ * new and are not in the shared tuple yet. Until they are added, `world.vehicles op=refit` and
+ * `op=clone` trip the `IsNetworkRegisteredCallback` assertion in debug builds.
  */
 
 /**
@@ -88,6 +94,24 @@ void AgentBuildVehicleCallback(Commands cmd, const CommandCost &result, VehicleI
  * @param group_id The group the vehicle ended up in.
  */
 void AgentAddVehicleToGroupCallback(Commands cmd, const CommandCost &result, GroupID group_id);
+
+/**
+ * Capture the cost and the resulting capacities of a posted `Commands::RefitVehicle`.
+ * @param cmd The command that ran.
+ * @param result The actual cost, or the failure of the command.
+ * @param refit_capacity Capacity of the refitted consist for the new cargo.
+ * @param mail_capacity Secondary (mail) capacity of a refitted aircraft.
+ * @param cargo_capacities Capacities of the refitted consist per cargo.
+ */
+void AgentRefitVehicleCallback(Commands cmd, const CommandCost &result, uint refit_capacity, uint16_t mail_capacity, CargoArray cargo_capacities);
+
+/**
+ * Capture the cost and the created vehicle of a posted `Commands::CloneVehicle`.
+ * @param cmd The command that ran.
+ * @param result The actual cost, or the failure of the command.
+ * @param veh_id The vehicle that was created.
+ */
+void AgentCloneVehicleCallback(Commands cmd, const CommandCost &result, VehicleID veh_id);
 
 } // namespace InGameAgent
 

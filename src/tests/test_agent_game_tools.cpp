@@ -83,19 +83,23 @@ TEST_CASE("agent_game_tools: capabilities list the implemented methods and their
 	CHECK(Contains(vehicles["implemented"], "build"));
 	CHECK(Contains(vehicles["implemented"], "start"));
 	CHECK(Contains(vehicles["implemented"], "stop"));
-	CHECK(Contains(vehicles["gaps"], "refit"));
+	CHECK(Contains(vehicles["implemented"], "refit"));
+	CHECK(Contains(vehicles["implemented"], "clone"));
+	CHECK(vehicles["gaps"].empty());
 
 	const Json orders = FindCapability(capabilities, "world.orders");
 	REQUIRE(!orders.empty());
 	CHECK(Contains(orders["implemented"], "set"));
 	CHECK(Contains(orders["implemented"], "append"));
-	CHECK(Contains(orders["gaps"], "timetable"));
+	CHECK(Contains(orders["implemented"], "timetable"));
+	CHECK(orders["gaps"].empty());
 
 	const Json query = FindCapability(capabilities, "world.query");
 	REQUIRE(!query.empty());
 	CHECK(query["authority"] == "read");
 	CHECK(Contains(query["implemented"], "vehicles"));
 	CHECK(Contains(query["implemented"], "engines"));
+	CHECK(Contains(query["implemented"], "orders"));
 }
 
 TEST_CASE("agent_game_tools: a method outside the game tools is not claimed")
@@ -104,13 +108,13 @@ TEST_CASE("agent_game_tools: a method outside the game tools is not claimed")
 	CHECK_FALSE(DispatchGameTool("", Json::object(), CompanyID::Invalid()).has_value());
 }
 
-TEST_CASE("agent_game_tools: a known but unimplemented method is an explicit gap")
+TEST_CASE("agent_game_tools: a method another module owns is not claimed")
 {
-	const std::optional<Json> result = DispatchGameTool("world.info", Json::object(), CompanyID::Invalid());
-	REQUIRE(result.has_value());
-	CHECK((*result)["ok"] == false);
-	CHECK((*result)["error"] == "unsupported_method");
-	CHECK((*result)["detail"]["method"] == "world.info");
+	/* The bridge kernel, transport and admin own these; claiming them would shadow their work. */
+	CHECK_FALSE(DispatchGameTool("world.info", Json::object(), CompanyID::Invalid()).has_value());
+	CHECK_FALSE(DispatchGameTool("world.pause", Json::object(), CompanyID::Invalid()).has_value());
+	CHECK_FALSE(DispatchGameTool("world.capture", Json::object(), CompanyID::Invalid()).has_value());
+	CHECK_FALSE(DispatchGameTool("task.barrier", Json::object(), CompanyID::Invalid()).has_value());
 }
 
 TEST_CASE("agent_game_tools: params must be an object")
@@ -121,17 +125,14 @@ TEST_CASE("agent_game_tools: params must be an object")
 	CHECK((*result)["error"] == "invalid_arguments");
 }
 
-TEST_CASE("agent_game_tools: world.query needs a kind and reports unknown kinds as gaps")
+TEST_CASE("agent_game_tools: world.query needs a kind and leaves other kinds to their module")
 {
 	const std::optional<Json> missing = DispatchGameTool("world.query", Json::object(), CompanyID::Invalid());
 	REQUIRE(missing.has_value());
 	CHECK((*missing)["error"] == "invalid_arguments");
 
-	const std::optional<Json> unknown = DispatchGameTool("world.query", {{"kind", "towns"}}, CompanyID::Invalid());
-	REQUIRE(unknown.has_value());
-	CHECK((*unknown)["ok"] == false);
-	CHECK((*unknown)["error"] == "unsupported_op");
-	CHECK((*unknown)["detail"]["op"] == "towns");
+	CHECK_FALSE(DispatchGameTool("world.query", {{"kind", "towns"}}, CompanyID::Invalid()).has_value());
+	CHECK_FALSE(DispatchGameTool("world.query", {{"kind", "stations"}}, CompanyID::Invalid()).has_value());
 }
 
 TEST_CASE("agent_game_tools: the vehicle and engine inventory is read-only and empty without a game")
@@ -148,25 +149,76 @@ TEST_CASE("agent_game_tools: the vehicle and engine inventory is read-only and e
 	CHECK((*engines)["ok"] == true);
 	CHECK((*engines)["kind"] == "engines");
 	CHECK((*engines)["rows"].is_array());
+
+	const std::optional<Json> orders = DispatchGameTool("world.query", {{"kind", "orders"}}, CompanyID::Invalid());
+	REQUIRE(orders.has_value());
+	CHECK((*orders)["ok"] == true);
+	CHECK((*orders)["kind"] == "orders");
+	CHECK((*orders)["rows"].is_array());
+	CHECK((*orders)["total"] == 0);
 }
 
-TEST_CASE("agent_game_tools: unsupported ops of the write families are gaps, not fake successes")
+TEST_CASE("agent_game_tools: query filters are validated instead of silently ignored")
 {
-	const std::optional<Json> rail = DispatchGameTool("world.construct", {{"op", "rail"}}, CompanyID::Invalid());
-	REQUIRE(rail.has_value());
-	CHECK((*rail)["ok"] == false);
-	CHECK((*rail)["error"] == "unsupported_op");
-	CHECK((*rail)["detail"]["op"] == "rail");
+	const std::optional<Json> unknown_filter = DispatchGameTool("world.query", {{"kind", "vehicles"}, {"filters", {{"colour", "red"}}}}, CompanyID::Invalid());
+	REQUIRE(unknown_filter.has_value());
+	CHECK((*unknown_filter)["ok"] == false);
+	CHECK((*unknown_filter)["error"] == "invalid_arguments");
+	CHECK((*unknown_filter)["detail"]["filter"] == "colour");
+	CHECK((*unknown_filter)["detail"]["kind"] == "vehicles");
 
-	const std::optional<Json> refit = DispatchGameTool("world.vehicles", {{"op", "refit"}}, CompanyID::Invalid());
+	/* A filter that only another kind understands is an error, not a dropped filter. */
+	const std::optional<Json> wrong_kind = DispatchGameTool("world.query", {{"kind", "engines"}, {"filters", {{"in_depot", true}}}}, CompanyID::Invalid());
+	REQUIRE(wrong_kind.has_value());
+	CHECK((*wrong_kind)["error"] == "invalid_arguments");
+	CHECK((*wrong_kind)["detail"]["filter"] == "in_depot");
+
+	const std::optional<Json> bad_type = DispatchGameTool("world.query", {{"kind", "vehicles"}, {"filters", {{"vehicle_type", "monorail"}}}}, CompanyID::Invalid());
+	REQUIRE(bad_type.has_value());
+	CHECK((*bad_type)["error"] == "invalid_arguments");
+
+	const std::optional<Json> bad_cargo = DispatchGameTool("world.query", {{"kind", "vehicles"}, {"filters", {{"cargo_id", 99}}}}, CompanyID::Invalid());
+	REQUIRE(bad_cargo.has_value());
+	CHECK((*bad_cargo)["error"] == "invalid_arguments");
+	CHECK((*bad_cargo)["detail"]["cargo_id"] == 99);
+
+	const std::optional<Json> bad_bool = DispatchGameTool("world.query", {{"kind", "vehicles"}, {"filters", {{"stopped", "yes"}}}}, CompanyID::Invalid());
+	REQUIRE(bad_bool.has_value());
+	CHECK((*bad_bool)["error"] == "invalid_arguments");
+
+	const std::optional<Json> bad_limit = DispatchGameTool("world.query", {{"kind", "vehicles"}, {"limit", "many"}}, CompanyID::Invalid());
+	REQUIRE(bad_limit.has_value());
+	CHECK((*bad_limit)["error"] == "invalid_arguments");
+}
+
+TEST_CASE("agent_game_tools: ops of the write families that another module owns are not claimed")
+{
+	CHECK_FALSE(DispatchGameTool("world.construct", {{"op", "rail"}}, CompanyID::Invalid()).has_value());
+	CHECK_FALSE(DispatchGameTool("world.construct", {{"op", "signal"}}, CompanyID::Invalid()).has_value());
+	CHECK_FALSE(DispatchGameTool("world.vehicles", {{"op", "autoreplace"}}, CompanyID::Invalid()).has_value());
+	CHECK_FALSE(DispatchGameTool("world.orders", {{"op", "delete"}}, CompanyID::Invalid()).has_value());
+}
+
+TEST_CASE("agent_game_tools: a parameter the op does not read is rejected, not silently dropped")
+{
+	const std::optional<Json> refit = DispatchGameTool("world.vehicles", {{"op", "refit"}, {"vehicle_id", 0}, {"cargo_id", 0}, {"colour", "red"}}, CompanyID(3));
 	REQUIRE(refit.has_value());
-	CHECK((*refit)["error"] == "unsupported_op");
+	CHECK((*refit)["ok"] == false);
+	CHECK((*refit)["error"] == "invalid_arguments");
+	CHECK((*refit)["detail"]["method"] == "world.vehicles");
 	CHECK((*refit)["detail"]["op"] == "refit");
+	CHECK((*refit)["detail"]["unknown"] == Json::array({"colour"}));
+	CHECK(Contains((*refit)["detail"]["supported"], "cargo_id"));
 
-	const std::optional<Json> timetable = DispatchGameTool("world.orders", {{"op", "timetable"}}, CompanyID::Invalid());
+	const std::optional<Json> timetable = DispatchGameTool("world.orders", {{"op", "timetable"}, {"vehicle_id", 0}, {"timetable", Json::array()}, {"orders", Json::array()}}, CompanyID(3));
 	REQUIRE(timetable.has_value());
-	CHECK((*timetable)["error"] == "unsupported_op");
-	CHECK((*timetable)["detail"]["op"] == "timetable");
+	CHECK((*timetable)["error"] == "invalid_arguments");
+	CHECK((*timetable)["detail"]["unknown"] == Json::array({"orders"}));
+
+	/* `expected_refs` belongs to the parent bridge and is accepted everywhere. */
+	const std::optional<Json> expected_refs = DispatchGameTool("world.vehicles", {{"op", "refit"}, {"vehicle_id", 0}, {"cargo_id", 0}, {"expected_refs", Json::array()}}, CompanyID(3));
+	REQUIRE(expected_refs.has_value());
+	CHECK((*expected_refs)["error"] == "invalid_company");
 }
 
 TEST_CASE("agent_game_tools: a write method needs a valid company")
@@ -321,4 +373,176 @@ TEST_CASE("agent_game_tools: order lists are validated before the vehicle is tou
 	const std::optional<Json> group = DispatchGameTool("world.orders", {{"op", "group"}, {"vehicle_id", 0}}, CompanyID(3));
 	REQUIRE(group.has_value());
 	CHECK((*group)["error"] == "invalid_arguments");
+}
+
+TEST_CASE("agent_game_tools: refit parameters are validated before anything is mutated")
+{
+	const std::optional<Json> no_vehicle = DispatchGameTool("world.vehicles", {{"op", "refit"}, {"cargo_id", 0}}, CompanyID(3));
+	REQUIRE(no_vehicle.has_value());
+	CHECK((*no_vehicle)["error"] == "invalid_arguments");
+
+	const std::optional<Json> no_cargo = DispatchGameTool("world.vehicles", {{"op", "refit"}, {"vehicle_id", 0}}, CompanyID(3));
+	REQUIRE(no_cargo.has_value());
+	CHECK((*no_cargo)["error"] == "invalid_arguments");
+
+	const std::optional<Json> bad_cargo = DispatchGameTool("world.vehicles", {{"op", "refit"}, {"vehicle_id", 0}, {"cargo_id", 99}}, CompanyID(3));
+	REQUIRE(bad_cargo.has_value());
+	CHECK((*bad_cargo)["error"] == "invalid_arguments");
+	CHECK((*bad_cargo)["detail"]["cargo_id"] == 99);
+	CHECK((*bad_cargo)["detail"]["max"] == 63);
+
+	const std::optional<Json> bad_flag = DispatchGameTool("world.vehicles", {{"op", "refit"}, {"vehicle_id", 0}, {"cargo_id", 0}, {"only_this", "yes"}}, CompanyID(3));
+	REQUIRE(bad_flag.has_value());
+	CHECK((*bad_flag)["error"] == "invalid_arguments");
+
+	/* A usable request reaches the company check, so refit is dispatched and not a gap. */
+	const std::optional<Json> company = DispatchGameTool("world.vehicles", {{"op", "refit"}, {"vehicle_id", 0}, {"cargo_id", 0}}, CompanyID(3));
+	REQUIRE(company.has_value());
+	CHECK((*company)["error"] == "invalid_company");
+}
+
+TEST_CASE("agent_game_tools: clone parameters are validated before anything is created")
+{
+	const std::optional<Json> no_vehicle = DispatchGameTool("world.vehicles", {{"op", "clone"}}, CompanyID(3));
+	REQUIRE(no_vehicle.has_value());
+	CHECK((*no_vehicle)["error"] == "invalid_arguments");
+
+	const std::optional<Json> count = DispatchGameTool("world.vehicles", {{"op", "clone"}, {"vehicle_id", 0}, {"count", 101}}, CompanyID(3));
+	REQUIRE(count.has_value());
+	CHECK((*count)["error"] == "invalid_arguments");
+	CHECK((*count)["detail"]["max"] == 100);
+
+	const std::optional<Json> zero_count = DispatchGameTool("world.vehicles", {{"op", "clone"}, {"vehicle_id", 0}, {"count", 0}}, CompanyID(3));
+	REQUIRE(zero_count.has_value());
+	CHECK((*zero_count)["error"] == "invalid_arguments");
+
+	const std::optional<Json> share = DispatchGameTool("world.vehicles", {{"op", "clone"}, {"vehicle_id", 0}, {"share_orders", "yes"}}, CompanyID(3));
+	REQUIRE(share.has_value());
+	CHECK((*share)["error"] == "invalid_arguments");
+
+	const std::optional<Json> company = DispatchGameTool("world.vehicles", {{"op", "clone"}, {"vehicle_id", 0}}, CompanyID(3));
+	REQUIRE(company.has_value());
+	CHECK((*company)["error"] == "invalid_company");
+}
+
+TEST_CASE("agent_game_tools: timetable entries are validated before the first command")
+{
+	const std::optional<Json> no_vehicle = DispatchGameTool("world.orders", {{"op", "timetable"}, {"timetable", Json::array({Json{{"index", 0}, {"wait_time", 10}}})}}, CompanyID(3));
+	REQUIRE(no_vehicle.has_value());
+	CHECK((*no_vehicle)["error"] == "invalid_arguments");
+
+	const std::optional<Json> no_entries = DispatchGameTool("world.orders", {{"op", "timetable"}, {"vehicle_id", 0}}, CompanyID(3));
+	REQUIRE(no_entries.has_value());
+	CHECK((*no_entries)["error"] == "invalid_arguments");
+
+	const std::optional<Json> empty = DispatchGameTool("world.orders", {{"op", "timetable"}, {"vehicle_id", 0}, {"timetable", Json::array()}}, CompanyID(3));
+	REQUIRE(empty.has_value());
+	CHECK((*empty)["error"] == "invalid_arguments");
+
+	const std::optional<Json> not_object = DispatchGameTool("world.orders", {{"op", "timetable"}, {"vehicle_id", 0}, {"timetable", Json::array({1})}}, CompanyID(3));
+	REQUIRE(not_object.has_value());
+	CHECK((*not_object)["error"] == "invalid_arguments");
+
+	const std::optional<Json> unknown_field = DispatchGameTool("world.orders", {{"op", "timetable"}, {"vehicle_id", 0}, {"timetable", Json::array({Json{{"index", 0}, {"wait_time", 10}, {"colour", "red"}}})}}, CompanyID(3));
+	REQUIRE(unknown_field.has_value());
+	CHECK((*unknown_field)["error"] == "invalid_arguments");
+	CHECK((*unknown_field)["detail"]["unknown"] == Json::array({"colour"}));
+
+	const std::optional<Json> no_field = DispatchGameTool("world.orders", {{"op", "timetable"}, {"vehicle_id", 0}, {"timetable", Json::array({Json{{"index", 0}}})}}, CompanyID(3));
+	REQUIRE(no_field.has_value());
+	CHECK((*no_field)["error"] == "invalid_arguments");
+
+	const std::optional<Json> bad_value = DispatchGameTool("world.orders", {{"op", "timetable"}, {"vehicle_id", 0}, {"timetable", Json::array({Json{{"index", 0}, {"wait_time", 70000}}})}}, CompanyID(3));
+	REQUIRE(bad_value.has_value());
+	CHECK((*bad_value)["error"] == "invalid_arguments");
+	CHECK((*bad_value)["detail"]["max"] == 65535);
+
+	const std::optional<Json> company = DispatchGameTool("world.orders", {{"op", "timetable"}, {"vehicle_id", 0}, {"timetable", Json::array({Json{{"index", 0}, {"wait_time", 10}}})}}, CompanyID(3));
+	REQUIRE(company.has_value());
+	CHECK((*company)["error"] == "invalid_company");
+}
+
+TEST_CASE("agent_game_tools: world.query answers the canonical kinds and their singular aliases")
+{
+	const Json capabilities = GameToolCapabilities();
+	REQUIRE(capabilities["query_aliases"].is_object());
+	CHECK(capabilities["query_aliases"].size() == 6);
+	CHECK(capabilities["query_aliases"]["vehicles"] == "vehicles");
+	CHECK(capabilities["query_aliases"]["vehicle"] == "vehicles");
+	CHECK(capabilities["query_aliases"]["engines"] == "engines");
+	CHECK(capabilities["query_aliases"]["engine"] == "engines");
+	CHECK(capabilities["query_aliases"]["orders"] == "orders");
+	CHECK(capabilities["query_aliases"]["order"] == "orders");
+
+	for (const auto &[kind, canonical] : {std::pair{"vehicle", "vehicles"}, {"vehicles", "vehicles"},
+			{"engine", "engines"}, {"engines", "engines"}, {"order", "orders"}, {"orders", "orders"}}) {
+		CAPTURE(kind);
+		const std::optional<Json> result = DispatchGameTool("world.query", {{"kind", kind}}, CompanyID::Invalid());
+		REQUIRE(result.has_value());
+		CHECK((*result)["ok"] == true);
+		/* The result always names the canonical kind, whichever spelling the caller used. */
+		CHECK((*result)["kind"] == canonical);
+	}
+}
+
+TEST_CASE("agent_game_tools: a company id that does not fit is rejected instead of truncated")
+{
+	/* 300 truncated to a uint8_t would silently read company 44's rows. */
+	const std::optional<Json> top_level = DispatchGameTool("world.query", {{"kind", "vehicles"}, {"company_id", 300}}, CompanyID::Invalid());
+	REQUIRE(top_level.has_value());
+	CHECK((*top_level)["ok"] == false);
+	CHECK((*top_level)["error"] == "invalid_arguments");
+	CHECK((*top_level)["detail"]["company_id"] == 300);
+	CHECK((*top_level)["detail"]["max"] == 255);
+
+	const std::optional<Json> filter = DispatchGameTool("world.query", {{"kind", "engines"}, {"filters", {{"company_id", 300}}}}, CompanyID::Invalid());
+	REQUIRE(filter.has_value());
+	CHECK((*filter)["error"] == "invalid_arguments");
+	CHECK((*filter)["detail"]["company_id"] == 300);
+
+	const std::optional<Json> negative = DispatchGameTool("world.query", {{"kind", "orders"}, {"filters", {{"company_id", -1}}}}, CompanyID::Invalid());
+	REQUIRE(negative.has_value());
+	CHECK((*negative)["error"] == "invalid_arguments");
+
+	/* A company id that does fit is used as it is. */
+	const std::optional<Json> valid = DispatchGameTool("world.query", {{"kind", "vehicles"}, {"company_id", 2}}, CompanyID::Invalid());
+	REQUIRE(valid.has_value());
+	CHECK((*valid)["ok"] == true);
+	CHECK((*valid)["total"] == 0);
+}
+
+TEST_CASE("agent_game_tools: every filter a kind documents is read without an error")
+{
+	const std::optional<Json> vehicles = DispatchGameTool("world.query", {{"kind", "vehicles"}, {"filters", {
+			{"company_id", 0}, {"vehicle_type", "road"}, {"vehicle_id", 0}, {"cargo_id", 0},
+			{"name_contains", "bus"}, {"in_depot", true}, {"stopped", false}}}}, CompanyID::Invalid());
+	REQUIRE(vehicles.has_value());
+	CHECK((*vehicles)["ok"] == true);
+
+	const std::optional<Json> engines = DispatchGameTool("world.query", {{"kind", "engines"}, {"filters", {
+			{"company_id", 0}, {"vehicle_type", "train"}, {"engine_id", 0}, {"cargo_id", 0},
+			{"name_contains", "loco"}, {"refittable", true}}}}, CompanyID::Invalid());
+	REQUIRE(engines.has_value());
+	CHECK((*engines)["ok"] == true);
+
+	const std::optional<Json> orders = DispatchGameTool("world.query", {{"kind", "orders"}, {"filters", {
+			{"company_id", 0}, {"vehicle_id", 0}}}}, CompanyID::Invalid());
+	REQUIRE(orders.has_value());
+	CHECK((*orders)["ok"] == true);
+}
+
+TEST_CASE("agent_game_tools: a world.query parameter the kind does not read is rejected")
+{
+	const std::optional<Json> unknown = DispatchGameTool("world.query", {{"kind", "vehicles"}, {"colour", "red"}}, CompanyID::Invalid());
+	REQUIRE(unknown.has_value());
+	CHECK((*unknown)["ok"] == false);
+	CHECK((*unknown)["error"] == "invalid_arguments");
+	CHECK((*unknown)["detail"]["method"] == "world.query");
+	CHECK((*unknown)["detail"]["op"] == "vehicles");
+	CHECK((*unknown)["detail"]["unknown"] == Json::array({"colour"}));
+
+	/* `limit`, `offset`, `filters` and `company_id` are read, so they are accepted. */
+	const std::optional<Json> known = DispatchGameTool("world.query", {{"kind", "orders"}, {"limit", 5}, {"offset", 0}, {"company_id", 1}, {"filters", {{"vehicle_id", 0}}}}, CompanyID::Invalid());
+	REQUIRE(known.has_value());
+	CHECK((*known)["ok"] == true);
 }
