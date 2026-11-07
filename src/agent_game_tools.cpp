@@ -2500,7 +2500,7 @@ std::optional<Json> CheckOrderRefit(const Order &order, size_t index)
 	Json detail = Json::object();
 	detail["order_index"] = index;
 	detail["reason"] = reason;
-	return MakeError("invalid_arguments", "the refit of order " + std::to_string(index) + " cannot be applied: " + reason, std::move(detail));
+	return MakeError("invalid_arguments", fmt::format("the refit of order {} cannot be applied: {}", index, reason), std::move(detail));
 }
 
 /**
