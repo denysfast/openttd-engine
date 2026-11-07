@@ -3811,9 +3811,14 @@ static constexpr std::initializer_list<NWidgetPart> _nested_agent_chat_settings_
 	EndContainer(),
 };
 
-/** Window description of the settings picker. */
+/**
+ * Window description of the settings picker.
+ *
+ * The picker is a transient child of the chat window: it has no size or sticky box of its own, so it
+ * carries no ini key and nothing about it is persisted between runs.
+ */
 static WindowDesc _agent_chat_settings_window_desc(
-	WindowPosition::Automatic, "agent_chat_settings", 440, 340,
+	WindowPosition::Automatic, {}, 440, 340,
 	WindowClass::AgentChatSettings, WindowClass::AgentChat,
 	{},
 	_nested_agent_chat_settings_widgets

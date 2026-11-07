@@ -19,11 +19,15 @@
 
 #include "../3rdparty/catch2/catch.hpp"
 
+#include <filesystem>
+
 #include "../agent_bridge.h"
 #include "../agent_chat_gui.h"
 #include "../company_base.h"
 #include "../company_func.h"
+#include "../language.h"
 #include "../openttd.h"
+#include "../strings_func.h"
 
 #include "../safeguards.h"
 
@@ -63,6 +67,58 @@ public:
 
 private:
 	CompanyID previous_local_company; ///< `_local_company` before the fixture ran.
+};
+
+/**
+ * Load the language pack the build generated, for the duration of one test case.
+ *
+ * The test binary has no language pack of its own: `GetString()` aborts on the first string that is
+ * not in the loaded table ("String 0x88CF is invalid"), and the tray label of a setting is built
+ * from STR_AGENT_CHAT_ATTACHMENT_SETTING_COMPANY and the name of the owning company. The pack is the
+ * real `english.lng` the build writes to `${CMAKE_BINARY_DIR}/lang`; CTest passes its path in
+ * `OTTD_TEST_LANGUAGE_FILE`, and the relative path is the fallback for a manual run from the build
+ * directory. The language that was current before is put back when the fixture goes out of scope, so
+ * the other cases of this binary keep the table they had.
+ *
+ * The metadata is static because `ReadLanguagePack()` keeps the pointer it is given as the current
+ * language, so a stack object would dangle once the pack is loaded.
+ */
+class TestLanguagePack {
+public:
+	TestLanguagePack()
+	{
+		static LanguageMetadata english;
+		if (_current_language == &english) return;
+
+		std::vector<std::filesystem::path> candidates;
+		if (const char *from_ctest = getenv("OTTD_TEST_LANGUAGE_FILE"); from_ctest != nullptr && *from_ctest != '\0') {
+			candidates.emplace_back(from_ctest);
+		}
+		candidates.emplace_back(std::filesystem::path("lang") / "english.lng");
+
+		for (const std::filesystem::path &candidate : candidates) {
+			if (!std::filesystem::exists(candidate)) continue;
+			english.file = candidate;
+			this->previous_language = _current_language;
+			this->previous_text_dir = _current_text_dir;
+			REQUIRE(ReadLanguagePack(&english));
+			this->loaded = true;
+			return;
+		}
+		FAIL("no english.lng found: CTest passes OTTD_TEST_LANGUAGE_FILE, a manual run needs the build directory as its working directory");
+	}
+
+	~TestLanguagePack()
+	{
+		if (!this->loaded) return;
+		_current_language = this->previous_language;
+		_current_text_dir = this->previous_text_dir;
+	}
+
+private:
+	const LanguageMetadata *previous_language = nullptr; ///< Language that was current before the fixture ran.
+	TextDirection previous_text_dir = TD_LTR;            ///< Text direction that was current before the fixture ran.
+	bool loaded = false;                                 ///< Whether this fixture loaded a pack and has to restore it.
 };
 
 /** Find one picker row by its exact key, or an empty object when the list does not offer it. */
@@ -153,6 +209,8 @@ TEST_CASE("Agent chat settings picker: the search filters the list")
 
 TEST_CASE("Agent chat settings picker: the tray label of a setting names the key and the owner")
 {
+	/* The label is built from the real strings of the build, so the pack is loaded here. */
+	TestLanguagePack language;
 	TestOwner owner;
 	owner.company->name = "Acme Transport";
 
