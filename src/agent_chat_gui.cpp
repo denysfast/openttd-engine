@@ -1005,6 +1005,7 @@ static void AgentChatSend()
 			}
 			_agent_chat.input.clear();
 			_agent_chat.caret = 0;
+			_agent_chat.composed_length = 0;
 			_agent_chat.tray.clear();
 			_agent_chat.scroll = INT32_MAX;
 			InvalidateWindowClassesData(WindowClass::AgentChat);
@@ -1856,24 +1857,25 @@ struct AgentChatWindow : Window {
 
 		if (base == WKC_HOME) {
 			_agent_chat.caret = 0;
+			this->ResetComposition();
 			this->SetWidgetDirty(WID_AC_INPUT);
 			return EventState::Handled;
 		}
 
 		if (base == WKC_END) {
 			_agent_chat.caret = _agent_chat.input.size();
+			this->ResetComposition();
 			this->SetWidgetDirty(WID_AC_INPUT);
 			return EventState::Handled;
 		}
 
 		if (key != 0 && IsPrintable(key)) {
-			/* While the input owns the edit box focus the backend delivers printable characters as
-			 * text input (InsertTextString), so inserting them here as well would duplicate every
-			 * one of them. This path stays for backends that do not do that. */
-			if (!EditBoxInGlobalFocus()) {
-				auto [buf, len] = EncodeUtf8(key);
-				this->InsertInput(std::string_view(buf, len));
-			}
+			/* A character reaches the game either as text input (SDL and Cocoa: InsertTextString)
+			 * or as a key press that carries the character (Windows: WM_CHAR, and the SDL backend
+			 * when no edit box has the text focus). No backend sends both for the same character,
+			 * so both paths insert, and neither duplicates the other. */
+			auto [buf, len] = EncodeUtf8(key);
+			this->InsertInput(std::string_view(buf, len));
 			return EventState::Handled;
 		}
 
@@ -1933,7 +1935,87 @@ struct AgentChatWindow : Window {
 	 */
 	Point GetCaretPosition() const override
 	{
+		if (this->GetWidget<NWidgetBase>(WID_AC_INPUT) == nullptr) return {0, 0};
 		return this->GetInputCaretPoint(this->GetInnerRect(WID_AC_INPUT));
+	}
+
+	/**
+	 * Get the bounding rectangle of a range of the text in the message box.
+	 *
+	 * The base implementation dereferences the QueryString of the focused edit box, and the
+	 * message box has none (it keeps its own buffer), so the range is measured here instead.
+	 * @param from First byte of the range.
+	 * @param to Last byte of the range (exclusive).
+	 * @return The rectangle of the range, empty when it is not on screen.
+	 */
+	Rect GetTextBoundingRect(size_t from, size_t to) const override
+	{
+		const Rect area = this->GetInnerRect(WID_AC_INPUT);
+		const InputLayout layout = this->LayoutInput(area);
+		const int line_height = GetCharacterHeight(FontSize::Normal);
+
+		size_t line_begin = 0;
+		for (size_t i = 0; i < layout.lines.size(); i++) {
+			const std::string &line = layout.lines[i];
+			if (from <= line_begin + line.size()) {
+				if (i < layout.first_line || i - layout.first_line >= static_cast<size_t>(layout.visible_lines)) return {0, 0, 0, 0};
+
+				const size_t begin = std::min(from - line_begin, line.size());
+				const size_t finish = std::clamp(to > line_begin ? to - line_begin : 0, begin, line.size());
+				const int y = area.top + static_cast<int>(i - layout.first_line) * line_height;
+				const int left = area.left + static_cast<int>(GetStringBoundingBox(std::string_view(line).substr(0, begin)).width);
+				const int right = area.left + static_cast<int>(GetStringBoundingBox(std::string_view(line).substr(0, finish)).width);
+				return {left, y, right, y + line_height - 1};
+			}
+			line_begin += line.size() + 1;
+		}
+		return {0, 0, 0, 0};
+	}
+
+	/**
+	 * Get the character of the message box at a position.
+	 *
+	 * The base implementation dereferences the QueryString of the focused edit box, and the
+	 * message box has none (it keeps its own buffer), so the position is mapped here instead.
+	 * @param pt The position, relative to the window.
+	 * @return The byte offset of the nearest character boundary, or -1 when the position is outside.
+	 */
+	ptrdiff_t GetTextCharacterAtPosition(const Point &pt) const override
+	{
+		const Rect area = this->GetInnerRect(WID_AC_INPUT);
+		if (!area.Contains(pt)) return -1;
+
+		const InputLayout layout = this->LayoutInput(area);
+		const size_t index = layout.first_line + static_cast<size_t>(std::max(0, (pt.y - area.top) / GetCharacterHeight(FontSize::Normal)));
+		if (index >= layout.lines.size()) return -1;
+
+		size_t line_begin = 0;
+		for (size_t i = 0; i < index; i++) line_begin += layout.lines[i].size() + 1;
+
+		const std::string &line = layout.lines[index];
+		size_t best = 0;
+		int best_distance = std::abs(pt.x - area.left);
+		for (size_t pos = 0; pos < line.size(); pos++) {
+			/* Only the last byte of a character is a boundary. */
+			if (pos + 1 < line.size() && IsUtf8Part(line[pos + 1])) continue;
+
+			const int width = area.left + static_cast<int>(GetStringBoundingBox(std::string_view(line).substr(0, pos + 1)).width);
+			const int distance = std::abs(width - pt.x);
+			if (distance < best_distance) {
+				best_distance = distance;
+				best = pos + 1;
+			}
+		}
+		return static_cast<ptrdiff_t>(line_begin + best);
+	}
+
+	/**
+	 * Forget the text of an IME composition that is no longer being composed, so the next text
+	 * input update does not try to replace it.
+	 */
+	void ResetComposition()
+	{
+		_agent_chat.composed_length = 0;
 	}
 
 	/**
@@ -1945,6 +2027,7 @@ struct AgentChatWindow : Window {
 		if (_agent_chat.input.size() + text.size() > AGENT_CHAT_MAX_INPUT) return;
 		_agent_chat.input.insert(_agent_chat.caret, text);
 		_agent_chat.caret += text.size();
+		this->ResetComposition();
 		this->UpdateWidgetStates();
 		this->SetWidgetDirty(WID_AC_INPUT);
 	}
@@ -1957,6 +2040,7 @@ struct AgentChatWindow : Window {
 		while (begin > 0 && IsUtf8Part(_agent_chat.input[begin])) begin--;
 		_agent_chat.input.erase(begin, _agent_chat.caret - begin);
 		_agent_chat.caret = begin;
+		this->ResetComposition();
 		this->UpdateWidgetStates();
 		this->SetWidgetDirty(WID_AC_INPUT);
 	}
@@ -1968,6 +2052,7 @@ struct AgentChatWindow : Window {
 		size_t end = _agent_chat.caret + 1;
 		while (end < _agent_chat.input.size() && IsUtf8Part(_agent_chat.input[end])) end++;
 		_agent_chat.input.erase(_agent_chat.caret, end - _agent_chat.caret);
+		this->ResetComposition();
 		this->UpdateWidgetStates();
 		this->SetWidgetDirty(WID_AC_INPUT);
 	}
@@ -1989,6 +2074,7 @@ struct AgentChatWindow : Window {
 			while (pos < _agent_chat.input.size() && IsUtf8Part(_agent_chat.input[pos])) pos++;
 			_agent_chat.caret = pos;
 		}
+		this->ResetComposition();
 		this->SetWidgetDirty(WID_AC_INPUT);
 	}
 
