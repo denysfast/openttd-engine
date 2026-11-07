@@ -6459,9 +6459,9 @@ STR_AGENT_CHAT_SETTING_PICKER_CLOSE                             :Close
 STR_AGENT_CHAT_SETTING_PICKER_CLOSE_TOOLTIP                     :Close the settings picker without attaching anything
 STR_AGENT_CHAT_SETTING_PICKER_EMPTY                             :{GRAY}No setting matches the filter.
 STR_AGENT_CHAT_SETTING_PICKER_STALE                             :The game changed while the settings picker was open; nothing was attached.
-STR_AGENT_CHAT_SETTING_PICKER_OWNER                             :Owner: {STRING}
+STR_AGENT_CHAT_SETTING_PICKER_OWNER                             :Owner: {RAW_STRING}
 STR_AGENT_CHAT_SETTING_PICKER_OWNER_TOOLTIP                     :Choose the company whose value a company setting shows
 STR_AGENT_CHAT_SETTING_PICKER_OWNER_NONE                        :no company
 STR_AGENT_CHAT_SETTING_PICKER_OWNER_GONE                        :The company of the settings picker changed; nothing was attached.
-STR_AGENT_CHAT_ATTACHMENT_SETTING_COMPANY                       :{STRING} (company {STRING})
+STR_AGENT_CHAT_ATTACHMENT_SETTING_COMPANY                       :{RAW_STRING} (company {RAW_STRING})
 STR_AGENT_CHAT_ATTACHMENT_COMPANY_ID                            :company #{NUM}

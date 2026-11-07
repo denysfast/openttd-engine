@@ -28,6 +28,7 @@
 #include "../language.h"
 #include "../openttd.h"
 #include "../strings_func.h"
+#include "../table/strings.h"
 
 #include "../safeguards.h"
 
@@ -234,6 +235,13 @@ TEST_CASE("Agent chat settings picker: the tray label of a setting names the key
 	/* A setting without an owner id keeps the bare key, so a scope/owner mismatch stays visible. */
 	const std::string no_owner = SettingAttachmentLabelForTest("engine_renew", "company", -1);
 	CHECK(no_owner == "engine_renew");
+
+	/* The owner caption of the picker formats that same owner label, so its string has to take the
+	 * raw owner text and not a string id: a {STRING} slot would read the text as a number and throw.
+	 * The caption needs the picker window, which the real UI test covers. */
+	const std::string caption = GetString(STR_AGENT_CHAT_SETTING_PICKER_OWNER, owner.company->name);
+	CHECK(caption.find(owner.company->name) != std::string::npos);
+	CHECK(caption != owner.company->name);
 }
 
 TEST_CASE("Agent chat settings picker: a company setting belongs to one company lifetime")
