@@ -2767,42 +2767,13 @@ Json CameraCapabilities()
 }
 
 /**
- * The methods the engine can actually serve right now.
- *
- * Composed from the core methods of this file and from the capability documents of the tool
- * modules: a method is only advertised when a module really implements at least one of its
- * operations, so a gap is never advertised as a capability. The per-module documents are sent
- * along as detail, so the backend and the operator can see what is missing.
- * @return {methods, modules}: the advertised method names and the module documents.
+ * The contracts of the methods whose answer is more than the data: how to guard a pause against
+ * a newer decision, and what the timing numbers actually measure. They are sent with the
+ * capability document so the environment does not have to guess either of them.
+ * @return The contracts document.
  */
-Json Capabilities()
+Json CoreContracts()
 {
-	std::vector<std::string> methods = {"world.info", "world.query", "world.objects", "world.pause",
-			"world.rename", "world.capture", "world.camera.get", "world.camera.set", "world.commands",
-			"world.command", "task.barrier", "ui.inspect"};
-	Json modules = Json::array();
-
-	for (const Json &module : {GameToolCapabilities(), TransportToolCapabilities(), AdminToolCapabilities(), CameraCapabilities(), CommandCatalogCapabilities()}) {
-		modules.push_back(module);
-		const auto entries = module.find("methods");
-		if (entries == module.end() || !entries->is_array()) continue;
-		for (const Json &entry : *entries) {
-			const auto implemented = entry.find("implemented");
-			if (implemented == entry.end() || !implemented->is_array() || implemented->empty()) continue;
-			const std::string name = JsonString(entry, "method");
-			if (name.empty()) continue;
-			if (std::find(methods.begin(), methods.end(), name) == methods.end()) methods.push_back(name);
-		}
-	}
-
-	Json advertised = Json::array();
-	for (const std::string &method : methods) advertised.push_back(method);
-
-	/*
-	 * The contracts of the methods whose answer is more than the data: how to guard a pause against
-	 * a newer decision, and what the timing numbers actually measure. They are sent with the
-	 * capability document so the environment does not have to guess either of them.
-	 */
 	Json contracts = Json::object();
 	contracts["pause"] = {
 		{"revision_source", "every accepted change through Commands::Pause, whoever posted it"},
@@ -2843,6 +2814,77 @@ Json Capabilities()
 		{"budget", "a threshold that counts overruns; nothing is aborted when it is exceeded"},
 		{"ordering", "a world.info answer reports the executions that finished before it"},
 	};
+
+	return contracts;
+}
+
+/**
+ * The kernel methods of this file, described the way the tool modules describe theirs.
+ *
+ * world.query is answered by two modules: the game tool module owns vehicles, engines, orders,
+ * groups and cargos, and this module owns the kinds the kernel iterates itself, so the gap one
+ * module reports is never the claim of the other. The contracts of the methods whose answer is
+ * more than the data travel with this document, so the hello detail carries them and the
+ * environment does not have to guess how to guard a pause or what the timing numbers measure.
+ * @return Capability document of the kernel methods.
+ */
+Json CoreCapabilities()
+{
+	Json methods = Json::array();
+	methods.push_back({
+		{"method", "world.query"},
+		{"authority", "read"},
+		{"implemented", Json::array({"towns", "companies", "stations", "industries", "signs", "tiles"})},
+		{"gaps", Json::array()},
+	});
+
+	Json result = Json::object();
+	result["module"] = "agent_bridge_core";
+	result["methods"] = std::move(methods);
+	result["contracts"] = CoreContracts();
+	result["notes"] = Json::array({
+		"world.query kind=towns, companies, stations, industries, signs and tiles is the kernel read; the game tool module answers vehicles, engines, orders, groups and cargos, so the two documents together describe the whole query.",
+		"These kinds are read through the engine's own Iterate() accessors and never written, so the agent can verify a command's effect against the next read.",
+		"The pause, calendar, refs and timing contracts are in this document, because the kernel methods they describe are the ones this module answers.",
+	});
+	return result;
+}
+
+/**
+ * The methods the engine can actually serve right now.
+ *
+ * Composed from the core methods of this file and from the capability documents of the tool
+ * modules: a method is only advertised when a module really implements at least one of its
+ * operations, so a gap is never advertised as a capability. The per-module documents are sent
+ * along as detail, so the backend and the operator can see what is missing; the contracts travel
+ * in the core module document, because the hello detail carries only the modules.
+ * @return {methods, modules, contracts}: the advertised method names, the module documents and
+ * the contracts of the methods whose answer is more than the data.
+ */
+Json Capabilities()
+{
+	std::vector<std::string> methods = {"world.info", "world.query", "world.objects", "world.pause",
+			"world.rename", "world.capture", "world.camera.get", "world.camera.set", "world.commands",
+			"world.command", "task.barrier", "ui.inspect"};
+	Json modules = Json::array();
+
+	for (const Json &module : {CoreCapabilities(), GameToolCapabilities(), TransportToolCapabilities(), AdminToolCapabilities(), CameraCapabilities(), CommandCatalogCapabilities()}) {
+		modules.push_back(module);
+		const auto entries = module.find("methods");
+		if (entries == module.end() || !entries->is_array()) continue;
+		for (const Json &entry : *entries) {
+			const auto implemented = entry.find("implemented");
+			if (implemented == entry.end() || !implemented->is_array() || implemented->empty()) continue;
+			const std::string name = JsonString(entry, "method");
+			if (name.empty()) continue;
+			if (std::find(methods.begin(), methods.end(), name) == methods.end()) methods.push_back(name);
+		}
+	}
+
+	Json advertised = Json::array();
+	for (const std::string &method : methods) advertised.push_back(method);
+
+	Json contracts = CoreContracts();
 
 	return {{"methods", std::move(advertised)}, {"modules", std::move(modules)}, {"contracts", std::move(contracts)}};
 }
