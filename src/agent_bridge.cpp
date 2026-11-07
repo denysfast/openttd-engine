@@ -10,6 +10,7 @@
 #include "stdafx.h"
 #include "agent_bridge.h"
 
+#include "agent_chat_gui.h"
 #include "command_func.h"
 #include "company_base.h"
 #include "company_cmd.h"
@@ -17,12 +18,14 @@
 #include "core/backup_type.hpp"
 #include "core/math_func.hpp"
 #include "debug.h"
+#include "genworld.h"
 #include "industry.h"
 #include "map_func.h"
 #include "misc_cmd.h"
 #include "network/core/http.h"
 #include "network/network.h"
 #include "openttd.h"
+#include "progress.h"
 #include "rev.h"
 #include "signs_base.h"
 #include "station_base.h"
@@ -277,6 +280,22 @@ Json Error(std::string_view code, std::string_view message = {})
 	Json result = {{"ok", false}, {"error", std::string(code)}};
 	if (!message.empty()) result["message"] = std::string(message);
 	return result;
+}
+
+/**
+ * Check whether the world may be read or changed right now.
+ *
+ * While a world is generated or a savegame is loaded, the map and the pools are
+ * owned by the progress thread and are not consistent yet. The bridge must not
+ * query or mutate them then, and must not advertise a world that is not usable.
+ * @return True iff a loaded world exists and no modal progress is running.
+ */
+bool IsWorldReady()
+{
+	if (_game_mode != GameMode::Normal && _game_mode != GameMode::Editor) return false;
+	if (_generating_world) return false;
+	if (HasModalProgress()) return false;
+	return true;
 }
 
 /**
@@ -1036,6 +1055,13 @@ Json ExecuteRequest(const Json &request)
 	/* A request may only be applied to the world and epoch it was issued for; check before anything else. */
 	if (const std::optional<Json> stale = CheckRequestWorld(request); stale.has_value()) return *stale;
 
+	/*
+	 * The world may have started generating or loading between the poll and this
+	 * execution; the map and the pools are not consistent then, so fail closed
+	 * instead of reading or mutating a half built world.
+	 */
+	if (!IsWorldReady()) return Error("world_not_ready", "the world is being generated or loaded");
+
 	/* Mutations are only supported in single player: in multiplayer Post() merely enqueues the command. */
 	if (IsMutation(method) && _networking) return Error("multiplayer_unsupported", "mutations are only supported in single player");
 
@@ -1059,6 +1085,9 @@ Json ExecuteRequest(const Json &request)
 	if (method == "world.objects") return WorldObjects(params);
 	if (method == "world.pause") return WorldPause(params);
 	if (method == "world.rename") return WorldRename(params, RequestCompanyId(request));
+
+	/* Read-only description of the native chat UI, so a GUI test can locate real targets. */
+	if (method == "ui.inspect") return Ok(::DescribeAgentChatUi());
 
 	return Error("unsupported_method", method);
 }
@@ -1227,7 +1256,7 @@ void SendHello()
 		{"world_id", _state.world_id},
 		{"epoch", _state.epoch},
 		{"build", std::string(_openttd_revision)},
-		{"capabilities", Json::array({"world.info", "world.query", "world.objects", "world.pause", "world.rename", "task.barrier"})},
+		{"capabilities", Json::array({"world.info", "world.query", "world.objects", "world.pause", "world.rename", "task.barrier", "ui.inspect"})},
 	};
 
 	Send(RequestKind::Hello, "/v1/engine/hello", body.dump(), _state.engine_token, _state.epoch, nullptr);
@@ -1286,8 +1315,12 @@ void Tick()
 	NetworkHTTPSocketHandler::HTTPReceive();
 	ProcessCompletions();
 
-	/* The bridge only talks about a world that is actually loaded. */
-	if (_game_mode != GameMode::Normal && _game_mode != GameMode::Editor) return;
+	/*
+	 * The bridge only talks about a world that is actually loaded and not being
+	 * generated or loaded: no hello, poll or result may describe a half built
+	 * world. Completions above are still drained, so nothing is lost meanwhile.
+	 */
+	if (!IsWorldReady()) return;
 
 	const Clock::time_point now = Clock::now();
 
@@ -1357,6 +1390,7 @@ Json Context()
 Json PickObjects(TileIndex tile)
 {
 	Json objects = Json::array();
+	if (!IsWorldReady()) return objects;
 	if (!IsValidTile(tile)) return objects;
 
 	const TileType type = GetTileType(tile);
