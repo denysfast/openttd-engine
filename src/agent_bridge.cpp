@@ -1,0 +1,1031 @@
+/*
+ * This file is part of OpenTTD.
+ * OpenTTD is free software; you can redistribute it and/or modify it under the terms of the GNU General Public License as published by the Free Software Foundation, version 2.
+ * OpenTTD is distributed in the hope that it will be useful, but WITHOUT ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.
+ * See the GNU General Public License for more details. You should have received a copy of the GNU General Public License along with OpenTTD. If not, see <https://www.gnu.org/licenses/old-licenses/gpl-2.0>.
+ */
+
+/** @file agent_bridge.cpp Native bridge between the running game and the in-game agent backend. */
+
+#include "stdafx.h"
+#include "agent_bridge.h"
+
+#include "command_func.h"
+#include "company_base.h"
+#include "company_cmd.h"
+#include "company_func.h"
+#include "core/backup_type.hpp"
+#include "core/math_func.hpp"
+#include "debug.h"
+#include "industry.h"
+#include "map_func.h"
+#include "misc_cmd.h"
+#include "network/core/http.h"
+#include "network/network.h"
+#include "openttd.h"
+#include "rev.h"
+#include "station_base.h"
+#include "station_cmd.h"
+#include "strings_func.h"
+#include "table/strings.h"
+#include "timer/timer_game_calendar.h"
+#include "timer/timer_game_tick.h"
+#include "tile_map.h"
+#include "town.h"
+#include "town_cmd.h"
+
+#include "3rdparty/fmt/format.h"
+
+#include <algorithm>
+#include <chrono>
+#include <cstdlib>
+#include <deque>
+#include <map>
+#include <memory>
+#include <optional>
+#include <random>
+#include <set>
+#include <string>
+#include <string_view>
+#include <vector>
+
+#include "safeguards.h"
+
+namespace InGameAgent {
+
+namespace {
+
+using Clock = std::chrono::steady_clock;
+
+/** Delay before retrying a failed hello. */
+constexpr auto HELLO_RETRY = std::chrono::seconds(5);
+/** Delay before retrying a failed poll. */
+constexpr auto POLL_RETRY = std::chrono::seconds(2);
+/** Delay before retrying a failed result delivery. */
+constexpr auto RESULT_RETRY = std::chrono::seconds(1);
+/** Maximum number of results kept while the backend is unreachable. */
+constexpr size_t MAX_PENDING_RESULTS = 256;
+/** Maximum number of request receipts kept for idempotent replay. */
+constexpr size_t MAX_RECEIPTS = 512;
+/** Default page size of world.query. */
+constexpr int DEFAULT_QUERY_LIMIT = 50;
+/** Maximum page size of world.query. */
+constexpr int MAX_QUERY_LIMIT = 500;
+/** Maximum number of tiles a single world.query may cover. */
+constexpr int MAX_QUERY_TILES = 4096;
+
+/**
+ * Generate a random (version 4) UUID.
+ * @return The UUID as a lower case string.
+ */
+std::string GenerateUuid()
+{
+	static std::mt19937_64 rng{std::random_device{}()};
+	uint64_t hi = rng();
+	uint64_t lo = rng();
+
+	hi = (hi & 0xFFFFFFFFFFFF0FFFULL) | 0x0000000000004000ULL;
+	lo = (lo & 0x3FFFFFFFFFFFFFFFULL) | 0x8000000000000000ULL;
+
+	return fmt::format("{:08x}-{:04x}-{:04x}-{:04x}-{:012x}",
+			static_cast<uint32_t>(hi >> 32), static_cast<uint16_t>(hi >> 16), static_cast<uint16_t>(hi),
+			static_cast<uint16_t>(lo >> 48), static_cast<uint64_t>(lo & 0xFFFFFFFFFFFFULL));
+}
+
+/**
+ * Lower case an ASCII string.
+ * @param text The string to lower case.
+ * @return The lower cased string.
+ */
+std::string LowerAscii(std::string_view text)
+{
+	std::string result(text);
+	for (char &c : result) {
+		if (c >= 'A' && c <= 'Z') c = c - 'A' + 'a';
+	}
+	return result;
+}
+
+/**
+ * Check whether a string contains another string, ignoring ASCII case.
+ * @param haystack The string to search in.
+ * @param needle The lower cased string to search for.
+ * @return True iff \a haystack contains \a needle.
+ */
+bool ContainsAsciiCI(std::string_view haystack, std::string_view needle)
+{
+	if (needle.empty()) return true;
+	const std::string lowered = LowerAscii(haystack);
+	return lowered.find(needle) != std::string::npos;
+}
+
+/**
+ * Read an integer from a JSON object, tolerating floats and missing keys.
+ * @param object The object to read from.
+ * @param key The key to read.
+ * @param fallback The value to return when the key is missing or not a number.
+ * @return The value of the key, or \a fallback.
+ */
+int JsonInt(const Json &object, const char *key, int fallback)
+{
+	if (!object.is_object() || !object.contains(key)) return fallback;
+	const Json &value = object[key];
+	if (value.is_number_integer()) return value.get<int>();
+	if (value.is_number_float()) return static_cast<int>(value.get<double>());
+	return fallback;
+}
+
+/**
+ * Read a string from a JSON object, tolerating missing keys and other types.
+ * @param object The object to read from.
+ * @param key The key to read.
+ * @param fallback The value to return when the key is missing or not a string.
+ * @return The value of the key, or \a fallback.
+ */
+std::string JsonString(const Json &object, const char *key, std::string_view fallback = {})
+{
+	if (!object.is_object() || !object.contains(key)) return std::string(fallback);
+	const Json &value = object[key];
+	if (!value.is_string()) return std::string(fallback);
+	return value.get<std::string>();
+}
+
+/** A finished HTTP request, waiting to be handled on the main thread. */
+struct Completion {
+	uint64_t id;      ///< Identifier of the request.
+	bool ok;          ///< Whether the request completed without a transport error.
+	std::string body; ///< The received body.
+};
+
+std::vector<Completion> _completions; ///< Completions waiting for the main thread.
+
+/**
+ * HTTP callback that collects the response body and hands it to the main thread.
+ *
+ * The callbacks are invoked from NetworkHTTPSocketHandler::HTTPReceive(), which
+ * runs on the main thread, so no locking is needed here.
+ */
+class BridgeHTTPCallback : public HTTPCallback {
+public:
+	/**
+	 * Create the callback.
+	 * @param id Identifier of the request this callback belongs to.
+	 */
+	explicit BridgeHTTPCallback(uint64_t id) : id(id) {}
+
+	void OnFailure() override
+	{
+		_completions.push_back({this->id, false, std::string{}});
+	}
+
+	void OnReceiveData(std::unique_ptr<char[]> data, size_t length) override
+	{
+		if (data == nullptr) {
+			_completions.push_back({this->id, true, std::move(this->body)});
+			this->body.clear();
+			return;
+		}
+		this->body.append(data.get(), length);
+	}
+
+	bool IsCancelled() const override { return false; }
+
+private:
+	uint64_t id;      ///< Identifier of the request this callback belongs to.
+	std::string body; ///< Body received so far.
+};
+
+/** The kind of request that is in flight. */
+enum class RequestKind {
+	Hello, ///< POST /v1/engine/hello
+	Poll,  ///< POST /v1/engine/poll
+	Result,///< POST /v1/engine/result
+	Ui,    ///< A request made by the native UI.
+};
+
+/** Bookkeeping for a request that is in flight. */
+struct PendingRequest {
+	RequestKind kind;                                ///< The kind of request.
+	std::string epoch;                               ///< The epoch the request was issued for.
+	std::function<void(bool, const Json &)> callback;///< Callback for UI requests.
+};
+
+/** A stored result of an executed request, kept so that a replay is answered identically. */
+struct Receipt {
+	Json result;               ///< The result of the request.
+	bool acknowledged = false; ///< Whether the backend acknowledged delivery of the result.
+};
+
+/** All state of the bridge. */
+struct BridgeState {
+	bool initialised = false; ///< Whether the runtime configuration has been read.
+	bool enabled = false;     ///< Whether a backend is configured.
+	std::string base_url;     ///< Base URL of the backend, without a trailing slash.
+	std::string engine_token; ///< Token for the engine routes.
+	std::string ui_token;     ///< Token for the chat routes.
+	std::string engine_id;    ///< Stable identity of this engine.
+
+	std::string world_id;      ///< Identity of the world, persisted with the savegame.
+	std::string epoch;         ///< Identity of this load of the world.
+	std::string connection_id; ///< Connection handed out by the backend.
+	bool connected = false;    ///< Whether the backend accepted our hello.
+	int heartbeat_seconds = 5; ///< Poll interval requested by the backend.
+	int64_t cursor = 0;        ///< Highest request sequence we have received.
+
+	bool hello_in_flight = false;  ///< Whether a hello is in flight.
+	bool poll_in_flight = false;   ///< Whether a poll is in flight.
+	bool result_in_flight = false; ///< Whether a result delivery is in flight.
+	Clock::time_point next_hello{};  ///< Earliest time to send the next hello.
+	Clock::time_point next_poll{};   ///< Earliest time to send the next poll.
+	Clock::time_point next_result{}; ///< Earliest time to send the next result.
+
+	std::deque<Json> results;              ///< Results waiting to be delivered.
+	Json inflight_result;                  ///< Result currently being delivered.
+	std::map<std::string, Receipt> receipts; ///< Results of executed requests, by request id.
+	std::deque<std::string> receipt_order; ///< Order in which receipts were stored.
+	std::set<std::string> barrier_tasks;   ///< Tasks whose barrier has been acknowledged.
+};
+
+BridgeState _state;                                        ///< The bridge state.
+uint64_t _next_request_id = 0;                             ///< Identifier of the next request.
+std::map<uint64_t, PendingRequest> _pending;               ///< Requests that are in flight.
+std::map<uint64_t, std::unique_ptr<BridgeHTTPCallback>> _callbacks; ///< Callbacks of the requests in flight.
+
+/**
+ * Build a successful method result.
+ * @param value The value of the result.
+ * @return The result.
+ */
+Json Ok(Json value)
+{
+	return {{"ok", true}, {"value", std::move(value)}};
+}
+
+/**
+ * Build a failed method result.
+ * @param code The machine readable error code.
+ * @param message Optional human readable message.
+ * @return The result.
+ */
+Json Error(std::string_view code, std::string_view message = {})
+{
+	Json result = {{"ok", false}, {"error", std::string(code)}};
+	if (!message.empty()) result["message"] = std::string(message);
+	return result;
+}
+
+/**
+ * Resolve the identity of the current world, if it is not known yet.
+ *
+ * The savegame id is persisted with the savegame, so it is a stable identity
+ * for the world across loads.
+ */
+void ResolveWorldId()
+{
+	if (!_state.world_id.empty()) return;
+	_state.world_id = _game_session_stats.savegame_id;
+	if (_state.world_id.empty()) _state.world_id = GenerateUuid();
+}
+
+/**
+ * Read the runtime configuration, once.
+ * @return True iff a backend is configured.
+ */
+bool EnsureInitialised()
+{
+	if (_state.initialised) return _state.enabled;
+	_state.initialised = true;
+
+	const char *url = std::getenv("AGENT_BACKEND_URL");
+	if (url == nullptr || *url == '\0') {
+		Debug(Facility::Net, Severity::Info, "In-game agent bridge: AGENT_BACKEND_URL is not set; bridge disabled");
+		return false;
+	}
+
+	_state.base_url = url;
+	while (!_state.base_url.empty() && _state.base_url.back() == '/') _state.base_url.pop_back();
+
+	const char *engine_token = std::getenv("AGENT_ENGINE_TOKEN");
+	const char *ui_token = std::getenv("AGENT_UI_TOKEN");
+	const char *engine_id = std::getenv("AGENT_ENGINE_ID");
+	_state.engine_token = engine_token != nullptr ? engine_token : "";
+	_state.ui_token = ui_token != nullptr ? ui_token : "";
+	_state.engine_id = (engine_id != nullptr && *engine_id != '\0') ? engine_id : GenerateUuid();
+
+	if (_state.epoch.empty()) _state.epoch = GenerateUuid();
+
+	_state.enabled = true;
+	_state.next_hello = Clock::now();
+	Debug(Facility::Net, Severity::Info, "In-game agent bridge: backend {} configured", _state.base_url);
+	return true;
+}
+
+/**
+ * Send a request to the backend.
+ * @param kind The kind of request.
+ * @param path The path below the backend base URL.
+ * @param payload The body of the request; empty for a GET.
+ * @param token The token to authenticate with.
+ * @param epoch The epoch the request is issued for.
+ * @param callback Optional callback for UI requests.
+ */
+void Send(RequestKind kind, const std::string &path, std::string payload, const std::string &token, const std::string &epoch, std::function<void(bool, const Json &)> callback)
+{
+	const uint64_t id = ++_next_request_id;
+	_callbacks[id] = std::make_unique<BridgeHTTPCallback>(id);
+	_pending[id] = PendingRequest{kind, epoch, std::move(callback)};
+
+	HTTPHeaders headers;
+	headers.emplace_back("Authorization", "Bearer " + token);
+
+	NetworkHTTPSocketHandler::Connect(_state.base_url + path, _callbacks[id].get(), std::move(payload), std::move(headers));
+}
+
+/**
+ * Check whether another receipt can be stored.
+ *
+ * A receipt may only be forgotten once the backend acknowledged the delivery of
+ * its result; otherwise a replay of that request would execute it a second time.
+ * @return True iff there is room for another receipt.
+ */
+bool HasReceiptCapacity()
+{
+	if (_state.receipts.size() < MAX_RECEIPTS) return true;
+	for (const std::string &request_id : _state.receipt_order) {
+		const auto receipt = _state.receipts.find(request_id);
+		if (receipt != _state.receipts.end() && receipt->second.acknowledged) return true;
+	}
+	return false;
+}
+
+/** Forget the oldest acknowledged receipt, to make room for a new one. */
+void MakeReceiptRoom()
+{
+	while (_state.receipts.size() >= MAX_RECEIPTS) {
+		const auto oldest = std::find_if(_state.receipt_order.begin(), _state.receipt_order.end(), [](const std::string &request_id) {
+			const auto receipt = _state.receipts.find(request_id);
+			return receipt != _state.receipts.end() && receipt->second.acknowledged;
+		});
+		if (oldest == _state.receipt_order.end()) return;
+		_state.receipts.erase(*oldest);
+		_state.receipt_order.erase(oldest);
+	}
+}
+
+/**
+ * Store the result of an executed request, so a replay is answered identically.
+ * @param request_id The request the result belongs to.
+ * @param result The result of the request.
+ */
+void StoreReceipt(const std::string &request_id, const Json &result)
+{
+	MakeReceiptRoom();
+	_state.receipts[request_id] = Receipt{result, false};
+	_state.receipt_order.push_back(request_id);
+}
+
+/**
+ * Mark the receipt of a delivered result as acknowledged by the backend.
+ * @param request_id The request whose result was delivered.
+ */
+void AcknowledgeReceipt(const std::string &request_id)
+{
+	const auto receipt = _state.receipts.find(request_id);
+	if (receipt != _state.receipts.end()) receipt->second.acknowledged = true;
+}
+
+/**
+ * Queue a result for delivery to the backend.
+ * @param request_id The request the result belongs to.
+ * @param result The result of the request.
+ * @return False iff the queue is full; the caller has to retry later.
+ */
+bool QueueResult(const std::string &request_id, const Json &result)
+{
+	if (_state.results.size() >= MAX_PENDING_RESULTS) {
+		Debug(Facility::Net, Severity::Warning, "In-game agent bridge: result queue is full; the backend has to catch up");
+		return false;
+	}
+	_state.results.push_back({{"request_id", request_id}, {"result", result}});
+	return true;
+}
+
+/**
+ * Get the name of a tile type, as used in the protocol.
+ * @param type The tile type.
+ * @return The name of the tile type.
+ */
+std::string_view TileTypeName(TileType type)
+{
+	switch (type) {
+		case TileType::Clear: return "clear";
+		case TileType::Railway: return "rail";
+		case TileType::Road: return "road";
+		case TileType::House: return "house";
+		case TileType::Trees: return "trees";
+		case TileType::Station: return "station";
+		case TileType::Water: return "water";
+		case TileType::Void: return "void";
+		case TileType::Industry: return "industry";
+		case TileType::TunnelBridge: return "tunnelbridge";
+		case TileType::Object: return "object";
+		default: return "unknown";
+	}
+}
+
+/**
+ * Describe a single tile.
+ * @param tile The tile to describe.
+ * @return The description of the tile.
+ */
+Json TileRow(TileIndex tile)
+{
+	const TileType type = GetTileType(tile);
+	Json row = {
+		{"x", TileX(tile)},
+		{"y", TileY(tile)},
+		{"type", std::string(TileTypeName(type))},
+	};
+
+	if (IsValidTile(tile)) {
+		row["height"] = TileHeight(tile);
+		if (type != TileType::House && type != TileType::Industry) {
+			const Owner owner = GetTileOwner(tile);
+			if (owner != OWNER_NONE && owner != INVALID_OWNER) row["owner"] = owner.base();
+		}
+	}
+
+	return row;
+}
+
+/** The methods that change the world, and therefore need the write gate. */
+bool IsMutation(std::string_view method)
+{
+	return method == "world.pause" || method == "world.rename" || method == "world.settings.set" ||
+			method == "world.construct" || method == "world.vehicles" || method == "world.orders" ||
+			method == "world.command";
+}
+
+/**
+ * Implement world.info.
+ * @return The result of the method.
+ */
+Json WorldInfo()
+{
+	Json companies = Json::array();
+	for (const Company *c : Company::Iterate()) {
+		companies.push_back({
+			{"id", c->index.base()},
+			{"name", c->name.empty() ? GetString(STR_COMPANY_NAME, c->index) : c->name},
+			{"is_ai", c->is_ai},
+			{"money", static_cast<int64_t>(c->money)},
+		});
+	}
+
+	return Ok({
+		{"date", TimerGameCalendar::date.base()},
+		{"ticks", TimerGameTick::counter},
+		{"paused", _pause_mode.Any()},
+		{"map", {{"width", Map::SizeX()}, {"height", Map::SizeY()}}},
+		{"companies", companies},
+		{"build", std::string(_openttd_revision)},
+	});
+}
+
+/**
+ * Implement world.query for towns, companies, stations and tiles.
+ * @param params The parameters of the method.
+ * @return The result of the method.
+ */
+Json WorldQuery(const Json &params)
+{
+	const std::string kind = JsonString(params, "kind");
+	const Json filters = params.contains("filters") && params["filters"].is_object() ? params["filters"] : Json::object();
+	const int limit = Clamp(JsonInt(params, "limit", DEFAULT_QUERY_LIMIT), 1, MAX_QUERY_LIMIT);
+	const int offset = std::max(0, JsonInt(params, "offset", 0));
+
+	Json rows = Json::array();
+	int total = 0;
+
+	auto add_row = [&](Json row) {
+		if (total >= offset && static_cast<int>(rows.size()) < limit) rows.push_back(std::move(row));
+		total++;
+	};
+
+	if (kind == "town") {
+		const std::string name = LowerAscii(JsonString(filters, "name"));
+		for (const Town *t : Town::Iterate()) {
+			if (!ContainsAsciiCI(t->GetCachedName(), name)) continue;
+			add_row({
+				{"id", t->index.base()},
+				{"name", t->GetCachedName()},
+				{"tile", {TileX(t->xy), TileY(t->xy)}},
+				{"population", t->cache.population},
+			});
+		}
+	} else if (kind == "company") {
+		const int id = JsonInt(filters, "id", -1);
+		for (const Company *c : Company::Iterate()) {
+			if (id >= 0 && static_cast<int>(c->index.base()) != id) continue;
+			add_row({
+				{"id", c->index.base()},
+				{"name", c->name.empty() ? GetString(STR_COMPANY_NAME, c->index) : c->name},
+				{"is_ai", c->is_ai},
+				{"money", static_cast<int64_t>(c->money)},
+			});
+		}
+	} else if (kind == "station") {
+		const int id = JsonInt(filters, "id", -1);
+		for (const Station *st : Station::Iterate()) {
+			if (id >= 0 && static_cast<int>(st->index.base()) != id) continue;
+			add_row({
+				{"id", st->index.base()},
+				{"name", st->GetCachedName()},
+				{"tile", {TileX(st->xy), TileY(st->xy)}},
+				{"owner", st->owner.base()},
+			});
+		}
+	} else if (kind == "tile") {
+		const int x = JsonInt(filters, "x", -1);
+		const int y = JsonInt(filters, "y", -1);
+		if (x >= 0 && y >= 0) {
+			if (x > static_cast<int>(Map::MaxX()) || y > static_cast<int>(Map::MaxY())) return Error("invalid_params", "tile is outside the map");
+			add_row(TileRow(TileXY(static_cast<uint>(x), static_cast<uint>(y))));
+		} else {
+			const int x0 = Clamp(JsonInt(filters, "x0", 0), 0, static_cast<int>(Map::MaxX()));
+			const int y0 = Clamp(JsonInt(filters, "y0", 0), 0, static_cast<int>(Map::MaxY()));
+			const int x1 = Clamp(JsonInt(filters, "x1", x0), x0, static_cast<int>(Map::MaxX()));
+			const int y1 = Clamp(JsonInt(filters, "y1", y0), y0, static_cast<int>(Map::MaxY()));
+
+			const int64_t count = static_cast<int64_t>(x1 - x0 + 1) * static_cast<int64_t>(y1 - y0 + 1);
+			if (count > MAX_QUERY_TILES) return Error("range_too_large", "the tile range is too large");
+
+			total = static_cast<int>(count);
+			int index = 0;
+			for (int ty = y0; ty <= y1 && static_cast<int>(rows.size()) < limit; ty++) {
+				for (int tx = x0; tx <= x1 && static_cast<int>(rows.size()) < limit; tx++, index++) {
+					if (index < offset) continue;
+					rows.push_back(TileRow(TileXY(static_cast<uint>(tx), static_cast<uint>(ty))));
+				}
+			}
+		}
+	} else {
+		return Error("unsupported_query_kind", kind);
+	}
+
+	return Ok({{"rows", rows}, {"total", total}});
+}
+
+/**
+ * Implement world.pause.
+ * @param params The parameters of the method.
+ * @return The result of the method.
+ */
+Json WorldPause(const Json &params)
+{
+	if (!params.contains("paused") || !params["paused"].is_boolean()) return Error("invalid_params", "paused must be a boolean");
+
+	const bool paused = params["paused"].get<bool>();
+	if (!Command<Commands::Pause>::Post(PauseMode::Normal, paused)) return Error("command_failed", "pause");
+
+	return Ok({{"paused", _pause_mode.Any()}});
+}
+
+/**
+ * Implement world.rename for towns, companies and stations.
+ * @param params The parameters of the method.
+ * @param request_company The company the request was made for, if any.
+ * @return The result of the method.
+ */
+Json WorldRename(const Json &params, CompanyID request_company)
+{
+	const std::string kind = JsonString(params, "kind");
+	const int id = JsonInt(params, "id", -1);
+	const std::string name = JsonString(params, "name");
+	if (name.empty()) return Error("invalid_params", "name must not be empty");
+
+	if (kind == "town") {
+		const TownID town_id = static_cast<TownID>(id);
+		if (id < 0 || !Town::IsValidID(town_id)) return Error("unknown_object", "no such town");
+		if (!Command<Commands::RenameTown>::Post(STR_ERROR_CAN_T_RENAME_TOWN, town_id, name)) return Error("command_failed", "rename town");
+	} else if (kind == "company") {
+		const CompanyID company_id = id >= 0 ? static_cast<CompanyID>(id) : request_company;
+		if (!Company::IsValidID(company_id)) return Error("unknown_object", "no such company");
+
+		/* RenameCompany operates on the current company, so scope it to the requested one. */
+		Backup<CompanyID> backup(_current_company, company_id);
+		const bool posted = Command<Commands::RenameCompany>::Post(STR_ERROR_CAN_T_CHANGE_COMPANY_NAME, name);
+		backup.Restore();
+		if (!posted) return Error("command_failed", "rename company");
+
+		/* Verify the object that was actually renamed, not just that the command was accepted. */
+		const Company *company = Company::GetIfValid(company_id);
+		if (company == nullptr || company->name != name) return Error("command_failed", "the company name was not changed");
+	} else if (kind == "station") {
+		const StationID station_id = static_cast<StationID>(id);
+		if (id < 0 || !Station::IsValidID(station_id)) return Error("unknown_object", "no such station");
+		if (!Command<Commands::RenameStation>::Post(STR_ERROR_CAN_T_RENAME_STATION, station_id, name)) return Error("command_failed", "rename station");
+	} else {
+		return Error("unsupported_rename_kind", kind);
+	}
+
+	return Ok({{"ok", true}, {"name", name}});
+}
+
+/**
+ * Check that a request belongs to the world and epoch the bridge is bound to.
+ * @param request The request, as received from the backend.
+ * @return An error result when the request is stale, nothing when it may be applied.
+ */
+std::optional<Json> CheckRequestWorld(const Json &request)
+{
+	const std::string world_id = JsonString(request, "world_id");
+	const std::string epoch = JsonString(request, "epoch");
+	if (world_id.empty() || epoch.empty()) return Error("invalid_request", "world_id and epoch are required");
+	if (world_id != _state.world_id) return Error("stale_world", "the request belongs to another world");
+	if (epoch != _state.epoch) return Error("stale_epoch", "the request belongs to another epoch");
+	return std::nullopt;
+}
+
+/**
+ * Read the company a request is made for.
+ * @param request The request, as received from the backend.
+ * @return The company id, or CompanyID::Invalid() when the request does not name one.
+ */
+CompanyID RequestCompanyId(const Json &request)
+{
+	const Json params = request.contains("params") && request["params"].is_object() ? request["params"] : Json::object();
+	const int id = request.contains("company_id") ? JsonInt(request, "company_id", -1) : JsonInt(params, "company_id", -1);
+	if (id < 0 || !Company::IsValidID(static_cast<CompanyID>(id))) return CompanyID::Invalid();
+	return static_cast<CompanyID>(id);
+}
+
+/**
+ * Execute one request from the backend on the main thread.
+ * @param request The request, as received from the backend.
+ * @return The result of the request.
+ */
+Json ExecuteRequest(const Json &request)
+{
+	const std::string method = JsonString(request, "method");
+	const Json params = request.contains("params") && request["params"].is_object() ? request["params"] : Json::object();
+	const std::string task_id = JsonString(request, "task_id");
+
+	/* A request may only be applied to the world and epoch it was issued for; check before anything else. */
+	if (const std::optional<Json> stale = CheckRequestWorld(request); stale.has_value()) return *stale;
+
+	/* Mutations are only supported in single player: in multiplayer Post() merely enqueues the command. */
+	if (IsMutation(method) && _networking) return Error("multiplayer_unsupported", "mutations are only supported in single player");
+
+	/* The barrier is the last request of a task; nothing of that task may mutate the world afterwards. */
+	if (method == "task.barrier") {
+		if (!task_id.empty()) _state.barrier_tasks.insert(task_id);
+		return Ok({{"barrier", true}});
+	}
+
+	if (IsMutation(method) && !task_id.empty() && _state.barrier_tasks.find(task_id) != _state.barrier_tasks.end()) {
+		return Error("task_stopped", "the task has been stopped");
+	}
+
+	if (method == "world.info") return WorldInfo();
+	if (method == "world.query") return WorldQuery(params);
+	if (method == "world.pause") return WorldPause(params);
+	if (method == "world.rename") return WorldRename(params, RequestCompanyId(request));
+
+	return Error("unsupported_method", method);
+}
+
+/**
+ * Handle the response to a hello.
+ * @param ok Whether the request succeeded.
+ * @param body The parsed response.
+ */
+void HandleHelloResponse(bool ok, const Json &body)
+{
+	if (!ok) {
+		_state.connected = false;
+		_state.next_hello = Clock::now() + HELLO_RETRY;
+		Debug(Facility::Net, Severity::Warning, "In-game agent bridge: hello failed; retrying");
+		return;
+	}
+
+	_state.connection_id = JsonString(body, "connection_id");
+	_state.connected = !_state.connection_id.empty();
+	_state.heartbeat_seconds = Clamp(static_cast<int>(body.value("heartbeat_seconds", 5.0)), 1, 60);
+	_state.next_poll = Clock::now();
+
+	Debug(Facility::Net, Severity::Info, "In-game agent bridge: connected to the backend (heartbeat {}s)", _state.heartbeat_seconds);
+}
+
+/**
+ * Handle the response to a poll: execute the requests, in order, on the main thread.
+ * @param ok Whether the request succeeded.
+ * @param body The parsed response.
+ */
+void HandlePollResponse(bool ok, const Json &body)
+{
+	if (!ok) {
+		_state.next_poll = Clock::now() + POLL_RETRY;
+		return;
+	}
+
+	bool complete = true;
+	if (body.contains("requests") && body["requests"].is_array()) {
+		for (const Json &request : body["requests"]) {
+			if (!request.is_object()) continue;
+			const std::string request_id = JsonString(request, "request_id");
+			if (request_id.empty()) continue;
+
+			/* A repeated request is the same request: answer with the stored receipt instead of executing it twice. */
+			const auto receipt = _state.receipts.find(request_id);
+			Json result;
+			if (receipt != _state.receipts.end()) {
+				result = receipt->second.result;
+			} else {
+				/* Fail closed when no receipt may be forgotten: a replay must never execute a request twice. */
+				if (!HasReceiptCapacity()) {
+					complete = false;
+					break;
+				}
+				result = ExecuteRequest(request);
+				StoreReceipt(request_id, result);
+			}
+
+			/* Never drop a result: an applied mutation has to reach the backend. */
+			if (!QueueResult(request_id, result)) {
+				complete = false;
+				break;
+			}
+		}
+	}
+
+	/* Only advance the cursor when the whole batch was handled; otherwise the backend replays it. */
+	if (complete && body.contains("cursor") && body["cursor"].is_number_integer()) {
+		_state.cursor = body["cursor"].get<int64_t>();
+	}
+
+	_state.next_poll = Clock::now() + std::chrono::seconds(complete ? _state.heartbeat_seconds : 1);
+}
+
+/**
+ * Handle the response to a result delivery.
+ * @param ok Whether the request succeeded.
+ */
+void HandleResultResponse(bool ok)
+{
+	if (!ok) {
+		_state.next_result = Clock::now() + RESULT_RETRY;
+		if (!_state.inflight_result.is_null()) _state.results.push_front(_state.inflight_result);
+	} else if (!_state.inflight_result.is_null()) {
+		/* The backend accepted the result, so its receipt may be forgotten later on. */
+		AcknowledgeReceipt(JsonString(_state.inflight_result, "request_id"));
+	}
+	_state.inflight_result = Json();
+}
+
+/**
+ * Handle everything the HTTP layer finished since the last call.
+ */
+void ProcessCompletions()
+{
+	if (_completions.empty()) return;
+
+	std::vector<Completion> completions;
+	completions.swap(_completions);
+
+	for (const Completion &completion : completions) {
+		const auto pending = _pending.find(completion.id);
+		if (pending == _pending.end()) continue;
+		const PendingRequest request = std::move(pending->second);
+		_pending.erase(pending);
+		_callbacks.erase(completion.id);
+
+		Json body = Json::object();
+		bool parsed = completion.body.empty();
+		if (completion.ok && !completion.body.empty()) {
+			body = Json::parse(completion.body, nullptr, false);
+			parsed = !body.is_discarded();
+			if (!parsed) body = Json::object();
+		}
+		const bool ok = completion.ok && parsed;
+
+		/* A completion of an older epoch must not touch the state of the current one. */
+		const bool current = request.epoch == _state.epoch;
+
+		switch (request.kind) {
+			case RequestKind::Hello:
+				if (current) {
+					_state.hello_in_flight = false;
+					HandleHelloResponse(ok, body);
+				}
+				break;
+
+			case RequestKind::Poll:
+				if (current) {
+					_state.poll_in_flight = false;
+					HandlePollResponse(ok, body);
+				}
+				break;
+
+			case RequestKind::Result:
+				if (current) {
+					_state.result_in_flight = false;
+					HandleResultResponse(ok);
+				}
+				break;
+
+			case RequestKind::Ui:
+				/* The UI gets whatever the backend answered, even when the world changed meanwhile. */
+				if (request.callback) request.callback(ok, body);
+				break;
+		}
+	}
+}
+
+/** Send a hello for the current world and epoch. */
+void SendHello()
+{
+	ResolveWorldId();
+	_state.hello_in_flight = true;
+
+	const Json body = {
+		{"engine_id", _state.engine_id},
+		{"world_id", _state.world_id},
+		{"epoch", _state.epoch},
+		{"build", std::string(_openttd_revision)},
+		{"capabilities", Json::array({"world.info", "world.query", "world.pause", "world.rename", "task.barrier"})},
+	};
+
+	Send(RequestKind::Hello, "/v1/engine/hello", body.dump(), _state.engine_token, _state.epoch, nullptr);
+}
+
+/** Send a poll for the current world and epoch. */
+void SendPoll()
+{
+	ResolveWorldId();
+	_state.poll_in_flight = true;
+
+	const Json body = {
+		{"connection_id", _state.connection_id},
+		{"world_id", _state.world_id},
+		{"epoch", _state.epoch},
+		{"results", Json::array()},
+		{"cursor", _state.cursor},
+	};
+
+	Send(RequestKind::Poll, "/v1/engine/poll", body.dump(), _state.engine_token, _state.epoch, nullptr);
+}
+
+/** Deliver the next queued result, if any. */
+void SendNextResult()
+{
+	if (_state.results.empty() || _state.result_in_flight) return;
+	if (Clock::now() < _state.next_result) return;
+
+	_state.inflight_result = _state.results.front();
+	_state.results.pop_front();
+	_state.result_in_flight = true;
+
+	const Json body = {
+		{"connection_id", _state.connection_id},
+		{"request_id", _state.inflight_result["request_id"]},
+		{"world_id", _state.world_id},
+		{"epoch", _state.epoch},
+		{"result", _state.inflight_result["result"]},
+	};
+
+	Send(RequestKind::Result, "/v1/engine/result", body.dump(), _state.engine_token, _state.epoch, nullptr);
+}
+
+} // namespace
+
+/**
+ * Run one step of the bridge. Must be called from the main thread once per
+ * game loop iteration; it also runs while the game is paused.
+ */
+void Tick()
+{
+	if (!EnsureInitialised()) return;
+	if (!_network_available) return;
+
+	/* Make sure responses are handled even when the network background loop is not running. */
+	NetworkHTTPSocketHandler::HTTPReceive();
+	ProcessCompletions();
+
+	/* The bridge only talks about a world that is actually loaded. */
+	if (_game_mode != GameMode::Normal && _game_mode != GameMode::Editor) return;
+
+	const Clock::time_point now = Clock::now();
+
+	if (!_state.connected) {
+		if (!_state.hello_in_flight && now >= _state.next_hello) SendHello();
+		return;
+	}
+
+	if (!_state.poll_in_flight && now >= _state.next_poll) SendPoll();
+	SendNextResult();
+}
+
+/**
+ * Forget everything about the current world and start a fresh epoch. Called
+ * whenever a new game is started or a savegame is loaded.
+ */
+void ResetWorld()
+{
+	_state.world_id.clear();
+	_state.epoch = GenerateUuid();
+	_state.connection_id.clear();
+	_state.connected = false;
+	_state.cursor = 0;
+	_state.heartbeat_seconds = 5;
+
+	_state.hello_in_flight = false;
+	_state.poll_in_flight = false;
+	_state.result_in_flight = false;
+	_state.next_hello = Clock::now();
+	_state.next_poll = Clock::now();
+	_state.next_result = Clock::now();
+
+	_state.results.clear();
+	_state.inflight_result = Json();
+	_state.receipts.clear();
+	_state.receipt_order.clear();
+	_state.barrier_tasks.clear();
+	/* Requests in flight are kept: their completions are ignored by epoch, and UI callbacks still get their answer. */
+}
+
+/**
+ * Identity of the world the bridge is currently bound to.
+ * @return {world_id, epoch, connection_id, connected}.
+ */
+Json Context()
+{
+	EnsureInitialised();
+	ResolveWorldId();
+
+	return {
+		{"world_id", _state.world_id},
+		{"epoch", _state.epoch},
+		{"connection_id", _state.connection_id},
+		{"connected", _state.connected},
+	};
+}
+
+/**
+ * Describe the objects attached to a tile, as typed attachment candidates.
+ * @param tile The tile to inspect.
+ * @return Array of {type, id?, name?, tile?} entries, most specific first.
+ */
+Json PickObjects(TileIndex tile)
+{
+	Json objects = Json::array();
+	if (!IsValidTile(tile)) return objects;
+
+	const TileType type = GetTileType(tile);
+	const Json location = {TileX(tile), TileY(tile)};
+
+	if (type == TileType::Station) {
+		const Station *st = Station::GetByTile(tile);
+		if (st != nullptr) {
+			objects.push_back({{"type", "station"}, {"id", st->index.base()}, {"name", st->GetCachedName()}, {"tile", location}});
+		}
+	} else if (type == TileType::Industry) {
+		const Industry *ind = Industry::GetByTile(tile);
+		if (ind != nullptr) {
+			objects.push_back({{"type", "industry"}, {"id", ind->index.base()}, {"tile", location}});
+		}
+	} else if (type == TileType::House) {
+		const Town *town = Town::GetByTile(tile);
+		if (town != nullptr) {
+			objects.push_back({{"type", "town"}, {"id", town->index.base()}, {"name", town->GetCachedName()}, {"tile", location}});
+		}
+	}
+
+	objects.push_back({{"type", "tile"}, {"tile", location}, {"what", std::string(TileTypeName(type))}});
+	return objects;
+}
+
+/**
+ * Send a request to the backend on behalf of the native UI. The UI token is
+ * used for authentication, and the callback is always invoked on the main
+ * thread.
+ * @param method HTTP method, e.g. "GET" or "POST".
+ * @param path Path below the backend base URL, e.g. "/v1/chats".
+ * @param body Request body; ignored for GET.
+ * @param callback Called with the parsed response and whether it succeeded.
+ */
+void Request(std::string method, std::string path, Json body, std::function<void(Json, bool)> callback)
+{
+	if (!EnsureInitialised() || !_state.enabled) {
+		if (callback) callback(Json::object(), false);
+		return;
+	}
+
+	std::string payload;
+	if (method != "GET" && !body.is_null()) payload = body.dump();
+
+	Send(RequestKind::Ui, path, std::move(payload), _state.ui_token, _state.epoch,
+			[cb = std::move(callback)](bool ok, const Json &response) { if (cb) cb(response, ok); });
+}
+
+} // namespace InGameAgent

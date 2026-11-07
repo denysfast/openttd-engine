@@ -56,6 +56,8 @@ add_files(
 )
 
 add_files(
+    agent_bridge.cpp
+    agent_bridge.h
     aircraft.h
     aircraft_cmd.cpp
     aircraft_cmd.h
