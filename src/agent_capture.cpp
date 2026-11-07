@@ -10,6 +10,7 @@
 #include "stdafx.h"
 #include "agent_capture.h"
 #include "blitter/factory.hpp"
+#include "core/backup_type.hpp"
 #include "core/format.hpp"
 #include "core/math_func.hpp"
 #include "gfx_func.h"
@@ -19,7 +20,9 @@
 #include "screenshot_gui.h"
 #include "screenshot_type.h"
 #include "settings_type.h"
+#include "smallmap_gui.h"
 #include "string_func.h"
+#include "tile_map.h"
 #include "tile_type.h"
 #include "timer/timer_game_tick.h"
 #include "town.h"
@@ -53,6 +56,7 @@ struct CaptureRect {
 /** Default and hard limits of a single capture, so one request stays bounded. */
 static constexpr uint64_t DEFAULT_MAX_PIXELS = 4096ull * 4096ull;
 static constexpr uint64_t HARD_MAX_PIXELS = 8192ull * 8192ull;
+static constexpr int MAX_CAPTURE_SIDE = 8192; ///< Longest side of a rendered image, so one buffer stays bounded.
 
 /**
  * The backend rejects a request body above 8 MiB (`MAX_BODY` in agent/backend/server.py), and a
@@ -312,11 +316,273 @@ private:
 	bool restored = true; ///< Whether the restore returned every window exactly.
 };
 
+/** What a capture request asks for, parsed and validated before any game state is used. */
+struct CaptureRequest {
+	/** How the pixels of the capture are produced. */
+	enum class Mode : uint8_t {
+		ScreenFrame,     ///< The live screen frame, as before.
+		Region,          ///< A rectangle of the live screen frame.
+		IndependentView, ///< A viewport rendered on its own, without touching the player's viewport.
+		Minimap,         ///< The smallmap owner-colour map of the whole world.
+	};
+
+	Mode mode = Mode::ScreenFrame;
+	std::string kind = "viewport";
+	bool hide_agent_ui = false;
+	bool include_png = true;
+	uint64_t max_pixels = DEFAULT_MAX_PIXELS;
+	size_t max_bytes = DEFAULT_MAX_BYTES;
+	CaptureRect region{0, 0, 0, 0}; ///< Requested region, before it is clamped to the frame.
+	int width = 0; ///< Requested image width, 0 for the default of the mode.
+	int height = 0; ///< Requested image height, 0 for the default of the mode.
+	ZoomLevel zoom = ZoomLevel::Normal; ///< Zoom level of an independent render.
+	TileIndex target = INVALID_TILE; ///< Tile an independent render is centred on.
+};
+
+/**
+ * Name of a capture mode, for the JSON results.
+ * @param mode The mode.
+ * @return The name of the mode.
+ */
+static std::string_view CaptureModeName(CaptureRequest::Mode mode)
+{
+	switch (mode) {
+		case CaptureRequest::Mode::ScreenFrame: return "screen_frame";
+		case CaptureRequest::Mode::Region: return "screen_frame_region";
+		case CaptureRequest::Mode::IndependentView: return "independent_viewport";
+		case CaptureRequest::Mode::Minimap: return "minimap";
+	}
+	return "unknown";
+}
+
+static std::string_view ZoomLevelName(ZoomLevel zoom);
+static Json ViewportJson(const Viewport &vp);
+static bool ResolveTile(const Json &params, TileIndex &tile, std::string_view &error);
+
+/**
+ * Parse and validate the parameters of a capture request.
+ *
+ * Only the request itself is looked at, so a caller error is reported as such even when there is
+ * nothing to capture. Nothing is silently ignored: a field that does not apply to the requested
+ * kind, or that has the wrong type, is "invalid_params".
+ *
+ * @param params  The request parameters.
+ * @param request Receives the parsed request.
+ * @return The error to report, or an empty view on success.
+ */
+static std::string_view ParseCaptureRequest(const Json &params, CaptureRequest &request)
+{
+	try {
+		if (!ReadHideAgentUi(params, request.hide_agent_ui)) return "invalid_params";
+
+		request.kind = params.value("kind", request.kind);
+		request.max_pixels = std::min<uint64_t>(params.value("max_pixels", DEFAULT_MAX_PIXELS), HARD_MAX_PIXELS);
+		/* Clamp to the largest PNG the backend can still receive, so an accepted result is deliverable. */
+		request.max_bytes = std::min<size_t>(params.value("max_bytes", DEFAULT_MAX_BYTES), MAX_PNG_BYTES);
+		request.include_png = params.value("include_png", request.include_png);
+
+		const bool has_target = params.contains("target");
+		const bool has_size = params.contains("width") || params.contains("height");
+		const bool has_zoom = params.contains("zoom");
+		const bool has_region = params.contains("region");
+
+		if (request.kind == "viewport") {
+			if (has_region) return "invalid_params";
+			if (!has_target) {
+				/* The screen frame has the size of the screen; a size or a zoom would be ignored. */
+				if (has_size || has_zoom) return "invalid_params";
+				return {};
+			}
+
+			request.mode = CaptureRequest::Mode::IndependentView;
+			if (!params["target"].is_object()) return "invalid_params";
+			request.width = params.value("width", 0);
+			request.height = params.value("height", 0);
+			if ((request.width == 0) != (request.height == 0)) return "invalid_params";
+			if (request.width < 0 || request.height < 0) return "invalid_params";
+			if (request.width > MAX_CAPTURE_SIDE || request.height > MAX_CAPTURE_SIDE) return "invalid_params";
+			const int zoom = params.value("zoom", to_underlying(ZoomLevel::Normal));
+			if (zoom < to_underlying(ZoomLevel::Min) || zoom > to_underlying(ZoomLevel::Max)) return "invalid_params";
+			request.zoom = static_cast<ZoomLevel>(zoom);
+			std::string_view error;
+			if (!ResolveTile(params["target"], request.target, error)) return error;
+			return {};
+		}
+
+		if (request.kind == "region") {
+			if (has_target || has_size || has_zoom) return "invalid_params";
+			if (!has_region || !params["region"].is_object()) return "invalid_params";
+			const Json &region = params["region"];
+			if (!region.contains("left") || !region.contains("top") || !region.contains("width") || !region.contains("height")) return "invalid_params";
+			request.mode = CaptureRequest::Mode::Region;
+			request.region.left = region.value("left", 0);
+			request.region.top = region.value("top", 0);
+			request.region.width = region.value("width", 0);
+			request.region.height = region.value("height", 0);
+			return {};
+		}
+
+		if (request.kind == "minimap") {
+			/* The whole map is shown, so there is nothing to aim at and nothing to zoom. */
+			if (has_target || has_zoom || has_region) return "invalid_params";
+			request.mode = CaptureRequest::Mode::Minimap;
+			request.width = params.value("width", 0);
+			request.height = params.value("height", 0);
+			if ((request.width == 0) != (request.height == 0)) return "invalid_params";
+			if (request.width < 0 || request.height < 0) return "invalid_params";
+			if (request.width > MAX_CAPTURE_SIDE || request.height > MAX_CAPTURE_SIDE) return "invalid_params";
+			return {};
+		}
+	} catch (const Json::exception &) {
+		return "invalid_params";
+	}
+
+	return "invalid_params";
+}
+
+/** The camera of an independent render: the viewport of the image, not of the player. */
+struct IndependentCamera {
+	Viewport viewport; ///< Viewport the image is rendered from.
+	int center_x; ///< World x of the point in the middle of the image.
+	int center_y; ///< World y of the point in the middle of the image.
+	int center_z; ///< World z of the point in the middle of the image.
+};
+
+/**
+ * Build the camera of an independent render, centred on a tile.
+ *
+ * The formulas are those of SetupScreenshotViewport(): the virtual size follows from the image size
+ * and the zoom, and the virtual position is chosen so that the requested point ends up in the middle
+ * of the image. Nothing of the player's viewport is read or written.
+ *
+ * @param tile   The tile to centre on.
+ * @param width  Image width in pixels.
+ * @param height Image height in pixels.
+ * @param zoom   Zoom level of the render.
+ * @return The camera to render.
+ */
+static IndependentCamera MakeIndependentCamera(TileIndex tile, int width, int height, ZoomLevel zoom)
+{
+	IndependentCamera camera{};
+	/* The centre of the tile at ground height, the same point ScrollMainWindowToTile() centres on. */
+	camera.center_x = TileX(tile) * TILE_SIZE + TILE_SIZE / 2;
+	camera.center_y = TileY(tile) * TILE_SIZE + TILE_SIZE / 2;
+	camera.center_z = GetSlopePixelZ(camera.center_x, camera.center_y);
+
+	const Point world = RemapCoords(camera.center_x, camera.center_y, camera.center_z);
+	Viewport &vp = camera.viewport;
+	vp.left = 0;
+	vp.top = 0;
+	vp.width = width;
+	vp.height = height;
+	vp.zoom = zoom;
+	vp.virtual_width = ScaleByZoom(width, zoom);
+	vp.virtual_height = ScaleByZoom(height, zoom);
+	vp.virtual_left = world.x - vp.virtual_width / 2;
+	vp.virtual_top = world.y - vp.virtual_height / 2;
+	vp.overlay = nullptr;
+	return camera;
+}
+
+/**
+ * Render the lines of an independent viewport into the image buffer.
+ *
+ * This is the rendering idiom of LargeWorldCallback() in screenshot.cpp: the screen buffer and the
+ * current drawing target are swapped for the image buffer for the duration of the call, the
+ * viewport is rendered in blocks of 1600 pixels and everything is restored afterwards.
+ *
+ * @param vp  The viewport to render.
+ * @param buf Destination buffer.
+ * @param y   First line to render.
+ * @param pitch Number of pixels per line in the destination buffer.
+ * @param n   Number of lines to render.
+ */
+static void IndependentViewCallback(const Viewport &vp, void *buf, uint y, uint pitch, uint n)
+{
+	DrawPixelInfo dpi{
+		.dst_ptr = buf,
+		.left = 0,
+		.top = static_cast<int>(y),
+		.width = vp.width,
+		.height = static_cast<int>(n),
+		.pitch = static_cast<int>(pitch),
+		.zoom = ZoomLevel::WorldScreenshot
+	};
+
+	/* We are no longer rendering to the screen. */
+	AutoRestoreBackup screen_backup(_screen, {
+		.dst_ptr = buf,
+		.left = 0,
+		.top = 0,
+		.width = static_cast<int>(pitch),
+		.height = static_cast<int>(n),
+		.pitch = static_cast<int>(pitch),
+		.zoom = ZoomLevel::Min
+	});
+	AutoRestoreBackup disable_anim_backup(_screen_disable_anim, true);
+	AutoRestoreBackup dpi_backup(_cur_dpi, &dpi);
+
+	/* Render the viewport in blocks of 1600 pixels width. */
+	int left = 0;
+	while (vp.width - left != 0) {
+		const int wx = std::min(vp.width - left, 1600);
+		left += wx;
+
+		ViewportDoDraw(vp,
+			ScaleByZoom(left - wx - vp.left, vp.zoom) + vp.virtual_left,
+			ScaleByZoom(y - vp.top, vp.zoom) + vp.virtual_top,
+			ScaleByZoom(left - vp.left, vp.zoom) + vp.virtual_left,
+			ScaleByZoom((y + n) - vp.top, vp.zoom) + vp.virtual_top
+		);
+	}
+}
+
+/** Size of the minimap image and of the map it shows. */
+struct MinimapRender {
+	int map_width; ///< Width of the map in tiles.
+	int map_height; ///< Height of the map in tiles.
+	int width; ///< Width of the image in pixels.
+	int height; ///< Height of the image in pixels.
+};
+
+/**
+ * Render the lines of a minimap image: the smallmap owner colours of the whole world.
+ *
+ * One pixel shows one tile, or the nearest tile when the image is smaller than the map. The x axis
+ * is mirrored like the built-in minimap screenshot (MakeMinimapWorldScreenshot()), so the image
+ * lines up with the isometric world.
+ *
+ * @param render The map and image sizes.
+ * @param buf    Destination buffer.
+ * @param y      First line to render.
+ * @param pitch  Number of pixels per line in the destination buffer.
+ * @param n      Number of lines to render.
+ */
+static void MinimapCallback(const MinimapRender &render, void *buf, uint y, uint pitch, uint n)
+{
+	uint32_t *row_buf = static_cast<uint32_t *>(buf);
+	for (uint row = 0; row < n; row++, row_buf += pitch) {
+		const int tile_y = static_cast<int>((y + row) * render.map_height / render.height);
+		for (int x = 0; x < render.width; x++) {
+			const int tile_x = render.map_width - 1 - x * render.map_width / render.width;
+			const TileIndex tile = TileXY(static_cast<uint>(tile_x), static_cast<uint>(tile_y));
+			const uint8_t colour = GetSmallMapOwnerPixels(tile, GetTileType(tile), IncludeHeightmap::Never) & 0xFF;
+
+			const Colour &palette_colour = _cur_palette.palette[colour];
+			row_buf[x] = static_cast<uint32_t>(palette_colour.b) |
+					(static_cast<uint32_t>(palette_colour.g) << 8) |
+					(static_cast<uint32_t>(palette_colour.r) << 16);
+		}
+	}
+}
+
 Json CaptureGameFrame(const Json &params)
 {
-	/* A field of the wrong type is a caller error, never something to ignore silently. */
-	bool hide_agent_ui = false;
-	if (!ReadHideAgentUi(params, hide_agent_ui)) return Failure("invalid_params");
+	/* Parse and validate the whole request first, so a caller error is reported as such even when
+	 * there is nothing to capture. */
+	CaptureRequest request;
+	const std::string_view parse_error = ParseCaptureRequest(params, request);
+	if (!parse_error.empty()) return Failure(parse_error);
 
 	/* Without a video driver, blitter or frame buffer there is nothing to capture; say so. */
 	Blitter *blitter = BlitterFactory::GetCurrentBlitter();
@@ -324,27 +590,16 @@ Json CaptureGameFrame(const Json &params)
 		return Failure("headless_unavailable");
 	}
 
-	std::string kind = "viewport";
+	/* The image, and for the screen modes the part of the frame it is copied from. */
 	CaptureRect rect{0, 0, _screen.width, _screen.height};
-	uint64_t max_pixels = DEFAULT_MAX_PIXELS;
-	size_t max_bytes = DEFAULT_MAX_BYTES;
-	bool include_png = true;
-	try {
-		kind = params.value("kind", kind);
-		max_pixels = std::min<uint64_t>(params.value("max_pixels", DEFAULT_MAX_PIXELS), HARD_MAX_PIXELS);
-		/* Clamp to the largest PNG the backend can still receive, so an accepted result is deliverable. */
-		max_bytes = std::min<size_t>(params.value("max_bytes", DEFAULT_MAX_BYTES), MAX_PNG_BYTES);
-		include_png = params.value("include_png", include_png);
+	int width = _screen.width;
+	int height = _screen.height;
+	switch (request.mode) {
+		case CaptureRequest::Mode::ScreenFrame:
+			break;
 
-		if (kind == "region") {
-			if (!params.contains("region") || !params["region"].is_object()) return Failure("invalid_params");
-			const Json &region = params["region"];
-			if (!region.contains("left") || !region.contains("top") || !region.contains("width") || !region.contains("height")) return Failure("invalid_params");
-
-			rect.left = region.value("left", 0);
-			rect.top = region.value("top", 0);
-			rect.width = region.value("width", 0);
-			rect.height = region.value("height", 0);
+		case CaptureRequest::Mode::Region: {
+			rect = request.region;
 
 			/* Clamp the requested region to the frame that actually exists. */
 			const int64_t right = std::min<int64_t>(static_cast<int64_t>(rect.left) + rect.width, _screen.width);
@@ -354,20 +609,31 @@ Json CaptureGameFrame(const Json &params)
 			rect.width = static_cast<int>(right - rect.left);
 			rect.height = static_cast<int>(bottom - rect.top);
 			if (rect.width <= 0 || rect.height <= 0) return Failure("invalid_params");
-		} else if (kind != "viewport") {
-			return Failure("invalid_params");
+			width = rect.width;
+			height = rect.height;
+			break;
 		}
-	} catch (const Json::exception &) {
-		return Failure("invalid_params");
+
+		case CaptureRequest::Mode::IndependentView:
+			/* Without an explicit size the image is as large as the screen, at the requested zoom. */
+			width = request.width != 0 ? request.width : _screen.width;
+			height = request.height != 0 ? request.height : _screen.height;
+			break;
+
+		case CaptureRequest::Mode::Minimap:
+			if (Map::SizeX() == 0 || Map::SizeY() == 0) return Failure("map_unavailable");
+			width = request.width != 0 ? request.width : static_cast<int>(Map::SizeX());
+			height = request.height != 0 ? request.height : static_cast<int>(Map::SizeY());
+			break;
 	}
 
-	const uint64_t pixels = static_cast<uint64_t>(rect.width) * static_cast<uint64_t>(rect.height);
-	if (pixels > max_pixels) {
+	const uint64_t pixels = static_cast<uint64_t>(width) * static_cast<uint64_t>(height);
+	if (pixels > request.max_pixels) {
 		Json result = Failure("too_large");
-		result["width"] = rect.width;
-		result["height"] = rect.height;
+		result["width"] = width;
+		result["height"] = height;
 		result["pixels"] = pixels;
-		result["max_pixels"] = max_pixels;
+		result["max_pixels"] = request.max_pixels;
 		return result;
 	}
 
@@ -386,43 +652,59 @@ Json CaptureGameFrame(const Json &params)
 	if (!temp_dir.Create()) return Failure("temp_dir_unavailable");
 	const std::filesystem::path path = temp_dir.Path() / "capture.png";
 
-	/* The screen buffer can still show the frame from before a command that ran earlier in this
-	 * same game loop iteration. Redraw the dirty blocks first, exactly like a viewport screenshot
-	 * does, so the pixels belong to the state whose tick we report. */
 	const uint64_t frame_tick = TimerGameTick::counter;
 	bool written = false;
 	int hidden_window_count = 0;
 	bool agent_ui_restored = true;
-	{
-		/* Lock the video buffer like the crashlog screenshot does, so the frame is stable while it is copied. */
-		VideoDriver::VideoBufferLocker video_buffer_lock;
+	IndependentCamera camera;
+	if (request.mode == CaptureRequest::Mode::ScreenFrame || request.mode == CaptureRequest::Mode::Region) {
+		/* The screen buffer can still show the frame from before a command that ran earlier in this
+		 * same game loop iteration. Redraw the dirty blocks first, exactly like a viewport
+		 * screenshot does, so the pixels belong to the state whose tick we report. */
+		{
+			/* Lock the video buffer like the crashlog screenshot does, so the frame is stable while it is copied. */
+			VideoDriver::VideoBufferLocker video_buffer_lock;
 
-		/* The agent UI is hidden inside the lock and put back before the lock is released, so the
-		 * windows never stay off screen and the pixels are the world the chat was covering. */
-		AgentUiHider hider(hide_agent_ui);
-		SetScreenshotWindowVisibility(true);
-		UndrawMouseCursor();
-		DrawDirtyBlocks();
-		SetScreenshotWindowVisibility(false);
+			/* The agent UI is hidden inside the lock and put back before the lock is released, so the
+			 * windows never stay off screen and the pixels are the world the chat was covering. */
+			AgentUiHider hider(request.hide_agent_ui);
+			SetScreenshotWindowVisibility(true);
+			UndrawMouseCursor();
+			DrawDirtyBlocks();
+			SetScreenshotWindowVisibility(false);
 
-		written = provider->MakeImage(path.string(), [&rect](void *buf, uint y, uint pitch, uint n) {
-			CaptureFrameCallback(rect, buf, y, pitch, n);
-		}, rect.width, rect.height, blitter->GetScreenDepth(), _cur_palette.palette);
+			written = provider->MakeImage(path.string(), [&rect](void *buf, uint y, uint pitch, uint n) {
+				CaptureFrameCallback(rect, buf, y, pitch, n);
+			}, width, height, blitter->GetScreenDepth(), _cur_palette.palette);
 
-		/* Put the windows back right away, so the reported state is the state after the capture.
-		 * The hidden count was taken when they moved, so it still describes the captured pixels. */
-		hider.Restore();
-		hidden_window_count = hider.HiddenWindowCount();
-		agent_ui_restored = hider.Restored();
+			/* Put the windows back right away, so the reported state is the state after the capture.
+			 * The hidden count was taken when they moved, so it still describes the captured pixels. */
+			hider.Restore();
+			hidden_window_count = hider.HiddenWindowCount();
+			agent_ui_restored = hider.Restored();
+		}
+	} else if (request.mode == CaptureRequest::Mode::IndependentView) {
+		/* The image is rendered from its own camera; the player's viewport is neither read nor moved. */
+		camera = MakeIndependentCamera(request.target, width, height, request.zoom);
+		written = provider->MakeImage(path.string(), [&camera](void *buf, uint y, uint pitch, uint n) {
+			IndependentViewCallback(camera.viewport, buf, y, pitch, n);
+		}, width, height, blitter->GetScreenDepth(), _cur_palette.palette);
+	} else {
+		const MinimapRender render{static_cast<int>(Map::SizeX()), static_cast<int>(Map::SizeY()), width, height};
+		written = provider->MakeImage(path.string(), [&render](void *buf, uint y, uint pitch, uint n) {
+			MinimapCallback(render, buf, y, pitch, n);
+		}, width, height, 32, _cur_palette.palette);
 	}
 
-	/* If the game advanced while the frame was copied, the pixels are older than the state we would
+	/* If the game advanced while the image was made, the pixels are older than the state we would
 	 * report; a stale frame is not visual verification. */
 	const uint64_t tick_after_copy = TimerGameTick::counter;
 	if (tick_after_copy != frame_tick) {
 		Json result = Json::object();
 		result["ok"] = false;
 		result["error"] = "stale_frame";
+		result["kind"] = request.kind;
+		result["mode"] = CaptureModeName(request.mode);
 		result["tick"] = frame_tick;
 		result["tick_now"] = tick_after_copy;
 		result["hide_agent_ui"] = hidden_window_count > 0;
@@ -438,11 +720,11 @@ Json CaptureGameFrame(const Json &params)
 	}
 	if (!written || png.empty()) return Failure("encode_failed");
 
-	if (png.size() > max_bytes) {
+	if (png.size() > request.max_bytes) {
 		Json result = Failure("too_large");
 		result["tick"] = frame_tick;
 		result["png_bytes"] = png.size();
-		result["max_bytes"] = max_bytes;
+		result["max_bytes"] = request.max_bytes;
 		result["max_body_bytes"] = MAX_RESULT_BODY_BYTES;
 		return result;
 	}
@@ -455,29 +737,94 @@ Json CaptureGameFrame(const Json &params)
 
 	Json result = Json::object();
 	result["ok"] = true;
-	result["kind"] = kind;
-	result["width"] = rect.width;
-	result["height"] = rect.height;
+	result["kind"] = request.kind;
+	result["mode"] = CaptureModeName(request.mode);
+	result["width"] = width;
+	result["height"] = height;
 	result["tick"] = frame_tick;
-	result["camera"] = {
-		{"left", rect.left},
-		{"top", rect.top},
-		{"width", rect.width},
-		{"height", rect.height},
-	};
-	result["frame"] = {
-		{"redrawn", true},
-		{"tick", frame_tick},
-	};
 	result["hash"] = hash_hex;
 	result["hash_algorithm"] = "md5";
 	result["parent_hash"] = _last_capture_hash.empty() ? Json(nullptr) : Json(_last_capture_hash);
-	/* True only when agent windows were really hidden; the request alone is not evidence. */
+	/* True only when agent windows were really hidden; the request alone is not evidence. A render
+	 * that contains no UI at all hides nothing and says so. */
+	result["ui_in_frame"] = request.mode == CaptureRequest::Mode::ScreenFrame || request.mode == CaptureRequest::Mode::Region;
 	result["hide_agent_ui"] = hidden_window_count > 0;
 	result["hidden_window_count"] = hidden_window_count;
 	result["agent_ui_restored"] = agent_ui_restored;
+
+	switch (request.mode) {
+		case CaptureRequest::Mode::ScreenFrame:
+		case CaptureRequest::Mode::Region:
+			result["frame"] = {
+				{"redrawn", true},
+				{"tick", frame_tick},
+			};
+			result["camera"] = {
+				{"left", rect.left},
+				{"top", rect.top},
+				{"width", rect.width},
+				{"height", rect.height},
+			};
+			break;
+
+		case CaptureRequest::Mode::IndependentView:
+			/* Everything needed to map between the image and the map, for this image only: the
+			 * player's viewport is not what was rendered here. */
+			result["coordinate_space"] = "screen_pixels";
+			result["frame"] = {
+				{"redrawn", false},
+				{"tick", frame_tick},
+			};
+			result["projection"] = {
+				{"kind", "isometric_viewport"},
+				{"world_to_screen", "WorldToScreen(viewport, x, y, z) gives the image pixel of a world point"},
+				{"screen_to_tile", "TranslateXYToTileCoord(viewport, x, y, clamp) gives the world position of an image pixel"},
+				{"viewport", ViewportJson(camera.viewport)},
+				{"target_tile", {{"index", request.target.base()}, {"x", TileX(request.target)}, {"y", TileY(request.target)}}},
+				{"target_world", {{"x", camera.center_x}, {"y", camera.center_y}, {"z", camera.center_z}}},
+				{"zoom", to_underlying(camera.viewport.zoom)},
+				{"zoom_name", ZoomLevelName(camera.viewport.zoom)},
+				{"sprite_detail_zoom", "normal"}, // like the built-in viewport screenshots, sprites are drawn at normal detail
+				{"player_viewport_unchanged", true},
+			};
+			break;
+
+		case CaptureRequest::Mode::Minimap: {
+			const int map_width = static_cast<int>(Map::SizeX());
+			const int map_height = static_cast<int>(Map::SizeY());
+			const bool native = map_width == width && map_height == height;
+			result["coordinate_space"] = "map_tiles";
+			result["frame"] = {
+				{"redrawn", false},
+				{"tick", frame_tick},
+			};
+			result["map"] = {{"size_x", map_width}, {"size_y", map_height}};
+			result["projection"] = {
+				{"kind", "smallmap_owner_colours"},
+				{"source", "GetSmallMapOwnerPixels(tile, GetTileType(tile), IncludeHeightmap::Never), the smallmap 'owner' mode"},
+				{"x_mirrored", true},
+				{"sampling", native ? "one_pixel_per_tile" : "nearest_tile"},
+				{"tiles_per_pixel", {{"x", static_cast<double>(map_width) / width}, {"y", static_cast<double>(map_height) / height}}},
+				{"pixel_from_tile", "pixel_x = ((map_size_x - 1 - tile_x) * width) / map_size_x; pixel_y = (tile_y * height) / map_size_y (integer division)"},
+				{"tile_from_pixel", "tile_x = map_size_x - 1 - (pixel_x * map_size_x) / width; tile_y = (pixel_y * map_size_y) / height (integer division)"},
+			};
+			result["legend"] = {
+				{"colour_space", "openttd_palette_index"},
+				{"entries", Json::array({
+					Json{{"meaning", "void"}, {"colour_index", PC_BLACK.p}},
+					Json{{"meaning", "industry"}, {"colour_index", PC_DARK_GREY.p}},
+					Json{{"meaning", "town_owned_land_or_house"}, {"colour_index", PC_DARK_RED.p}},
+					Json{{"meaning", "water"}, {"colour_index", PC_WATER.p}},
+					Json{{"meaning", "company_owned_land_or_road"}, {"colour_index", "company colour of the owner"}},
+				})},
+				{"unowned_land", "the player's smallmap land colour scheme (height or default colour), not a fixed palette index"},
+			};
+			break;
+		}
+	}
+
 	result["png_bytes"] = png.size();
-	if (include_png) result["png_base64"] = Base64Encode(png);
+	if (request.include_png) result["png_base64"] = Base64Encode(png);
 
 	_last_capture_hash = hash_hex;
 	return result;
