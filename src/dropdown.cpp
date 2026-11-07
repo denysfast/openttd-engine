@@ -533,6 +533,56 @@ struct DropdownWindow : Window {
 	}
 };
 
+DropDownListGeometry GetOpenDropDownListGeometry(const Window *parent, WidgetID button)
+{
+	DropDownListGeometry geometry;
+	const DropdownWindow *dropdown = dynamic_cast<const DropdownWindow *>(FindWindowById(WindowClass::DropdownMenu, 0));
+	/* Only the list this window opened for this widget is that widget's list. */
+	if (dropdown == nullptr || dropdown->parent != parent || dropdown->parent_button != button) return geometry;
+
+	geometry.open = true;
+	geometry.rect = Rect{dropdown->left, dropdown->top, dropdown->left + dropdown->width - 1, dropdown->top + dropdown->height - 1};
+
+	/* The item area and the item heights are the ones the drawing and the hit testing use. */
+	const Rect items = dropdown->GetWidget<NWidgetBase>(WID_DM_ITEMS)->GetCurrentRect().Shrink(WidgetDimensions::scaled.dropdownlist);
+	geometry.items = items.Translate(dropdown->left, dropdown->top);
+
+	/* A click is only taken inside the area GetDropDownItem() uses, which is the item area without
+	 * the text padding on the left and the right. Reporting the rows clipped to it means every
+	 * point of a reported rectangle really selects that row. */
+	const Rect hit = items.Shrink(WidgetDimensions::scaled.dropdowntext, RectPadding::zero);
+
+	/* Walk the filtered list the way DrawWidget() does: the scroll position is in pixels and every
+	 * item has its own height, so a row is only reported where it is really visible. */
+	int y = -dropdown->vscroll->GetPosition();
+	const int y_end = items.Height();
+	for (const auto &item : dropdown->list) {
+		if (!dropdown->FilterByText(*item)) continue;
+		const int item_height = item->Height();
+
+		/* Skip items that are scrolled up, and stop at the items below the visible area. */
+		if (y > y_end) break;
+		if (y > -item_height) {
+			const Rect full = items.Translate(0, y).WithHeight(item_height);
+			const int left = std::max(full.left, hit.left);
+			const int top = std::max(full.top, hit.top);
+			const int right = std::min(full.right, hit.right);
+			const int bottom = std::min(full.bottom, hit.bottom);
+			if (right >= left && bottom >= top) {
+				DropDownRowGeometry row;
+				row.result = item->result;
+				row.rect = Rect{left, top, right, bottom}.Translate(dropdown->left, dropdown->top);
+				row.selected = dropdown->selected_result == item->result && item->Selectable() && dropdown->selected_click_result < 0;
+				row.disabled = item->masked || !item->Selectable();
+				geometry.rows.push_back(row);
+			}
+		}
+		y += item_height;
+	}
+
+	return geometry;
+}
+
 void ReplaceDropDownList(Window *parent, DropDownList &&list, std::optional<int> selected_result)
 {
 	DropdownWindow *ddw = dynamic_cast<DropdownWindow *>(parent->FindChildWindow(WindowClass::DropdownMenu));

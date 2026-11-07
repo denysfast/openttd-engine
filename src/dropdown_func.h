@@ -14,6 +14,40 @@
 #include "dropdown_type.h"
 #include "window_gui.h"
 
+/**
+ * One row of an open dropdown list, as it is laid out and clipped on screen.
+ */
+struct DropDownRowGeometry {
+	int result = 0;        ///< Result value the row reports when it is chosen.
+	Rect rect{};           ///< Screen rectangle of the visible part of the row.
+	bool selected = false; ///< Whether the row is drawn as the selected one.
+	bool disabled = false; ///< Whether the row is shown but cannot be chosen.
+};
+
+/**
+ * Geometry of the open dropdown list of one widget of a window.
+ */
+struct DropDownListGeometry {
+	bool open = false;                     ///< Whether a dropdown list of that widget is open.
+	Rect rect{};                           ///< Screen rectangle of the dropdown window.
+	Rect items{};                          ///< Screen rectangle of the clipped item area.
+	std::vector<DropDownRowGeometry> rows; ///< Rows that are visible right now, top to bottom.
+};
+
+/**
+ * Get the geometry of the dropdown list a window opened for one of its widgets.
+ *
+ * Only the list that is open right now is reported, and only when it was opened by \a parent for
+ * \a button: the dropdown of another window is not the list of that widget. The rows are the items
+ * that are visible after filtering and scrolling, with the rectangle they occupy on screen clipped
+ * to the item area, which is the same layout the drawing and the hit testing use. Nothing here
+ * changes the list or the window.
+ * @param parent The window that opened the list.
+ * @param button The widget of that window the list belongs to.
+ * @return The geometry; \c open is false when no such list is open.
+ */
+DropDownListGeometry GetOpenDropDownListGeometry(const Window *parent, WidgetID button);
+
 /* Show drop down menu containing a fixed list of strings */
 void ShowDropDownMenu(Window *w, std::span<const StringID> strings, int selected, WidgetID button, uint32_t disabled_mask, uint32_t hidden_mask, uint width = 0, DropDownOptions options = {}, std::string * const persistent_filter_text = nullptr);
 

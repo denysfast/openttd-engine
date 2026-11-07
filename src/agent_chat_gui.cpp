@@ -4348,6 +4348,37 @@ nlohmann::json DescribeAgentChatUi()
 					{"company_generation", GetPoolGeneration(*company)}, {"selected", company->index == picker->owner}});
 		}
 		entry["companies"] = std::move(companies);
+
+		/* The owner dropdown, when it is open: the real native dropdown window of this picker and its
+		 * owner widget, with the rows that are visible after filtering and scrolling and with the
+		 * lifetime every row was offered with. A real input test can click a row from here instead of
+		 * guessing a coordinate, and it can never pick a row that is not on screen. */
+		const DropDownListGeometry owner_dropdown = GetOpenDropDownListGeometry(picker, WID_ASP_OWNER);
+		Json dropdown_rows = Json::array();
+		for (const DropDownRowGeometry &row : owner_dropdown.rows) {
+			int64_t generation = -1;
+			for (const AgentSettingPickerOwner &offered : picker->offered_owners) {
+				if (offered.company.base() != row.result) continue;
+				generation = offered.generation;
+				break;
+			}
+			Json row_entry = {
+				{"company_id", row.result},
+				/* The lifetime the row was offered with, from the snapshot of the open dropdown and
+				 * not from the current company pool: a company that was deleted and recreated while
+				 * the dropdown is open keeps the lifetime the player was shown. */
+				{"company_generation", generation >= 0 ? Json(generation) : Json()},
+				{"rect", RectToJson(row.rect)},
+				{"selected", row.selected},
+			};
+			if (row.disabled) row_entry["disabled"] = true;
+			dropdown_rows.push_back(std::move(row_entry));
+		}
+		entry["owner_dropdown"] = Json{
+			{"open", owner_dropdown.open},
+			{"coordinate_space", "screen_pixels"},
+			{"rows", std::move(dropdown_rows)},
+		};
 		entry["rect"] = RectToJson(Rect{picker->left, picker->top, picker->left + picker->width - 1, picker->top + picker->height - 1});
 
 		Json widgets = Json::object();

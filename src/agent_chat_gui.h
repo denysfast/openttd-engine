@@ -308,20 +308,30 @@ void AgentChatGuiTick();
  * in the UI ("(stale)" / "(unverified)") and are still sent, the backend resolves them.
  * - "status_window": object {left, top, text, stop} with the position of the status window and
  *   the screen rectangles of its widgets, or null when it is not open.
- * - "settings_picker": object {open, world_id, epoch, rect, search, owner, companies, total,
- *   matching, selected, scroll{position, capacity, count}, widgets, rows} while the settings picker
- *   is open, and {open: false} otherwise. "search" is the current filter text, "total" the number
- *   of settings the picker offers, "matching" the number the filter leaves, "selected" the index of
- *   the highlighted row in the filtered list, and "rows" the rows that are on screen as
- *   {name, scope, value, selected, rect}. "name" is the exact engine key the attachment will carry
- *   and the text the filter matches, "scope" the scope of its descriptor, "value" the current value
- *   as the engine formats it for the selected owner. "owner" is the company the company settings
- *   are shown for as {company_id, company_generation, name} (null when there is none) and
- *   "companies" the companies the owner selector offers as
+ * - "settings_picker": object {open, world_id, epoch, rect, search, owner, companies,
+ *   owner_dropdown, total, matching, selected, scroll{position, capacity, count}, widgets, rows}
+ *   while the settings picker is open, and {open: false} otherwise. "search" is the current filter
+ *   text, "total" the number of settings the picker offers, "matching" the number the filter
+ *   leaves, "selected" the index of the highlighted row in the filtered list, and "rows" the rows
+ *   that are on screen as {name, scope, value, selected, rect}. "name" is the exact engine key the
+ *   attachment will carry and the text the filter matches, "scope" the scope of its descriptor,
+ *   "value" the current value as the engine formats it for the selected owner. "owner" is the
+ *   company the company settings are shown for as {company_id, company_generation, name} (null when
+ *   there is none) and "companies" the companies the owner selector offers as
  *   {company_id, name, company_generation, selected}. The widgets are caption, search, owner, list,
  *   scroll, select, close and closebox. The picker belongs to the active chat: selecting or creating
  *   another chat closes it, and a company that is removed or recreated while the owner dropdown is
  *   open is refused instead of being re-pinned to a lifetime the player did not see.
+ *   "owner_dropdown" is the owner selector's open list as
+ *   {open, coordinate_space: "screen_pixels", rows: [{company_id, company_generation, rect,
+ *   selected, disabled?}]}. It is reported from the native dropdown window that this picker opened
+ *   for the owner widget, so `rows` are only the items that are visible after filtering and
+ *   scrolling, with the rectangle they really occupy (clipped to the item area the list draws in
+ *   and to the area it takes clicks in, so any point of a row really selects it) and the selected
+ *   and disabled flags the list draws; `company_generation` is the lifetime the row was offered
+ *   with, so a company that is deleted and recreated while the list is open keeps the lifetime the
+ *   player saw. `open` is false, with no rows, when the list is closed or when the open dropdown
+ *   belongs to another window. A real input test can click a row's rect instead of guessing one.
  * - "chat_ack": the timing of the last chat Send acknowledgement, the same object that world.info
  *   reports as `timing.chat_ack` (see AgentChatSendAck::ToJson()). It is bound to the world and
  *   epoch it was measured in and is never mixed with a clock of the backend process.
