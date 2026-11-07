@@ -577,6 +577,23 @@ Json ManyNames(const std::vector<std::string_view> &many)
 }
 
 /**
+ * Whether this module can change a setting right now.
+ *
+ * A game or a company integer setting has an engine command, so the command's own editability rules
+ * apply to it. Everything else - a client setting, a string setting and a game setting the engine
+ * itself changes without a command - is written locally, so the rules for a local write apply. A
+ * list setting has no scalar value of its own, so there is nothing a caller could set.
+ * @param sd The setting.
+ * @return True when `world.settings.set` can write the setting now.
+ */
+bool CanSetSetting(const SettingDesc &sd)
+{
+	if (!sd.IsIntSetting() && !sd.IsStringSetting()) return false;
+	if (sd.GetType() != ST_CLIENT && sd.IsIntSetting() && sd.IsEditable(true)) return true;
+	return sd.IsEditable(false);
+}
+
+/**
  * Describe one setting: its current value and the values it accepts.
  * @param sd The setting.
  * @param object The object the setting lives in.
@@ -587,7 +604,7 @@ Json DescribeSetting(const SettingDesc &sd, const void *object)
 	Json row = Json::object();
 	row["name"] = sd.GetName();
 	row["scope"] = ScopeName(sd.GetType());
-	row["editable"] = sd.IsEditable(true);
+	row["editable"] = CanSetSetting(sd);
 	row["newgame_only"] = sd.flags.Test(SettingFlag::NewgameOnly);
 	row["sandbox"] = sd.flags.Test(SettingFlag::Sandbox);
 	row["formatted"] = sd.FormatValue(object);
@@ -621,18 +638,69 @@ Json DescribeSetting(const SettingDesc &sd, const void *object)
 }
 
 /**
- * Every setting descriptor this module can see, in a stable order.
+ * The public generic setting descriptors of this build, in the engine's own table order.
+ *
+ * "Public" is the universe the engine's own settings picker offers: the generic setting tables, and
+ * nothing else. The private and the secrets configuration tables (`network.client_name`, the relay
+ * and survey settings, `network.server_password`, `network.rcon_password`, the invite codes and the
+ * keys) are not part of it: they hold the identity and the credentials of the host and of the
+ * service, so an MCP client that reads and writes settings must not reach them by name either.
  * @return The descriptors.
  */
-std::vector<const SettingDesc *> AllSettings()
+std::vector<const SettingDesc *> PublicGenericSettings()
 {
-	std::vector<const SettingDesc *> settings = GetFilteredSettingCollection([](const SettingDesc &sd) {
+	return GetFilteredSettingCollection([](const SettingDesc &sd) {
 		return SlIsObjectCurrentlyValid(sd.save.version_from, sd.save.version_to);
 	});
+}
+
+/**
+ * The public per-company setting descriptors of this build, in the engine's own table order.
+ * @return The descriptors.
+ */
+std::vector<const SettingDesc *> PublicCompanySettings()
+{
+	std::vector<const SettingDesc *> settings;
 	for (const SettingVariant &desc : _company_settings) {
 		const SettingDesc *sd = GetSettingDesc(desc);
 		if (SlIsObjectCurrentlyValid(sd->save.version_from, sd->save.version_to)) settings.push_back(sd);
 	}
+	return settings;
+}
+
+/**
+ * Find a setting by name in one collection of descriptors, with the engine's own name rules.
+ *
+ * The exact engine key wins over the shortcut form, as in the engine's own `GetSettingFromName`: a
+ * name that is the whole key of a setting resolves to it, and only when no setting has that key
+ * does a name that is the last part of one resolve to that setting (`town_growth_rate` for
+ * `economy.town_growth_rate`).
+ * @param settings The descriptors to search.
+ * @param name The name to resolve.
+ * @return The descriptor, or nullptr when no setting of the collection has that name.
+ */
+const SettingDesc *FindSettingIn(const std::vector<const SettingDesc *> &settings, std::string_view name)
+{
+	for (const SettingDesc *sd : settings) {
+		if (sd->GetName() == name) return sd;
+	}
+
+	const std::string short_name_suffix = std::string{ "." }.append(name);
+	for (const SettingDesc *sd : settings) {
+		if (sd->GetName().ends_with(short_name_suffix)) return sd;
+	}
+
+	return nullptr;
+}
+
+/**
+ * Every public setting descriptor this module exposes, in a stable order.
+ * @return The descriptors: the generic tables, then the per-company table.
+ */
+std::vector<const SettingDesc *> AllSettings()
+{
+	std::vector<const SettingDesc *> settings = PublicGenericSettings();
+	for (const SettingDesc *sd : PublicCompanySettings()) settings.push_back(sd);
 	return settings;
 }
 
@@ -1058,7 +1126,7 @@ Json PowerPlantInfo(const Industry *i)
  */
 Json SettingRow(std::string_view name, CompanyID company)
 {
-	const SettingDesc *sd = GetSettingFromName(name);
+	const SettingDesc *sd = FindPublicSetting(name);
 	if (sd == nullptr || !SlIsObjectCurrentlyValid(sd->save.version_from, sd->save.version_to)) return Json::object();
 	if (sd->GetType() == ST_COMPANY && !Company::IsValidID(company)) return Json::object();
 	return DescribeSetting(*sd, SettingObject(*sd, company));
@@ -1857,7 +1925,7 @@ Json SettingsGet(const Json &params, CompanyID company)
 
 	if (!names.empty()) {
 		for (const std::string &name : names) {
-			const SettingDesc *sd = GetSettingFromName(name);
+			const SettingDesc *sd = FindPublicSetting(name);
 			if (sd == nullptr || !SlIsObjectCurrentlyValid(sd->save.version_from, sd->save.version_to)) {
 				unknown.push_back(name);
 				continue;
@@ -1872,7 +1940,7 @@ Json SettingsGet(const Json &params, CompanyID company)
 	} else {
 		for (const SettingDesc *sd : AllSettings()) {
 			if (!prefix.empty() && !sd->GetName().starts_with(prefix)) continue;
-			if (writable_only && !(sd->IsIntSetting() && sd->IsEditable(true))) continue;
+			if (writable_only && !CanSetSetting(*sd)) continue;
 			if (sd->GetType() == ST_COMPANY && !Company::IsValidID(target)) continue;
 			if (total >= static_cast<size_t>(offset) && rows.size() < static_cast<size_t>(limit)) {
 				rows.push_back(DescribeSetting(*sd, SettingObject(*sd, target)));
@@ -1894,7 +1962,7 @@ Json SettingsGet(const Json &params, CompanyID company)
 /* --- world.settings.set --- */
 
 /**
- * Change one setting through the normal command path.
+ * Change one public setting, through the engine's own write path for its scope and type.
  * @param params The method parameters.
  * @param company The company the call is made for.
  * @return The result document.
@@ -1912,9 +1980,9 @@ Json SettingsSet(const Json &params, CompanyID company)
 	const auto value_it = params.find("value");
 	if (value_it == params.end()) return MakeError("invalid_arguments", "`value` is required");
 
-	const SettingDesc *sd = GetSettingFromName(name);
+	const SettingDesc *sd = FindPublicSetting(name);
 	if (sd == nullptr || !SlIsObjectCurrentlyValid(sd->save.version_from, sd->save.version_to)) {
-		return MakeError("unknown_setting", "there is no setting with that name", {{"name", name}});
+		return MakeError("unknown_setting", "there is no public setting with that name", {{"name", name}});
 	}
 
 	const SettingType scope = sd->GetType();
@@ -1926,22 +1994,30 @@ Json SettingsSet(const Json &params, CompanyID company)
 		return MakeError("invalid_arguments", "`company_id` only applies to per-company settings", {{"name", name}});
 	}
 
-	if (scope == ST_CLIENT) {
-		return MakeGap("world.settings.set", "client_scope");
+	/* A list setting has no scalar value of its own, so there is nothing a caller could write. */
+	if (!sd->IsIntSetting() && !sd->IsStringSetting()) {
+		return MakeGap("world.settings.set", "list_setting");
 	}
-	if (!sd->IsIntSetting()) {
-		return MakeGap("world.settings.set", "string_setting");
-	}
-	if (!sd->IsEditable(true)) {
-		return MakeError("setting_not_editable", "the setting cannot be changed now", {{"name", name}, {"newgame_only", sd->flags.Test(SettingFlag::NewgameOnly)}});
+	if (!CanSetSetting(*sd)) {
+		return MakeError("setting_not_editable", "the setting cannot be changed now", {{"name", sd->GetName()}, {"newgame_only", sd->flags.Test(SettingFlag::NewgameOnly)}});
 	}
 
+	/* Parse the value as the type the setting really has: a string setting takes a string and is
+	 * never read as an integer, an integer setting is checked against its own range. */
 	int32_t parsed = 0;
-	if (const auto error = ParseSettingValue(*sd, *value_it, parsed); error.has_value()) return *error;
+	std::string text;
+	if (sd->IsIntSetting()) {
+		if (const auto error = ParseSettingValue(*sd, *value_it, parsed); error.has_value()) return *error;
+	} else {
+		if (!value_it->is_string()) return MakeError("invalid_value", "the value of a string setting is a string", {{"name", sd->GetName()}});
+		text = value_it->get<std::string>();
+	}
+	const Json requested = sd->IsIntSetting() ? Json(parsed) : Json(text);
 
-	const IntSettingDesc &isd = *sd->AsIntSetting();
+	/* The value and its text before the write, so the answer describes the change even when the
+	 * engine refuses it. */
 	const void *object = SettingObject(*sd, target);
-	const int32_t old_value = isd.Read(object);
+	const Json old_value = sd->IsIntSetting() ? Json(sd->AsIntSetting()->Read(object)) : Json(sd->AsStringSetting()->Read(object));
 
 	Json result = Json::object();
 	result["name"] = sd->GetName();
@@ -1950,22 +2026,69 @@ Json SettingsSet(const Json &params, CompanyID company)
 	result["old_value"] = old_value;
 	result["old_formatted"] = sd->FormatValue(object);
 
-	bool ok;
-	if (scope == ST_COMPANY) {
-		const Backup<CompanyID> context(_current_company, target);
-		ok = RunCommand<Commands::ChangeCompanySetting>(sd->GetName(), parsed);
+	/* Where the setting lives decides how it is applied. A game or a company integer setting has an
+	 * engine command, and the module keeps using it, so the engine's own eligibility and finance
+	 * checks apply and the receipt carries the engine's own result. A client setting lives in this
+	 * very process, and a string setting has no command at all (Commands::ChangeSetting carries an
+	 * integer), so both are written through the setting's own descriptor - the same local write the
+	 * engine's settings window and console make. A local write posts nothing, and its receipt says
+	 * so instead of claiming a command result. */
+	const bool use_command = scope != ST_CLIENT && sd->IsIntSetting() && sd->IsEditable(true);
+	if (use_command) {
+		bool ok;
+		if (scope == ST_COMPANY) {
+			const Backup<CompanyID> context(_current_company, target);
+			ok = RunCommand<Commands::ChangeCompanySetting>(sd->GetName(), parsed);
+		} else {
+			ok = RunCommand<Commands::ChangeSetting>(sd->GetName(), parsed);
+		}
+		if (!_posted.captured) return AddNotExecuted(std::move(result));
+		result = AddCommandResult(std::move(result));
+		result["applied_by"] = "command";
+		if (!ok) return result;
 	} else {
-		ok = RunCommand<Commands::ChangeSetting>(sd->GetName(), parsed);
+		if (sd->IsIntSetting()) {
+			if (scope == ST_GAME && sd->flags.Test(SettingFlag::NoNetworkSync)) {
+				/* The engine changes a non-synced game setting locally and keeps the new-game default
+				 * in step, so the setting behaves as it does in the settings window. */
+				SetSettingValue(sd->AsIntSetting(), parsed);
+			} else {
+				sd->AsIntSetting()->ChangeValue(object, parsed);
+			}
+		} else {
+			sd->AsStringSetting()->ChangeValue(object, std::move(text));
+		}
+		result["applied_by"] = "local";
+		result["cost"] = 0;
+		result["estimated"] = false;
+		result["dry_run"] = false;
 	}
-	if (!_posted.captured) return AddNotExecuted(std::move(result));
-	result = AddCommandResult(std::move(result));
-	if (!ok) return result;
 
-	/* Report what the engine actually applied, not what was asked for. */
+	/* Report what the engine actually holds afterwards, not what was asked for. */
 	const void *after = SettingObject(*sd, target);
-	result["value"] = isd.Read(after);
+	const Json value = sd->IsIntSetting() ? Json(sd->AsIntSetting()->Read(after)) : Json(sd->AsStringSetting()->Read(after));
+	result["value"] = value;
 	result["formatted"] = sd->FormatValue(after);
-	result["changed"] = isd.Read(after) != old_value;
+	result["changed"] = value != old_value;
+
+	/* The command path reports the engine's own result. A local write has no command result: the
+	 * descriptor's ChangeValue returns nothing, so the readback is the only evidence that the value
+	 * was taken. A pre-check that refuses the value leaves the setting untouched, and a write that
+	 * did not happen must not be answered as an applied one. A descriptor may also normalise the
+	 * value it is given (a string length limit truncates it), so only a setting that still holds the
+	 * old value while the caller asked for another one counts as a refusal; a no-op request for the
+	 * value the setting already has is a success that changed nothing. */
+	if (!use_command) {
+		if (requested != old_value && value == old_value) {
+			result["ok"] = false;
+			result["error"] = "setting_not_applied";
+			result["message"] = "the engine did not apply the value; the setting still holds its old value";
+			result["requested"] = requested;
+			result["readback"] = value;
+			return result;
+		}
+		result["ok"] = true;
+	}
 	return result;
 }
 
@@ -4169,6 +4292,20 @@ Json CheatOp(const Json &params, CompanyID company)
 
 } // anonymous namespace
 
+const SettingDesc *FindPublicSetting(std::string_view name)
+{
+	/* The generic tables first and the per-company table last, exactly as the engine's own
+	 * GetSettingFromName searches them, so a name resolves to the same setting it always did. */
+	if (const SettingDesc *sd = FindSettingIn(PublicGenericSettings(), name); sd != nullptr) return sd;
+
+	/* The per-company table is searched under its own keys; the `company.` prefix is the engine's
+	 * own shortcut for it and is stripped, as GetCompanySettingFromName does. */
+	static constexpr std::string_view company_prefix = "company.";
+	std::string_view company_name = name;
+	if (company_name.starts_with(company_prefix)) company_name.remove_prefix(company_prefix.size());
+	return FindSettingIn(PublicCompanySettings(), company_name);
+}
+
 void AgentAdminCommandCallback([[maybe_unused]] Commands cmd, const CommandCost &result, [[maybe_unused]] TileIndex tile)
 {
 	_posted.captured = true;
@@ -4214,8 +4351,8 @@ Json AdminToolCapabilities()
 			{"game", "company", "client", "names", "prefix"},
 			{"write"}));
 	methods.push_back(Capability("world.settings.set", "write",
-			{"game", "company", "bool", "int", "one_of_many", "many_of_many"},
-			{"client_scope", "string_setting"}));
+			{"game", "company", "client", "bool", "int", "string", "one_of_many", "many_of_many"},
+			{"list_setting"}));
 	methods.push_back(Capability("world.company", "write",
 			{"info", "livery", "loan_increase", "loan_decrease", "set_max_loan", "create", "delete", "give_money",
 					"colour", "livery_set", "manager_face", "rename", "rename_president", "buy"},
@@ -4272,8 +4409,8 @@ Json AdminToolCapabilities()
 	});
 	result["notes"] = Json::array({
 		"Actual mutations go through Command<Commands::...>::Post, the normal player command path, so the engine's own eligibility, pause and finance checks apply; results carry the actual cost and the engine error, and every command receipt states its mode explicitly (`dry_run` false and `estimated` false), while a command that never ran answers `command_not_executed`.",
-		"world.settings.get returns the setting descriptors with their current value, type, scope, allowed values or range, default and whether they can be changed now.",
-		"world.settings.set validates the name, the scope, the type and the range before it posts Commands::ChangeSetting or Commands::ChangeCompanySetting, and reports the value the engine actually applied.",
+		"world.settings.get returns the descriptors of the public settings - the generic tables and the per-company table, the same universe the engine's settings picker offers, without the private and the secrets configuration tables - with their current value, type, scope, allowed values or range, default and whether they can be changed now.",
+		"world.settings.set validates the name, the scope, the type and the range and then applies the value the way the setting lives: a game or a company integer setting through Commands::ChangeSetting or Commands::ChangeCompanySetting (`applied_by` command, with the engine's cost), a client setting or a string setting locally through the setting's own descriptor (`applied_by` local, no command and no cost), and it reports the value the engine actually holds afterwards. A list setting is an explicit gap.",
 		"world.company op=create uses Commands::CompanyControl with CompanyCtrlAction::NewAI, the only company creation the single player engine has; the created id is read back from the company pool.",
 		"world.company op=colour and op=livery_set post Commands::SetCompanyColour as the company itself; op=manager_face posts Commands::SetCompanyManagerFace; op=rename and op=rename_president post the matching rename commands; op=buy posts Commands::BuyCompany and needs the company to be bankrupt-asked or an AI for a hostile takeover.",
 		"world.towns op=invest is paid by the company and reports the real cost; op=set_investment, op=force_need, op=growth_rate, op=expand, op=cargo_goal, op=rating and op=destroy are the free administrative commands and run as the deity.",

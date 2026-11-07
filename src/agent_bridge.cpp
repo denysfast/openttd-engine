@@ -2192,6 +2192,9 @@ Json SettingValueJson(const SettingDesc &sd, const void *object)
  * setting. The world and the epoch are checked by #ResolveRef before this is called, so a
  * reference of a world that was left is stale.
  *
+ * Only public settings resolve: the descriptor is looked up through the same resolver the settings
+ * tools use, so a key of the private or the secrets configuration table is unknown here as well.
+ *
  * `scope` is mandatory for every setting, game and client settings included, and it is never
  * inferred from the key: it must be the scope of the descriptor that holds the key. A per-company
  * setting is owned by one company, and the id of a company is reused after the company is gone, so
@@ -2211,7 +2214,7 @@ Json ResolveSettingRef(const Json &ref, [[maybe_unused]] bool require_identity)
 	const std::string name = JsonString(ref, "setting_name");
 	if (name.empty()) return RefFailure("setting", "missing_setting_name", "invalid_params");
 
-	const SettingDesc *sd = GetSettingFromName(name);
+	const SettingDesc *sd = FindPublicSetting(name);
 	if (sd == nullptr) {
 		Json row = RefFailure("setting", "setting_not_found", "unknown_setting");
 		row["setting_name"] = name;
@@ -3436,7 +3439,7 @@ Json CoreContracts()
 		{"mapobject_fields", "a map object adds object_id and object_generation: the pooled object behind the tile is part of the identity, so replacing it with one of the same type is a different identity"},
 		{"point_fields", "type=point, identity=point, tile; no fingerprint, so a point names a location and can never be stale"},
 		{"setting_fields", "type=setting, identity=setting, setting_name, scope (game, client or company; always named, never inferred); a resolved setting adds value (the typed current value: a boolean for a boolean setting, a number for an integer setting, a string for a string setting, null for a list setting) and value_text (the text the engine's own settings window shows). A company scoped setting is owned and adds company_id and company_generation; a game or client setting carries neither an id nor a generation nor a tile nor a fingerprint"},
-		{"setting_identity", "the exact engine setting key (the descriptor's own name, e.g. economy.town_growth_rate) together with its scope is the identity: a value change does not make the reference stale, so a write that names the key is current while the key exists. scope is mandatory for every setting, game and client included: a reference without it answers error=invalid_params with reason=missing_scope, and one that names another scope than the descriptor that holds the key answers scope_mismatch. The scope is never inferred from the key, so a key that moved between tables cannot resolve to another setting unnoticed. A shortcut or alias the engine would also accept is not the key the caller named and answers error=unknown_setting with canonical_name instead of resolving to another setting"},
+		{"setting_identity", "the exact engine setting key (the descriptor's own name, e.g. economy.town_growth_rate) together with its scope is the identity: a value change does not make the reference stale, so a write that names the key is current while the key exists. scope is mandatory for every setting, game and client included: a reference without it answers error=invalid_params with reason=missing_scope, and one that names another scope than the descriptor that holds the key answers scope_mismatch. The scope is never inferred from the key, so a key that moved between tables cannot resolve to another setting unnoticed. A shortcut or alias the engine would also accept is not the key the caller named and answers error=unknown_setting with canonical_name instead of resolving to another setting. Only public settings resolve - the generic and per-company tables the engine's own settings picker offers - so a key of the private or the secrets configuration table (a host name, a password, an invite code, a key) answers unknown_setting too"},
 		{"setting_owner", "a company scoped setting is owned by one company, and company ids are reused: the reference must name company_id and company_generation, and it resolves only against that company lifetime. A missing owner answers error=invalid_params with reason=missing_company_id or missing_company_generation, a deleted owner answers reason=company_deleted and a recreated company that holds the id now answers reason=company_lifetime_mismatch with company_generation_now. The owner is never taken from the current actor, and a company scoped setting never falls back to the client company defaults"},
 		{"setting_world", "a setting reference is bound to the world and epoch it was read in like every other reference, so a reference of a world that was left answers world_mismatch or epoch_mismatch"},
 		{"fingerprint", "FNV-1a over the native tile values that identify the object and its state (tile type, height, the category fields, the recorded owner and both halves of every 64 bit pool lifetime), not over map-array bytes and not over an address"},

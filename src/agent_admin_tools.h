@@ -21,6 +21,8 @@
 #include <optional>
 #include <string_view>
 
+struct SettingDesc;
+
 /** Administrative and game-settings tool methods the agent bridge dispatches onto real OpenTTD commands. */
 namespace InGameAgent {
 
@@ -36,6 +38,24 @@ using Json = nlohmann::json;
  * @return Capability document: implemented methods/ops plus the known gaps.
  */
 Json AdminToolCapabilities();
+
+/**
+ * Find the descriptor of a public engine setting by name.
+ *
+ * The public universe is the one the engine's own settings picker offers: every currently valid
+ * descriptor of the generic setting tables, plus every per-company descriptor. The private and the
+ * secrets configuration tables are not part of it, so their keys - the client and server identity,
+ * the passwords, the invite codes and the keys - are unknown here even though the engine itself
+ * would find them. Both the settings tools of this module and the setting references of the bridge
+ * resolve through this one function, so the two cannot expose different sets of settings.
+ *
+ * The engine's own name rules apply inside that universe: the exact key wins, and the shortcut
+ * form (`town_growth_rate`, `company.engine_renew`) resolves to the setting that owns the key.
+ *
+ * @param name The setting name.
+ * @return The descriptor, or nullptr when no public setting has that name.
+ */
+const SettingDesc *FindPublicSetting(std::string_view name);
 
 /**
  * Point the savegame operations at another directory, for the tests.

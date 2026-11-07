@@ -955,6 +955,27 @@ TEST_CASE("Agent bridge refs: a setting key this build does not have is rejected
 	CHECK(shortcut["found"] == false);
 	CHECK(shortcut["canonical_name"] == "economy.town_growth_rate");
 
+	/* The private and the secrets configuration tables are not public settings: the engine knows
+	 * those keys, a setting reference does not resolve them, so the identity and the credentials of
+	 * the host and of the service are not reachable through the protocol. */
+	REQUIRE(CanonicalSettingName("network.client_name") == "network.client_name");
+	const Json private_key = ResolveObjectRef(Json{{"type", "setting"}, {"setting_name", "network.client_name"}}, false);
+	CHECK(private_key["found"] == false);
+	CHECK(private_key["error"] == "unknown_setting");
+	CHECK(private_key["reason"] == "setting_not_found");
+	CHECK_FALSE(private_key.contains("canonical_name"));
+
+	REQUIRE(CanonicalSettingName("network.server_password") == "network.server_password");
+	const Json secret_key = ResolveObjectRef(Json{{"type", "setting"}, {"setting_name", "network.server_password"}}, false);
+	CHECK(secret_key["found"] == false);
+	CHECK(secret_key["error"] == "unknown_setting");
+	CHECK(secret_key["reason"] == "setting_not_found");
+	CHECK_FALSE(secret_key.contains("canonical_name"));
+
+	/* A public client setting still resolves, so the exclusion is the table and not the scope. */
+	const Json public_client = ResolveObjectRef(Json{{"type", "setting"}, {"setting_name", "gui.auto_remove_signals"}, {"scope", "client"}}, false);
+	CHECK(public_client["found"] == true);
+
 	/* A reference without a key is an invalid argument, not an unknown setting. */
 	const Json missing = ResolveObjectRef(Json{{"type", "setting"}}, false);
 	CHECK(missing["found"] == false);

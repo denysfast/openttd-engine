@@ -24,6 +24,7 @@
 #include "../company_base.h"
 #include "../fileio_func.h"
 #include "../openttd.h"
+#include "../settings_type.h"
 #include "../town_growth.h"
 #include "../town_growth_type.h"
 
@@ -141,7 +142,11 @@ TEST_CASE("Agent admin tools: capabilities")
 	REQUIRE(!settings_set.empty());
 	CHECK(settings_set["authority"] == "write");
 	CHECK(Contains(settings_set["implemented"], "one_of_many"));
-	CHECK(Contains(settings_set["gaps"], "client_scope"));
+	CHECK(Contains(settings_set["implemented"], "client"));
+	CHECK(Contains(settings_set["implemented"], "string"));
+	CHECK(Contains(settings_set["gaps"], "list_setting"));
+	CHECK_FALSE(Contains(settings_set["gaps"], "client_scope"));
+	CHECK_FALSE(Contains(settings_set["gaps"], "string_setting"));
 
 	const Json company = FindCapability(capabilities, "world.company");
 	REQUIRE(!company.empty());
@@ -297,16 +302,21 @@ TEST_CASE("Agent admin tools: settings set validation")
 	CHECK(no_company["ok"] == false);
 	CHECK(no_company["error"] == "unknown_company");
 
-	/* The scopes this module does not write are reported as gaps, not as success. */
-	const Json client = Dispatch("world.settings.set", Json::object({{"name", "gui.autosave_interval"}, {"value", 1}}));
-	CHECK(client["ok"] == false);
-	CHECK(client["error"] == "unsupported_op");
-	CHECK(client["detail"]["op"] == "client_scope");
+	/* A list setting has no scalar value of its own, so it stays an explicit gap. */
+	const Json list_setting = Dispatch("world.settings.set", Json::object({{"name", "music.custom_1"}, {"value", 1}}));
+	CHECK(list_setting["ok"] == false);
+	CHECK(list_setting["error"] == "unsupported_op");
+	CHECK(list_setting["detail"]["op"] == "list_setting");
 
-	const Json string_setting = Dispatch("world.settings.set", Json::object({{"name", "locale.digit_group_separator"}, {"value", " "}}));
-	CHECK(string_setting["ok"] == false);
-	CHECK(string_setting["error"] == "unsupported_op");
-	CHECK(string_setting["detail"]["op"] == "string_setting");
+	/* The private and the secrets configuration tables are not public settings: the engine knows
+	 * those keys, the setting tools of the protocol do not, so the identity and the credentials of
+	 * the host and of the service cannot be reached through them. */
+	CHECK(Dispatch("world.settings.set", Json::object({{"name", "network.client_name"}, {"value", "agent"}}))["error"] == "unknown_setting");
+	CHECK(Dispatch("world.settings.set", Json::object({{"name", "network.server_password"}, {"value", "secret"}}))["error"] == "unknown_setting");
+	const Json protected_rows = Dispatch("world.settings.get", Json::object({{"names", Json::array({"network.client_name", "network.server_password", "network.rcon_password"})}}));
+	REQUIRE(protected_rows["ok"] == true);
+	CHECK(protected_rows["settings"].empty());
+	REQUIRE(protected_rows["unknown"].size() == 3);
 
 	/* A valid change runs the real command path and reports what the engine applied. */
 	const Json posted = Dispatch("world.settings.set", Json::object({{"name", "difficulty.number_towns"}, {"value", 3}}));
@@ -314,6 +324,7 @@ TEST_CASE("Agent admin tools: settings set validation")
 	CHECK(posted["scope"] == "game");
 	REQUIRE(posted["old_value"].is_number_integer());
 	CHECK(posted["ok"] == true);
+	CHECK(posted["applied_by"] == "command");
 	CHECK(posted["value"] == 3);
 	CHECK(posted["changed"] == true);
 	CHECK(posted["cost"] == 0);
@@ -960,4 +971,99 @@ TEST_CASE("Agent admin tools: a money cheat states an actual execution")
 	REQUIRE((*granted)["money_after"].is_number_integer());
 	CHECK((*granted)["money_after"] == before + 20000);
 	CHECK(company.Money() == before + 20000);
+}
+
+TEST_CASE("Agent admin tools: public client and string settings are really written")
+{
+	/* A client setting lives in this process and not in the world, so the module writes it through
+	 * the setting's own descriptor and says in the receipt how it was applied, instead of claiming a
+	 * command result that never happened. */
+	const Json client_before = Dispatch("world.settings.get", Json::object({{"names", Json::array({"gui.threaded_saves"})}}));
+	REQUIRE(client_before["ok"] == true);
+	REQUIRE(client_before["settings"].size() == 1);
+	const Json client_row = client_before["settings"][0];
+	CHECK(client_row["scope"] == "client");
+	CHECK(client_row["type"] == "bool");
+	CHECK(client_row["editable"] == true);
+	/* A boolean setting reports its stored integer, as the descriptors of this method always have. */
+	REQUIRE(client_row["value"].is_number_integer());
+	const bool client_old = client_row["value"].get<int32_t>() != 0;
+	const int32_t client_new = client_old ? 0 : 1;
+
+	const Json client = Dispatch("world.settings.set", Json::object({{"name", "gui.threaded_saves"}, {"value", !client_old}}));
+	REQUIRE(client["ok"] == true);
+	CHECK(client["name"] == "gui.threaded_saves");
+	CHECK(client["scope"] == "client");
+	CHECK(client["old_value"] == (client_old ? 1 : 0));
+	CHECK(client["value"] == client_new);
+	CHECK(client["changed"] == true);
+	/* A local write posts no command: it costs nothing, it is not an estimate, and it names the path
+	 * that applied it. */
+	CHECK(client["applied_by"] == "local");
+	CHECK(client["cost"] == 0);
+	REQUIRE(client["dry_run"].is_boolean());
+	CHECK(client["dry_run"] == false);
+	CHECK(client["estimated"] == false);
+	/* The client object of this process really holds the new value. */
+	CHECK(_settings_client.gui.threaded_saves == (client_new != 0));
+
+	/* A string setting takes a string and is never read as an integer; the value is read back from
+	 * the setting object the write went into. */
+	const Json string_before = Dispatch("world.settings.get", Json::object({{"names", Json::array({"locale.digit_group_separator"})}}));
+	REQUIRE(string_before["ok"] == true);
+	REQUIRE(string_before["settings"].size() == 1);
+	CHECK(string_before["settings"][0]["scope"] == "game");
+	CHECK(string_before["settings"][0]["type"] == "string");
+	REQUIRE(string_before["settings"][0]["value"].is_string());
+	const std::string separator_old = string_before["settings"][0]["value"].get<std::string>();
+
+	const Json string_set = Dispatch("world.settings.set", Json::object({{"name", "locale.digit_group_separator"}, {"value", "'"}}));
+	REQUIRE(string_set["ok"] == true);
+	CHECK(string_set["scope"] == "game");
+	CHECK(string_set["old_value"] == separator_old);
+	CHECK(string_set["value"] == "'");
+	CHECK(string_set["changed"] == true);
+	CHECK(string_set["applied_by"] == "local");
+	CHECK(string_set["cost"] == 0);
+	CHECK(string_set["dry_run"] == false);
+	CHECK(string_set["estimated"] == false);
+	CHECK(GetGameSettings().locale.digit_group_separator == "'");
+
+	/* A string setting is not read as an integer, so a number is refused instead of being written. */
+	const Json not_a_string = Dispatch("world.settings.set", Json::object({{"name", "locale.digit_group_separator"}, {"value", 1}}));
+	CHECK(not_a_string["ok"] == false);
+	CHECK(not_a_string["error"] == "invalid_value");
+
+	/* A game setting the engine itself changes without a command (the locale units are not synced)
+	 * is written locally too, and its range is still the descriptor's own. */
+	const Json units_before = Dispatch("world.settings.get", Json::object({{"names", Json::array({"locale.units_velocity"})}}));
+	REQUIRE(units_before["ok"] == true);
+	REQUIRE(units_before["settings"].size() == 1);
+	CHECK(units_before["settings"][0]["scope"] == "game");
+	CHECK(units_before["settings"][0]["editable"] == true);
+	const int32_t units_old = units_before["settings"][0]["value"].get<int32_t>();
+	const int32_t units_new = units_old == 0 ? 1 : 0;
+
+	const Json units = Dispatch("world.settings.set", Json::object({{"name", "locale.units_velocity"}, {"value", units_new}}));
+	REQUIRE(units["ok"] == true);
+	CHECK(units["value"] == units_new);
+	CHECK(units["changed"] == true);
+	CHECK(units["applied_by"] == "local");
+	CHECK(units["cost"] == 0);
+	CHECK(units["dry_run"] == false);
+	CHECK(units["estimated"] == false);
+	CHECK(static_cast<int32_t>(GetGameSettings().locale.units_velocity) == units_new);
+
+	/* A request for the value the setting already holds is a success that changed nothing, and it
+	 * is not mistaken for a write the engine refused. */
+	const Json same = Dispatch("world.settings.set", Json::object({{"name", "locale.units_velocity"}, {"value", units_new}}));
+	REQUIRE(same["ok"] == true);
+	CHECK(same["changed"] == false);
+	CHECK(same["value"] == units_new);
+	CHECK(same["applied_by"] == "local");
+
+	/* Put the settings back, so the other cases see the values they expect. */
+	CHECK(Dispatch("world.settings.set", Json::object({{"name", "gui.threaded_saves"}, {"value", client_old ? 1 : 0}}))["ok"] == true);
+	CHECK(Dispatch("world.settings.set", Json::object({{"name", "locale.digit_group_separator"}, {"value", separator_old}}))["ok"] == true);
+	CHECK(Dispatch("world.settings.set", Json::object({{"name", "locale.units_velocity"}, {"value", units_old}}))["ok"] == true);
 }
