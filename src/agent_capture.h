@@ -23,17 +23,24 @@ using Json = nlohmann::json;
 /**
  * Capture the frame that the game is currently showing and return it as a PNG.
  *
- * The pixels come from the live screen buffer of the running game, encoded with the
- * regular PNG screenshot provider; nothing is synthesised. Before the copy the dirty
- * blocks are redrawn, exactly like a viewport screenshot does, so a capture requested
- * after a command shows the state that command produced instead of the frame from
- * before it. The image is written to a private temporary directory, read back, and the
- * directory is removed again, so no user file is ever touched.
+ * The pixels are produced by the game's own renderers and encoded with the regular PNG
+ * screenshot provider; nothing is synthesised. The screen modes copy the live screen buffer,
+ * and before that copy the dirty blocks are redrawn, exactly like a viewport screenshot does,
+ * so a capture requested after a command shows the state that command produced instead of the
+ * frame from before it. The image is written to a private temporary directory, read back, and
+ * the directory is removed again, so no user file is ever touched.
  *
- * The capture is the whole screen frame, every window included, not an independent
- * map-camera render: "kind": "viewport" means the screen, and "region" is a rectangle in
- * screen pixels. To find out where a tile is on that screen, use InspectGameViewport()
- * (or WorldToScreen()) first; the capture itself does not move the camera.
+ * Three kinds of image are supported:
+ * - "viewport" without a "target" (the default) is the whole screen frame, every window
+ *   included, copied from the live screen buffer. "region" is a rectangle of that frame in
+ *   screen pixels. To find out where a tile is on that screen, use InspectGameViewport()
+ *   (or WorldToScreen()) first; the capture itself does not move the camera.
+ * - "viewport" with a "target" renders an independent camera view of the map at the
+ *   requested tile, size and zoom. It is rendered from its own Viewport, so the player's
+ *   viewport is neither moved nor read, and no UI is in the image.
+ * - "minimap" renders the smallmap "owner" colouring of the whole world, one pixel per tile
+ *   (or nearest tile when a smaller image is asked for), exactly what the built-in minimap
+ *   screenshot draws.
  *
  * Must be called from the main thread: the thread that runs the video driver's draw
  * tick and owns the video buffer (the one that executes VideoDriver::QueueOnMainThread
@@ -41,10 +48,24 @@ using Json = nlohmann::json;
  * call in VideoDriver::GetInstance()->QueueOnMainThread(...). The project exposes no
  * public game-thread identity, so this is a caller contract and not a runtime check.
  *
- * Parameters (all optional):
- * - "kind":        "viewport" (default) for the whole screen frame, or "region" for a part of it.
+ * Parameters (all optional; a field that does not apply to the requested kind, or that has
+ * the wrong type, is "invalid_params" and is never silently ignored):
+ * - "kind":        "viewport" (default), "region" or "minimap". "region" is a part of the screen
+ *                  frame; "minimap" is the smallmap render described above.
  * - "region":      object with "left", "top", "width", "height" in screen pixels; required
  *                  for "region" and clamped to the frame that actually exists.
+ * - "target":      object asking for an independent camera render instead of the screen frame;
+ *                  exactly one of "tile" (tile index), "tile_x"/"tile_y" (tile coordinates),
+ *                  "town" (town id) or "center" (object with "x"/"y" tile coordinates). Only
+ *                  valid with "kind": "viewport". The tile centre at ground height is put in the
+ *                  middle of the image. With a target, the capture reads and writes nothing of the
+ *                  player's viewport, so the camera stays exactly where the player left it.
+ * - "width"/"height": image size in pixels, both or neither, at most 8192 each. For "target" they
+ *                  default to the screen size; for "minimap" they default to one pixel per tile.
+ *                  A smaller minimap is sampled per nearest tile. Only valid with "target" or
+ *                  "minimap".
+ * - "zoom":        zoom level of a "target" render (0 = 4x in ... 6 = 8x out, default 2 = normal,
+ *                  the same numbers InspectGameViewport() reports). Only valid with "target".
  * - "max_pixels":  upper bound on the number of captured pixels (default 16M, hard cap 64M).
  * - "max_bytes":   upper bound on the size of the encoded PNG (default 5MiB, clamped to the
  *                  largest PNG that still fits the backend's 8MiB request body after base64
@@ -55,23 +76,34 @@ using Json = nlohmann::json;
  *                  map that the chat was covering. Only those two windows are touched, only their
  *                  position, and they are put back exactly where they were before the call
  *                  returns - also when the capture fails. Default false, which keeps the whole
- *                  screen frame (chat included) as before.
+ *                  screen frame (chat included) as before. A rendered image ("target" or
+ *                  "minimap") contains no UI, so there it hides nothing and reports that.
  *
  * On success the result contains:
- * - "ok": true, "kind", "width", "height", "tick" (the game tick the pixels were rendered
- *   from), "camera" (left/top/width/height of the captured screen rectangle), "frame"
- *   (redrawn/tick), "hash" (MD5 of the PNG bytes), "hash_algorithm", "parent_hash" (hash of
- *   the previous capture in this process, or null), "png_bytes" and, unless disabled,
+ * - "ok": true, "kind", "mode" ("screen_frame", "screen_frame_region", "independent_viewport"
+ *   or "minimap"), "width", "height", "tick" (the game tick the pixels were rendered from),
+ *   "frame" (redrawn/tick), "hash" (MD5 of the PNG bytes), "hash_algorithm", "parent_hash" (hash
+ *   of the previous capture in this process, or null), "png_bytes" and, unless disabled,
  *   "png_base64". The backend derives its own SHA-256 from the decoded bytes.
- *   "hide_agent_ui" is true only when agent windows were really hidden for this copy,
- *   "hidden_window_count" says how many, and "agent_ui_restored" is false only when a hidden
- *   window was gone before it could be put back.
+ * - "camera" (left/top/width/height of the copied screen rectangle) for the screen modes.
+ * - "coordinate_space", "projection" and, for "minimap", "map" and "legend" for the rendered
+ *   modes: "projection.viewport" holds the Viewport of an independent render, so that
+ *   WorldToScreen(viewport, x, y, z) and TranslateXYToTileCoord(viewport, x, y) map between the
+ *   image and the map (the player's viewport is a different camera; InspectGameViewport() reports
+ *   that one). "projection.player_viewport_unchanged" is true. For "minimap", "projection"
+ *   describes the pixel/tile mapping (x is mirrored like the built-in minimap screenshot) and
+ *   "legend" gives the palette indices of the fixed colour meanings.
+ * - "ui_in_frame" (whether the image can contain UI at all), "hide_agent_ui" (true only when
+ *   agent windows were really hidden for this copy), "hidden_window_count" (how many) and
+ *   "agent_ui_restored" (false only when a hidden window was gone before it could be put back).
  *
  * On failure the result contains "ok": false, "error" and "tick". Possible errors are
  * "headless_unavailable" (no video driver, blitter or frame buffer), "invalid_params",
  * "too_large" (with "png_bytes"/"max_bytes" or "pixels"/"max_pixels"), "stale_frame" (the
- * game advanced while the frame was copied, so the pixels are not the state of the reported
- * tick), "png_unavailable", "temp_dir_unavailable" and "encode_failed".
+ * game advanced while the image was made, so the pixels are not the state of the reported
+ * tick), "map_unavailable" (a "minimap" without a map, e.g. in the menu), "out_of_bounds"
+ * (a target that is not on the map), "png_unavailable", "temp_dir_unavailable" and
+ * "encode_failed".
  *
  * @param params The request parameters.
  * @return The JSON result describing the capture.

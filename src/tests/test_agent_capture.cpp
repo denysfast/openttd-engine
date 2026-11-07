@@ -125,6 +125,82 @@ TEST_CASE("Agent capture: a wrongly typed hide_agent_ui is a capture error")
 	CHECK(accepted["error"] == "headless_unavailable");
 }
 
+TEST_CASE("Agent capture: independent and minimap requests are validated strictly")
+{
+	using Json = InGameAgent::Json;
+
+	/* All of these are rejected while parsing, i.e. before the video driver is looked at, so the
+	 * windowless test binary sees the caller error itself. */
+	SECTION("a target needs an object") {
+		CHECK(InGameAgent::CaptureGameFrame(Json{{"target", "tile 5"}})["error"] == "invalid_params");
+	}
+
+	SECTION("a target with the wrong kind is rejected, not ignored") {
+		CHECK(InGameAgent::CaptureGameFrame(Json{{"kind", "region"}, {"target", {{"tile", 0}}}, {"region", {{"left", 0}, {"top", 0}, {"width", 4}, {"height", 4}}}})["error"] == "invalid_params");
+		CHECK(InGameAgent::CaptureGameFrame(Json{{"kind", "minimap"}, {"target", {{"tile", 0}}}})["error"] == "invalid_params");
+	}
+
+	SECTION("a size or zoom without a target is rejected, not ignored") {
+		CHECK(InGameAgent::CaptureGameFrame(Json{{"width", 64}, {"height", 64}})["error"] == "invalid_params");
+		CHECK(InGameAgent::CaptureGameFrame(Json{{"zoom", 2}})["error"] == "invalid_params");
+		CHECK(InGameAgent::CaptureGameFrame(Json{{"kind", "region"}, {"zoom", 2}, {"region", {{"left", 0}, {"top", 0}, {"width", 4}, {"height", 4}}}})["error"] == "invalid_params");
+	}
+
+	SECTION("half a size and a bad zoom are rejected") {
+		CHECK(InGameAgent::CaptureGameFrame(Json{{"target", {{"tile", 0}}}, {"width", 64}})["error"] == "invalid_params");
+		CHECK(InGameAgent::CaptureGameFrame(Json{{"target", {{"tile", 0}}}, {"zoom", 7}})["error"] == "invalid_params");
+		CHECK(InGameAgent::CaptureGameFrame(Json{{"target", {{"tile", 0}}}, {"zoom", -1}})["error"] == "invalid_params");
+		CHECK(InGameAgent::CaptureGameFrame(Json{{"target", {{"tile", 0}}}, {"width", 100000}, {"height", 100000}})["error"] == "invalid_params");
+	}
+
+	SECTION("minimap rejects a target and a zoom") {
+		CHECK(InGameAgent::CaptureGameFrame(Json{{"kind", "minimap"}, {"zoom", 2}})["error"] == "invalid_params");
+		CHECK(InGameAgent::CaptureGameFrame(Json{{"kind", "minimap"}, {"width", 64}})["error"] == "invalid_params");
+		CHECK(InGameAgent::CaptureGameFrame(Json{{"kind", "minimap"}, {"width", "big"}, {"height", 64}})["error"] == "invalid_params");
+	}
+
+	SECTION("wrong types are rejected") {
+		CHECK(InGameAgent::CaptureGameFrame(Json{{"kind", "minimap"}, {"width", "big"}, {"height", 64}})["error"] == "invalid_params");
+		CHECK(InGameAgent::CaptureGameFrame(Json{{"kind", 5}})["error"] == "invalid_params");
+		CHECK(InGameAgent::CaptureGameFrame(Json{{"target", {{"tile", "zero"}}}})["error"] == "invalid_params");
+	}
+
+	SECTION("a well formed request gets past validation") {
+		/* Past the parsing there is no frame buffer in this binary, so the honest answer is that. */
+		CHECK(InGameAgent::CaptureGameFrame(Json{{"kind", "minimap"}})["error"] == "headless_unavailable");
+		CHECK(InGameAgent::CaptureGameFrame(Json{{"kind", "minimap"}, {"width", 256}, {"height", 256}})["error"] == "headless_unavailable");
+
+		/* A target needs a map and this binary has none (Map::size is 0), so the request is accepted
+		 * by the parser and then honestly reported as out of bounds. */
+		CHECK(InGameAgent::CaptureGameFrame(Json{{"target", {{"tile", 0}}}, {"width", 64}, {"height", 64}, {"zoom", 3}})["error"] == "out_of_bounds");
+	}
+}
+
+TEST_CASE("Agent capture: an independent camera centres its target in the image")
+{
+	/* The viewport of an independent render is a plain Viewport, so the mapping helpers of the
+	 * module apply to it unchanged. */
+	Viewport camera{};
+	camera.left = 0;
+	camera.top = 0;
+	camera.width = 640;
+	camera.height = 480;
+	camera.zoom = ZoomLevel::Normal;
+	camera.virtual_width = ScaleByZoom(camera.width, camera.zoom);
+	camera.virtual_height = ScaleByZoom(camera.height, camera.zoom);
+	camera.virtual_left = 20000 - camera.virtual_width / 2;
+	camera.virtual_top = 10000 - camera.virtual_height / 2;
+
+	/* A world point at the centre of the camera maps to the centre of the image. */
+	const Point middle = InGameAgent::WorldToScreen(camera, 20000, 10000, 0);
+	CHECK(std::abs(middle.x - camera.width / 2) <= 1);
+	CHECK(std::abs(middle.y - camera.height / 2) <= 1);
+
+	/* And the mapping stays inside the image, i.e. the camera does not fall back on the screen. */
+	CHECK(InGameAgent::WorldToScreen(camera, 20000, 10000, 0).x >= 0);
+	CHECK(InGameAgent::WorldToScreen(camera, 20000, 10000, 0).y >= 0);
+}
+
 TEST_CASE("Agent capture: camera queries without a main window")
 {
 	/* The test binary has no window system, so there is no main viewport. */
