@@ -23,16 +23,25 @@
 #include "../agent_game_tools.h"
 #include "../aircraft.h"
 #include "../cargotype.h"
+#include "../clear_map.h"
 #include "../company_base.h"
 #include "../engine_base.h"
 #include "../language.h"
+#include "../map_func.h"
 #include "../order_base.h"
 #include "../road.h"
+#include "../road_map.h"
+#include "../road_type.h"
 #include "../roadveh.h"
 #include "../settings_type.h"
+#include "../station_map.h"
+#include "../station_type.h"
 #include "../table/strings.h"
+#include "../tile_cmd.h"
+#include "../track_func.h"
 #include "../train.h"
 #include "../vehicle_base.h"
+#include "../void_map.h"
 
 #include "../safeguards.h"
 
@@ -1248,4 +1257,225 @@ TEST_CASE("agent_game_tools: an unsupported refit is refused before the order li
 	const Json no_id = OrdersPlanForTest(Json::array({Json{{"type", "station"}, {"refit_cargo_id", 1}}}));
 	CHECK(no_id["ok"] == false);
 	CHECK(no_id["error"]["error"] == "invalid_arguments");
+}
+
+namespace {
+
+/**
+ * A flat map of real tiles for the depot entrance case.
+ *
+ * The engine's own map is allocated and every tile is set to flat grass, so the road bits and the
+ * depot below are real map state that the engine's accessors read back. No running game is needed
+ * for that, exactly as the rail route cases show; the map is not freed because the next case that
+ * needs one allocates over it.
+ */
+class TestRoadMap {
+public:
+	TestRoadMap()
+	{
+		Map::Allocate(128, 128);
+		/* `TileIndex`, not `Tile`: this file has its own `Tile(x, y)` helper, which hides the type. */
+		for (TileIndex t : Map::Iterate()) {
+			MakeClear(t, ClearGround::Grass, 3);
+			SetTileHeight(t, 3);
+			if (TileX(t) == Map::MaxX() || TileY(t) == Map::MaxY()) MakeVoid(t);
+		}
+		/* The engine's own road type tables: without a game the road/tram masks are empty. */
+		ResetRoadTypes();
+	}
+};
+
+} // namespace
+
+TEST_CASE("agent_game_tools: a depot entrance reports the road that is really there")
+{
+	/* The entrance of a depot is the tile the vehicles drive out into. The engine lets them leave
+	 * only onto a road piece on the side of that tile which faces the depot, and only if that tile
+	 * offers a track the vehicle can drive on; a depot built against the side of a straight road is
+	 * accepted and then traps every vehicle it releases. Every case below is real map state: real
+	 * road pieces and real depot tiles read back through the engine's own accessors. */
+	TestRoadMap map;
+
+	/* A straight road along the x axis: its pieces are the south-west and north-east ones. */
+	for (uint x = 8; x <= 11; x++) {
+		MakeRoadNormal(TileXY(x, 10), ROAD_X, ROADTYPE_ROAD, INVALID_ROADTYPE, TownID::Invalid(), OWNER_NONE, OWNER_NONE);
+	}
+
+	/* In line with the road: the exit points along the road, so the piece that faces the depot is
+	 * there and a vehicle can leave. */
+	MakeRoadDepot(TileXY(7, 10), OWNER_NONE, DepotID(0), DiagDirection::SW, ROADTYPE_ROAD);
+	REQUIRE(IsRoadDepotTile(TileXY(7, 10)));
+
+	const Json aligned = RoadDepotEntranceJson(TileXY(7, 10));
+	CHECK(aligned["direction"] == "sw");
+	CHECK(aligned["tile"]["x"] == 8);
+	CHECK(aligned["tile"]["y"] == 10);
+	CHECK(aligned["required_road_bit"] == "ne");
+	CHECK(Contains(aligned["road_bits"], "ne"));
+	CHECK(Contains(aligned["road_bits"], "sw"));
+	CHECK(aligned["has_required_bit"] == true);
+	CHECK(aligned["drivable"] == true);
+	CHECK(aligned["connected"] == true);
+
+	/* Beside the road: the exit points at the side of the same straight road, whose pieces are the
+	 * other pair, so the neighbour has nothing on the side the vehicle enters it from. This is the
+	 * layout the end-to-end case built, and the bus never left the depot tile. */
+	MakeRoadDepot(TileXY(10, 11), OWNER_NONE, DepotID(1), DiagDirection::NW, ROADTYPE_ROAD);
+	REQUIRE(IsRoadDepotTile(TileXY(10, 11)));
+
+	const Json wrong_axis = RoadDepotEntranceJson(TileXY(10, 11));
+	CHECK(wrong_axis["direction"] == "nw");
+	CHECK(wrong_axis["tile"]["x"] == 10);
+	CHECK(wrong_axis["tile"]["y"] == 10);
+	CHECK(wrong_axis["required_road_bit"] == "se");
+	CHECK_FALSE(Contains(wrong_axis["road_bits"], "se"));
+	CHECK(wrong_axis["has_required_bit"] == false);
+	CHECK(wrong_axis["connected"] == false);
+
+	/* The engine's own rule agrees: the road pathfinder keeps only the tracks reachable from the
+	 * direction the vehicle enters the neighbour tile with, and that set is empty here and not for
+	 * the aligned depot. */
+	const TrackStatus aligned_tracks = GetTileTrackStatus(TileXY(8, 10), TransportType::Road, RoadTramType::Road);
+	CHECK((aligned_tracks.trackdirs & DiagdirReachesTrackdirs(DiagDirection::SW)).Any());
+	const TrackStatus wrong_axis_tracks = GetTileTrackStatus(TileXY(10, 10), TransportType::Road, RoadTramType::Road);
+	CHECK((wrong_axis_tracks.trackdirs & DiagdirReachesTrackdirs(DiagDirection::NW)).None());
+
+	/* An entrance tile without any road at all is the same trap, and it says so. */
+	MakeRoadDepot(TileXY(10, 13), OWNER_NONE, DepotID(2), DiagDirection::NW, ROADTYPE_ROAD);
+
+	const Json empty = RoadDepotEntranceJson(TileXY(10, 13));
+	CHECK(empty["tile"]["x"] == 10);
+	CHECK(empty["tile"]["y"] == 12);
+	CHECK(empty["road_bits"].empty());
+	CHECK(empty["connected"] == false);
+
+	/* The read is the map as it is now and not a remembered build: laying the road under the door
+	 * changes the answer for the same depot. */
+	MakeRoadNormal(TileXY(10, 12), ROAD_Y, ROADTYPE_ROAD, INVALID_ROADTYPE, TownID::Invalid(), OWNER_NONE, OWNER_NONE);
+	const Json refreshed = RoadDepotEntranceJson(TileXY(10, 13));
+	CHECK(Contains(refreshed["road_bits"], "se"));
+	CHECK(refreshed["has_required_bit"] == true);
+	CHECK(refreshed["drivable"] == true);
+	CHECK(refreshed["connected"] == true);
+
+	/* A one-piece stub: the piece that faces the depot is there, but a single piece has no drivable
+	 * track in the engine, so it must not read as a usable exit. */
+	MakeRoadNormal(TileXY(20, 20), RoadBits{RoadBit::SE}, ROADTYPE_ROAD, INVALID_ROADTYPE, TownID::Invalid(), OWNER_NONE, OWNER_NONE);
+	MakeRoadDepot(TileXY(20, 21), OWNER_NONE, DepotID(3), DiagDirection::NW, ROADTYPE_ROAD);
+
+	const Json stub = RoadDepotEntranceJson(TileXY(20, 21));
+	CHECK(stub["required_road_bit"] == "se");
+	CHECK(stub["has_required_bit"] == true);
+	CHECK(stub["drivable"] == false);
+	CHECK(stub["connected"] == false);
+
+	/* A tile that is not a road depot has no road entrance at all. */
+	CHECK(RoadDepotEntranceJson(TileXY(8, 10)).is_null());
+}
+
+TEST_CASE("agent_game_tools: a road stop access reports the entries of its own tile")
+{
+	TestRoadMap map;
+
+	/* A bay stop is entered from the one side the engine stored for it. */
+	MakeRoadStop(TileXY(30, 10), OWNER_NONE, StationID(0), RoadStopType::Bus, ROADTYPE_ROAD, INVALID_ROADTYPE, DiagDirection::SE);
+	MakeRoadNormal(TileXY(30, 11), ROAD_Y, ROADTYPE_ROAD, INVALID_ROADTYPE, TownID::Invalid(), OWNER_NONE, OWNER_NONE);
+
+	const Json bay = RoadStopAccessJson(TileXY(30, 10));
+	CHECK(bay["type"] == "bus");
+	CHECK(bay["kind"] == "bay");
+	CHECK(bay["tile"]["x"] == 30);
+	CHECK(bay["tile"]["y"] == 10);
+	CHECK(bay["entries"].size() == 1);
+	CHECK(bay["entries"][0]["direction"] == "se");
+	CHECK(bay["entries"][0]["tile"]["x"] == 30);
+	CHECK(bay["entries"][0]["tile"]["y"] == 11);
+	CHECK(bay["entries"][0]["required_road_bit"] == "nw");
+	CHECK(bay["entries"][0]["connected"] == true);
+
+	/* The same stop with nothing on its entrance side, then with the road laid afterwards: the
+	 * answer follows the map, so a stop is never taken for usable from an old build. */
+	MakeRoadStop(TileXY(31, 10), OWNER_NONE, StationID(0), RoadStopType::Truck, ROADTYPE_ROAD, INVALID_ROADTYPE, DiagDirection::SE);
+	const Json no_road = RoadStopAccessJson(TileXY(31, 10));
+	CHECK(no_road["type"] == "truck");
+	CHECK(no_road["entries"].size() == 1);
+	CHECK(no_road["entries"][0]["road_bits"].empty());
+	CHECK(no_road["entries"][0]["connected"] == false);
+
+	MakeRoadNormal(TileXY(31, 11), ROAD_Y, ROADTYPE_ROAD, INVALID_ROADTYPE, TownID::Invalid(), OWNER_NONE, OWNER_NONE);
+	CHECK(RoadStopAccessJson(TileXY(31, 10))["entries"][0]["connected"] == true);
+
+	/* A drive-through stop is entered from either end of the axis the engine stored. */
+	MakeDriveThroughRoadStop(TileXY(40, 10), OWNER_NONE, OWNER_NONE, OWNER_NONE, StationID(1), StationType::Bus, ROADTYPE_ROAD, INVALID_ROADTYPE, Axis::X);
+	MakeRoadNormal(TileXY(39, 10), ROAD_X, ROADTYPE_ROAD, INVALID_ROADTYPE, TownID::Invalid(), OWNER_NONE, OWNER_NONE);
+
+	const Json through = RoadStopAccessJson(TileXY(40, 10));
+	CHECK(through["kind"] == "drive_through");
+	CHECK(through["axis"] == "x");
+	REQUIRE(through["entries"].size() == 2);
+	/* The two ends are the two axis neighbours, in the engine's direction order. */
+	CHECK(through["entries"][0]["direction"] == "ne");
+	CHECK(through["entries"][0]["tile"]["x"] == 39);
+	CHECK(through["entries"][0]["tile"]["y"] == 10);
+	CHECK(through["entries"][0]["connected"] == true);
+	CHECK(through["entries"][1]["direction"] == "sw");
+	CHECK(through["entries"][1]["tile"]["x"] == 41);
+	CHECK(through["entries"][1]["tile"]["y"] == 10);
+	CHECK(through["entries"][1]["connected"] == false);
+
+	/* The other end, once the road reaches it. */
+	MakeRoadNormal(TileXY(41, 10), ROAD_X, ROADTYPE_ROAD, INVALID_ROADTYPE, TownID::Invalid(), OWNER_NONE, OWNER_NONE);
+	const Json both = RoadStopAccessJson(TileXY(40, 10));
+	CHECK(both["entries"][0]["connected"] == true);
+	CHECK(both["entries"][1]["connected"] == true);
+
+	/* A tile that is not a bus or truck stop has no stop access at all. */
+	CHECK(RoadStopAccessJson(TileXY(30, 11)).is_null());
+}
+
+TEST_CASE("agent_game_tools: a road tile read reports its pieces and one-way state")
+{
+	TestRoadMap map;
+
+	MakeRoadNormal(TileXY(8, 10), ROAD_X, ROADTYPE_ROAD, INVALID_ROADTYPE, TownID::Invalid(), OWNER_NONE, OWNER_NONE);
+
+	/* A straight road offers the two directions along its own axis and no others, so two adjacent
+	 * road tiles can be told apart from connected track. */
+	const Json straight = RoadTileJson(TileXY(8, 10), RoadTramType::Road);
+	CHECK(Contains(straight["road_bits"], "ne"));
+	CHECK(Contains(straight["road_bits"], "sw"));
+	CHECK(Contains(straight["drivable_exits"], "ne"));
+	CHECK(Contains(straight["drivable_exits"], "sw"));
+	CHECK_FALSE(Contains(straight["drivable_exits"], "se"));
+	CHECK_FALSE(Contains(straight["drivable_exits"], "nw"));
+	CHECK(straight["road_type_id"] == static_cast<int>(ROADTYPE_ROAD));
+	CHECK(straight["road_type"] == "road");
+	CHECK(straight["one_way"] == false);
+	CHECK(straight["disallowed_directions"].empty());
+
+	/* A one-way road says which travel direction the engine disallows, and its drivable exits do
+	 * not change: the restriction applies to entering a neighbouring tile, which is a per-pair test. */
+	MakeRoadNormal(TileXY(9, 10), ROAD_X, ROADTYPE_ROAD, INVALID_ROADTYPE, TownID::Invalid(), OWNER_NONE, OWNER_NONE);
+	SetDisallowedRoadDirections(TileXY(9, 10), DisallowedRoadDirections{DisallowedRoadDirection::Northbound});
+
+	const Json one_way = RoadTileJson(TileXY(9, 10), RoadTramType::Road);
+	CHECK(one_way["one_way"] == true);
+	CHECK(Contains(one_way["disallowed_directions"], "northbound"));
+	CHECK_FALSE(Contains(one_way["disallowed_directions"], "southbound"));
+	CHECK(Contains(one_way["drivable_exits"], "ne"));
+	CHECK(Contains(one_way["drivable_exits"], "sw"));
+
+	/* A one-piece stub carries a piece and no drivable track at all. */
+	MakeRoadNormal(TileXY(20, 20), RoadBits{RoadBit::SE}, ROADTYPE_ROAD, INVALID_ROADTYPE, TownID::Invalid(), OWNER_NONE, OWNER_NONE);
+	const Json stub = RoadTileJson(TileXY(20, 20), RoadTramType::Road);
+	CHECK(Contains(stub["road_bits"], "se"));
+	CHECK(stub["drivable_exits"].empty());
+	CHECK(stub["one_way"] == false);
+
+	/* A tile without a road of that family says so instead of pretending to be empty road. */
+	const Json clear_tile = RoadTileJson(TileXY(50, 50), RoadTramType::Road);
+	CHECK(clear_tile["road_bits"].empty());
+	CHECK(clear_tile["road_type_id"].is_null());
+	CHECK(clear_tile["road_type"].is_null());
+	CHECK(clear_tile["drivable_exits"].empty());
 }

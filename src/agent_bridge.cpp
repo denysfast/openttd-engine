@@ -47,6 +47,7 @@
 #include "settings_internal.h"
 #include "settings_type.h"
 #include "road_map.h"
+#include "roadstop_base.h"
 #include "signs_base.h"
 #include "signs_cmd.h"
 #include "station_base.h"
@@ -1161,6 +1162,12 @@ Json TileObjectRow(TileIndex tile, TileObjectKind kind, std::string_view subtype
 		row["object_generation"] = object == nullptr ? Json(nullptr) : Json(object->generation);
 	}
 
+	/* A road or tram object carries the pieces, the type and the one-way state of its own family,
+	 * so two neighbouring road tiles are not taken for connected track by their tile type alone. */
+	if (kind == TileObjectKind::Road || kind == TileObjectKind::Tram) {
+		row.update(RoadTileJson(tile, kind == TileObjectKind::Tram ? RoadTramType::Tram : RoadTramType::Road));
+	}
+
 	return row;
 }
 
@@ -1282,6 +1289,18 @@ Json TileRow(TileIndex tile)
 			const Owner owner = GetTileOwner(tile);
 			if (owner != OWNER_NONE && owner != INVALID_OWNER) row["owner"] = owner.base();
 		}
+
+		/* The road or tram state of the tile itself, per family: the tile type alone does not say
+		 * which pieces are there, so two adjacent road tiles are not taken for connected track. */
+		if (type == TileType::Road) {
+			if (GetRoadType(tile, RoadTramType::Road) != INVALID_ROADTYPE) row["road"] = RoadTileJson(tile, RoadTramType::Road);
+			if (GetRoadType(tile, RoadTramType::Tram) != INVALID_ROADTYPE) row["tram"] = RoadTileJson(tile, RoadTramType::Tram);
+			/* A depot tile stores its exit direction; the entrance facts are read from the tile. */
+			if (IsRoadDepotTile(tile)) row["depot"] = RoadDepotEntranceJson(tile);
+		}
+
+		/* A bus or truck stop tile stores its own access; a road waypoint is not a stop. */
+		if (IsStationRoadStopTile(tile)) row["stop"] = RoadStopAccessJson(tile);
 	}
 
 	return row;
@@ -1594,6 +1613,41 @@ Json StationAirportJson(const Station &st)
 	};
 }
 
+/** Largest number of road stops one station row lists, so an answer stays bounded. */
+constexpr uint MAX_STATION_ROAD_STOPS = 8;
+
+/**
+ * The road stops of a station, with the access of each stop read from its own tile.
+ *
+ * The stops are the engine's own lists (`Station::GetPrimaryRoadStop()` and `RoadStop::next`), not
+ * the station's tile area, so a stop is reported exactly where the engine keeps it. Each stop
+ * carries the current entrance facts of its tile (see RoadStopAccessJson in agent_game_tools.h), so
+ * a station row follows the map when a road is built or removed next to a stop. The list is bounded
+ * and says so instead of dropping stops silently.
+ * @param st The station.
+ * @return `{total, truncated, stops}`; an empty list for a station without road stops.
+ */
+Json StationRoadStopsJson(const Station &st)
+{
+	Json stops = Json::array();
+	uint total = 0;
+	for (const RoadStopType type : {RoadStopType::Bus, RoadStopType::Truck}) {
+		for (const RoadStop *rs = st.GetPrimaryRoadStop(type); rs != nullptr; rs = rs->next) {
+			if (total < MAX_STATION_ROAD_STOPS) {
+				const Json access = RoadStopAccessJson(rs->xy);
+				if (!access.is_null()) stops.push_back(access);
+			}
+			total++;
+		}
+	}
+
+	return {
+		{"total", total},
+		{"truncated", total > MAX_STATION_ROAD_STOPS},
+		{"stops", std::move(stops)},
+	};
+}
+
 /**
  * Implement world.query for towns, companies, stations, waypoints, depots, industries, vehicles,
  * signs and tiles.
@@ -1701,6 +1755,8 @@ Json WorldQuery(const Json &params)
 			 * for a station that has no airport at all. */
 			const Json airport = StationAirportJson(*st);
 			if (!airport.is_null()) row["airport"] = airport;
+			/* The same current road stop access as the resolved station below. */
+			row["road_stops"] = StationRoadStopsJson(*st);
 			add_row(std::move(row));
 		}
 	} else if (kind == "waypoints") {
@@ -1730,6 +1786,9 @@ Json WorldQuery(const Json &params)
 			if (company_id >= 0 && (!valid_tile || static_cast<int>(GetTileOwner(d->xy).base()) != company_id)) continue;
 			if (!ContainsAsciiCI(d->name, name)) continue;
 			if (range.active && (!valid_tile || !range.Contains(d->xy))) continue;
+			/* The entrance is read from the depot tile as it is now, not from the build receipt:
+			 * a road laid or removed next to the depot changes the answer. A depot that is not a
+			 * road or tram depot has no road entrance, so the field is null for it. */
 			add_row({
 				{"id", d->index.base()},
 				{"generation", d->generation},
@@ -1738,6 +1797,7 @@ Json WorldQuery(const Json &params)
 				{"owner", valid_tile ? Json(GetTileOwner(d->xy).base()) : Json(nullptr)},
 				{"what", valid_tile ? Json(std::string(TileTypeName(GetTileType(d->xy)))) : Json(nullptr)},
 				{"town_id", d->town != nullptr ? d->town->index.base() : -1},
+				{"entrance", valid_tile ? RoadDepotEntranceJson(d->xy) : Json(nullptr)},
 			});
 		}
 	} else if (kind == "industries") {
@@ -2542,6 +2602,8 @@ Json ResolveRef(const Json &ref, bool require_identity)
 			 * not have to look the station up again; a station without an airport omits it. */
 			const Json airport = StationAirportJson(st);
 			if (!airport.is_null()) row["airport"] = airport;
+			/* The same current road stop access the station row carries. */
+			row["road_stops"] = StationRoadStopsJson(st);
 		});
 	}
 	if (type == "waypoint") {
@@ -2575,6 +2637,8 @@ Json ResolveRef(const Json &ref, bool require_identity)
 			row["what"] = std::string(TileTypeName(GetTileType(d.xy)));
 			row["tile"] = Json{{"x", TileX(d.xy)}, {"y", TileY(d.xy)}};
 			row["town_id"] = d.town != nullptr ? d.town->index.base() : -1;
+			/* The same current entrance facts the depot row carries, read from the tile. */
+			row["entrance"] = IsValidTile(d.xy) ? RoadDepotEntranceJson(d.xy) : Json(nullptr);
 		});
 	}
 	if (type == "engine") {

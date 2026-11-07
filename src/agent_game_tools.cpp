@@ -17,6 +17,7 @@
 #include "company_base.h"
 #include "depot_base.h"
 #include "depot_map.h"
+#include "direction_func.h"
 #include "direction_type.h"
 #include "engine_base.h"
 #include "group.h"
@@ -27,15 +28,21 @@
 #include "order_base.h"
 #include "order_cmd.h"
 #include "order_type.h"
+#include "road.h"
 #include "road_cmd.h"
+#include "road_func.h"
 #include "road_type.h"
+#include "road_map.h"
 #include "roadveh.h"
 #include "station_base.h"
 #include "station_cmd.h"
+#include "station_map.h"
 #include "station_type.h"
 #include "strings_func.h"
+#include "tile_cmd.h"
 #include "timer/timer_game_calendar.h"
 #include "timetable_cmd.h"
+#include "track_func.h"
 #include "train.h"
 #include "vehicle_base.h"
 #include "vehicle_cmd.h"
@@ -722,6 +729,154 @@ bool ReadDiagDirection(const Json &params, DiagDirection &dir)
 	return false;
 }
 
+/**
+ * Name of a diagonal direction, as the tool protocol spells it.
+ * @param dir The direction.
+ * @return The name.
+ */
+std::string DiagDirName(DiagDirection dir)
+{
+	switch (dir) {
+		case DiagDirection::NE: return "ne";
+		case DiagDirection::SE: return "se";
+		case DiagDirection::SW: return "sw";
+		case DiagDirection::NW: return "nw";
+		default: return "invalid";
+	}
+}
+
+/**
+ * Name of one road piece, as the tool protocol spells it.
+ * @param bit The road piece.
+ * @return The name.
+ */
+std::string RoadBitName(RoadBit bit)
+{
+	switch (bit) {
+		case RoadBit::NW: return "nw";
+		case RoadBit::SW: return "sw";
+		case RoadBit::SE: return "se";
+		case RoadBit::NE: return "ne";
+		default: return "invalid";
+	}
+}
+
+/**
+ * Serialise the road pieces of a tile as protocol names.
+ * @param bits The pieces.
+ * @return JSON array of names, in the engine's own piece order.
+ */
+Json RoadBitsJson(RoadBits bits)
+{
+	static constexpr RoadBit all[]{RoadBit::NW, RoadBit::SW, RoadBit::SE, RoadBit::NE};
+
+	Json result = Json::array();
+	for (const RoadBit bit : all) {
+		if (bits.Test(bit)) result.push_back(RoadBitName(bit));
+	}
+	return result;
+}
+
+/**
+ * Name of one disallowed travel direction, as the engine stores it on a one-way road tile.
+ * @param dir The engine's own value; it is not a screen direction.
+ * @return The name.
+ */
+std::string_view DisallowedRoadDirectionName(DisallowedRoadDirection dir)
+{
+	switch (dir) {
+		case DisallowedRoadDirection::Southbound: return "southbound";
+		case DisallowedRoadDirection::Northbound: return "northbound";
+		default: return "invalid";
+	}
+}
+
+/**
+ * The road or tram family a tile carries, as the engine records it.
+ *
+ * A road depot or a road stop tile stores the family it was built for in the same field, so the
+ * family is read from the tile and never assumed.
+ * @param tile The tile.
+ * @return \c RoadTramType::Road when the tile carries a road-type road, else \c RoadTramType::Tram.
+ */
+RoadTramType TileRoadTramType(TileIndex tile)
+{
+	if (IsValidTile(tile) && MayHaveRoad(tile) && GetRoadType(tile, RoadTramType::Road) != INVALID_ROADTYPE) {
+		return RoadTramType::Road;
+	}
+	return RoadTramType::Tram;
+}
+
+/**
+ * One road connection of a tile: the neighbour tile in a direction and whether a vehicle can drive
+ * between the two.
+ *
+ * The engine lets a road vehicle drive into a tile only if the tile it comes from carries the road
+ * piece towards that tile and the tile it drives into offers a track reachable from the direction
+ * it enters with (`RoadFindPathToDest` keeps only
+ * `GetTileTrackStatus(entered) & DiagdirReachesTrackdirs(travel)`). The raw piece test alone is not
+ * enough: a one-piece stub carries the piece but has no drivable track at all, so \c connected is
+ * the pair and a stub never reads as a usable connection.
+ * @param tile The reported tile.
+ * @param dir The direction from \a tile to the neighbour tile.
+ * @param rtt The road or tram family.
+ * @param leaving True when the vehicle drives out of \a tile into the neighbour (a depot exit),
+ *                false when it drives from the neighbour into \a tile (a stop entry).
+ * @return `{direction, tile, required_road_bit, road_bits, has_required_bit, drivable, connected}`.
+ */
+Json RoadLinkJson(TileIndex tile, DiagDirection dir, RoadTramType rtt, bool leaving)
+{
+	const TileIndex neighbour = TileAddByDiagDir(tile, dir);
+	const TileIndex entered = leaving ? neighbour : tile;
+	const DiagDirection travel = leaving ? dir : ReverseDiagDir(dir);
+	const bool valid = IsValidTile(neighbour) && IsValidTile(entered);
+
+	const RoadBits own = IsValidTile(tile) ? GetAnyRoadBits(tile, rtt, false) : RoadBits{};
+	const RoadBits required = DiagDirToRoadBits(ReverseDiagDir(dir));
+	const RoadBits present = IsValidTile(neighbour) ? GetAnyRoadBits(neighbour, rtt, false) : RoadBits{};
+	const std::optional<RoadBit> required_bit = required.GetNthSetBit(0);
+	const bool has_required_bit = present.Any(required);
+	/* The tile the vehicle comes from must carry the piece towards the other one. */
+	const bool from_ok = leaving ? own.Test(DiagDirToRoadBits(dir)) : has_required_bit;
+	/* The engine's own reachability test on the tile the vehicle drives into. */
+	const bool drivable = valid && from_ok &&
+			(GetTileTrackStatus(entered, TransportType::Road, rtt).trackdirs & DiagdirReachesTrackdirs(travel)).Any();
+
+	Json result = Json::object();
+	result["direction"] = DiagDirName(dir);
+	result["tile"] = IsValidTile(neighbour) ? TileJson(neighbour) : Json(nullptr);
+	result["required_road_bit"] = required_bit.has_value() ? Json(RoadBitName(*required_bit)) : Json(nullptr);
+	result["road_bits"] = RoadBitsJson(present);
+	result["has_required_bit"] = has_required_bit;
+	result["drivable"] = drivable;
+	result["connected"] = has_required_bit && drivable;
+	return result;
+}
+
+/**
+ * The exit of a road depot: a vehicle drives out of the depot tile into the neighbour tile.
+ * @param depot_tile Tile of the depot.
+ * @param dir The direction of the depot exit.
+ * @param rtt The road or tram family.
+ * @return The connection object described at #RoadLinkJson.
+ */
+Json RoadExitJson(TileIndex depot_tile, DiagDirection dir, RoadTramType rtt)
+{
+	return RoadLinkJson(depot_tile, dir, rtt, true);
+}
+
+/**
+ * One entry of a road stop: a vehicle drives from the neighbour tile into the stop tile.
+ * @param stop_tile Tile of the stop.
+ * @param dir The direction from the stop tile to the neighbour the vehicle comes from.
+ * @param rtt The road or tram family.
+ * @return The connection object described at #RoadLinkJson.
+ */
+Json RoadEntryJson(TileIndex stop_tile, DiagDirection dir, RoadTramType rtt)
+{
+	return RoadLinkJson(stop_tile, dir, rtt, false);
+}
+
 /* -- read-only inventory ----------------------------------------------------------------- */
 
 /** Default number of rows one `world.query` returns. */
@@ -1047,6 +1202,15 @@ Json VehicleRow(const Vehicle *v)
 	row["status"] = std::string(VehicleStatusName(v));
 	row["stopped"] = v->vehstatus.Test(VehState::Stopped);
 	row["in_depot"] = v->IsStoppedInDepot();
+	/* Exactly the engine's own depot state (`IsInDepot()`, i.e. `RVSB_IN_DEPOT`). It stays true for
+	 * a vehicle that was started but has not left the depot yet, where `in_depot` above
+	 * (`IsStoppedInDepot()`) is already false. It is a state flag, not proof of movement: a vehicle
+	 * turning around on its depot tile is out of this state and still on the tile, which is what
+	 * `on_depot_tile` below reports. */
+	row["in_depot_state"] = v->IsInDepot();
+	/* Exactly `IsDepotTile(v->tile)`: the tile the vehicle is on now is a depot tile. This is a map
+	 * read of the current tile and does not depend on any vehicle state. */
+	row["on_depot_tile"] = IsDepotTile(v->tile);
 	row["crashed"] = v->vehstatus.Test(VehState::Crashed);
 	row["broken_down"] = v->breakdown_ctr == 1;
 	row["speed"] = v->cur_speed;
@@ -1838,6 +2002,13 @@ Json ConstructDepot(const Json &params, CompanyID company, RoadType rt, bool dry
 		const Depot *d = Depot::GetByTile(tile);
 		if (d != nullptr) result["depot_id"] = d->index.base();
 	}
+
+	/* The engine stores exactly the requested exit direction, so the entrance facts are the same
+	 * for a dry run. A depot whose entrance tile has no road on the side facing the depot is
+	 * accepted by CmdBuildRoadDepot and then traps every vehicle that leaves it. This is a snapshot
+	 * of the build: `world.query` and `world.objects` read the same facts again from the tile, so a
+	 * caller that lays the road afterwards can see them change. */
+	result["entrance"] = RoadExitJson(tile, dir, GetRoadTramType(rt));
 	return MarkExecution(CommandResult(_posted, std::move(result)), dry_run);
 }
 
@@ -3106,6 +3277,80 @@ Json Capability(std::string_view method, std::string_view authority, std::initia
 std::optional<Json> ReadOrderForTest(const Json &entry, Order &order)
 {
 	return ReadOrder(entry, order);
+}
+
+Json RoadDepotEntranceJson(TileIndex depot_tile)
+{
+	if (!IsValidTile(depot_tile) || !IsRoadDepotTile(depot_tile)) return Json(nullptr);
+
+	/* Both facts are the engine's: the exit direction it stores on the depot tile, and the road or
+	 * tram family the tile carries. Nothing here is remembered from the build. */
+	return RoadExitJson(depot_tile, GetRoadDepotDirection(depot_tile), TileRoadTramType(depot_tile));
+}
+
+Json RoadStopAccessJson(TileIndex stop_tile)
+{
+	if (!IsValidTile(stop_tile) || !IsStationRoadStopTile(stop_tile)) return Json(nullptr);
+
+	const RoadStopType rst = GetRoadStopType(stop_tile);
+	const RoadTramType rtt = TileRoadTramType(stop_tile);
+	const bool bay = IsBayRoadStopTile(stop_tile);
+
+	/* A bay stop is entered from the one side the engine stored for it; a drive-through stop is
+	 * entered from either end of the axis the engine stored, so both ends are reported. */
+	Json entries = Json::array();
+	if (bay) {
+		entries.push_back(RoadEntryJson(stop_tile, GetBayRoadStopDir(stop_tile), rtt));
+	} else {
+		const Axis axis = GetDriveThroughStopAxis(stop_tile);
+		for (const DiagDirection dir : {DiagDirection::NE, DiagDirection::SE, DiagDirection::SW, DiagDirection::NW}) {
+			if (DiagDirToAxis(dir) != axis) continue;
+			entries.push_back(RoadEntryJson(stop_tile, dir, rtt));
+		}
+	}
+
+	Json result = Json::object();
+	result["tile"] = TileJson(stop_tile);
+	result["station_id"] = GetStationIndex(stop_tile).base();
+	result["type"] = rst == RoadStopType::Bus ? "bus" : "truck";
+	result["kind"] = bay ? "bay" : "drive_through";
+	if (!bay) result["axis"] = GetDriveThroughStopAxis(stop_tile) == Axis::X ? "x" : "y";
+	result["entries"] = std::move(entries);
+	return result;
+}
+
+Json RoadTileJson(TileIndex tile, RoadTramType rtt)
+{
+	const bool valid = IsValidTile(tile);
+	const bool may_have_road = valid && MayHaveRoad(tile);
+	const RoadBits present = may_have_road ? GetAnyRoadBits(tile, rtt, false) : RoadBits{};
+	const RoadType rt = may_have_road ? GetRoadType(tile, rtt) : INVALID_ROADTYPE;
+	const TrackStatus status = may_have_road ? GetTileTrackStatus(tile, TransportType::Road, rtt) : TrackStatus{};
+	const DisallowedRoadDirections disallowed = valid && IsNormalRoadTile(tile) ? GetDisallowedRoadDirections(tile) : DisallowedRoadDirections{};
+
+	/* The directions a vehicle can actually drive off this tile in, from the engine's own track
+	 * status. One-way restrictions of the neighbouring tiles are per pair and are reported raw
+	 * above, not folded in here. */
+	Json exits = Json::array();
+	for (const DiagDirection dir : {DiagDirection::NE, DiagDirection::SE, DiagDirection::SW, DiagDirection::NW}) {
+		if ((status.trackdirs & DiagdirReachesTrackdirs(dir)).Any()) exits.push_back(DiagDirName(dir));
+	}
+
+	Json directions = Json::array();
+	for (const DisallowedRoadDirection dir : {DisallowedRoadDirection::Southbound, DisallowedRoadDirection::Northbound}) {
+		if (disallowed.Test(dir)) directions.push_back(std::string(DisallowedRoadDirectionName(dir)));
+	}
+
+	Json result = Json::object();
+	result["road_bits"] = RoadBitsJson(present);
+	/* The same pair of fields a vehicle row carries: the engine's type id and the engine's own
+	 * classification of it. */
+	result["road_type_id"] = rt == INVALID_ROADTYPE ? Json(nullptr) : Json(static_cast<uint8_t>(rt));
+	result["road_type"] = rt == INVALID_ROADTYPE ? Json(nullptr) : Json(std::string(RoadTypeIsTram(rt) ? "tram" : "road"));
+	result["one_way"] = valid && IsOneWayRoadTile(tile);
+	result["disallowed_directions"] = std::move(directions);
+	result["drivable_exits"] = std::move(exits);
+	return result;
 }
 
 Json OrdersPlanForTest(const Json &orders)
