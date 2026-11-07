@@ -11,6 +11,7 @@
 
 #include "agent_chat_gui.h"
 #include "agent_bridge.h"
+#include "agent_chat_image.h"
 #include "agent_chat_selection.h"
 
 #include "company_base.h"
@@ -71,6 +72,9 @@ static const uint AGENT_CHAT_FINISHING_POLL_INTERVAL_MS = 250;
 /** Number of requests in flight above which a periodic read is skipped instead of queued. */
 static const int AGENT_CHAT_MAX_PENDING_REQUESTS = 4;
 
+/** Number of screenshot previews fetched at the same time. */
+static const int AGENT_CHAT_MAX_PREVIEW_REQUESTS = 4;
+
 /** Number of text lines shown in the message input. */
 static const int AGENT_CHAT_INPUT_LINES = 3;
 
@@ -87,6 +91,11 @@ struct AgentChatAttachment {
 	std::string what;               ///< Extra classification of a tile reference.
 	std::string world_id;           ///< World the reference was created in.
 	std::string epoch;              ///< Load epoch the reference was created in.
+	std::string artifact_id;        ///< Artifact id of a screenshot attachment, empty for references.
+	std::string sha256;             ///< SHA-256 of the stored source image of a screenshot.
+	int width = 0;                  ///< Width of the source image of a screenshot, in pixels.
+	int height = 0;                 ///< Height of the source image of a screenshot, in pixels.
+	int64_t tick = 0;               ///< Game tick a screenshot was captured at.
 	Json extra = Json::object();    ///< Reference fields this UI does not know, kept verbatim.
 };
 
@@ -136,6 +145,7 @@ struct AgentChatUiState {
 	std::chrono::steady_clock::time_point next_poll{}; ///< Time of the next poll.
 	AgentChatSendAck send_ack;              ///< Submission of the composed message and its acknowledgement.
 	AgentChatSelection selection;           ///< Selected transcript text of the active chat.
+	AgentChatPreviewCache previews;         ///< Screenshot previews of the transcript, bounded and per world.
 };
 
 static AgentChatUiState _agent_chat;
@@ -298,6 +308,7 @@ static std::string GetAttachmentTypeName(const std::string &type)
 	if (type == "engine") return GetString(STR_AGENT_CHAT_TYPE_ENGINE);
 	if (type == "cargo") return GetString(STR_AGENT_CHAT_TYPE_CARGO);
 	if (type == "object" || type == "mapobject") return GetString(STR_AGENT_CHAT_TYPE_OBJECT);
+	if (type == "image") return GetString(STR_AGENT_CHAT_TYPE_IMAGE);
 
 	/* A bridge may name the kind of tile in the type itself instead of in "what". */
 	const std::string kind = GetAttachmentKindName(type);
@@ -386,6 +397,22 @@ static std::string GetTileAttachmentLabel(const std::string &type, const std::st
 }
 
 /**
+ * Check whether an attachment is a screenshot of the transcript.
+ *
+ * A screenshot carries the identity of its artifact, the hash of the stored source image and the
+ * size of that source, so the transcript can reserve the right box and ask for exactly that
+ * artifact. It has no tile, no file path and no pixels of its own: the pixels are fetched
+ * separately and never travel inside a message.
+ * @param attachment The attachment.
+ * @return \c true when the attachment is a screenshot.
+ */
+static bool IsImageAttachment(const AgentChatAttachment &attachment)
+{
+	return attachment.type == "image" && !attachment.artifact_id.empty() &&
+			!attachment.sha256.empty() && attachment.width > 0 && attachment.height > 0;
+}
+
+/**
  * Get the label of an attachment, as shown in the attachment tray.
  * @param attachment The attachment.
  * @return The label.
@@ -468,6 +495,8 @@ static std::string GetAttachmentSummary(const std::vector<AgentChatAttachment> &
 {
 	std::string summary;
 	for (const AgentChatAttachment &attachment : attachments) {
+		/* A screenshot is drawn as a picture, so its label would only repeat it. */
+		if (IsImageAttachment(attachment)) continue;
 		if (!summary.empty()) summary += ", ";
 		summary += GetAttachmentDisplayLabel(attachment);
 	}
@@ -491,6 +520,13 @@ static Json AttachmentToJson(const AgentChatAttachment &attachment)
 	if (!attachment.what.empty()) j["what"] = attachment.what;
 	if (!attachment.world_id.empty()) j["world_id"] = attachment.world_id;
 	if (!attachment.epoch.empty()) j["epoch"] = attachment.epoch;
+	if (!attachment.artifact_id.empty()) {
+		j["artifact_id"] = attachment.artifact_id;
+		j["sha256"] = attachment.sha256;
+		j["width"] = attachment.width;
+		j["height"] = attachment.height;
+		j["tick"] = attachment.tick;
+	}
 	return j;
 }
 
@@ -560,12 +596,18 @@ static AgentChatAttachment ParseAttachment(const Json &j)
 	attachment.what = JsonString(j, "what");
 	attachment.world_id = JsonString(j, "world_id");
 	attachment.epoch = JsonString(j, "epoch");
+	attachment.artifact_id = JsonString(j, "artifact_id");
+	attachment.sha256 = JsonString(j, "sha256");
+	attachment.width = static_cast<int>(JsonInt(j, "width", 0));
+	attachment.height = static_cast<int>(JsonInt(j, "height", 0));
+	attachment.tick = JsonInt(j, "tick", 0);
 
 	/* Keep the reference fields this UI does not know about, so they survive a round trip. */
 	if (j.is_object()) {
 		for (auto it = j.begin(); it != j.end(); ++it) {
 			const std::string &key = it.key();
-			if (key == "type" || key == "id" || key == "generation" || key == "tile" || key == "name" || key == "what" || key == "world_id" || key == "epoch") continue;
+			if (key == "type" || key == "id" || key == "generation" || key == "tile" || key == "name" || key == "what" || key == "world_id" || key == "epoch" ||
+					key == "artifact_id" || key == "sha256" || key == "width" || key == "height" || key == "tick") continue;
 			attachment.extra[key] = it.value();
 		}
 	}
@@ -788,6 +830,10 @@ static void AgentChatSyncContext()
 	const std::string world_id = JsonString(context, "world_id");
 	const std::string epoch = JsonString(context, "epoch");
 	const bool connected = JsonBool(context, "connected");
+
+	/* Screenshot previews belong to the world and epoch they were fetched in; a switch drops them
+	 * and makes every answer still in flight unusable. */
+	_agent_chat.previews.BindWorld(world_id, epoch);
 
 	if (world_id != _agent_chat.world_id || epoch != _agent_chat.epoch) {
 		_agent_chat.chats.clear();
@@ -1537,6 +1583,29 @@ static void AgentChatStop(const std::string &chat_id)
 	});
 }
 
+/* --- Screenshot previews --- */
+
+/**
+ * Build the identity of the preview of a screenshot attachment.
+ * @param chat The chat the message belongs to.
+ * @param attachment The screenshot attachment.
+ * @return The key of the preview that has to be shown for it.
+ */
+static AgentChatPreviewKey GetPreviewKey(const AgentChatEntry &chat, const AgentChatAttachment &attachment)
+{
+	AgentChatPreviewKey key;
+	/* A capture belongs to the world and epoch it was taken in, not to the one that is shown now:
+	 * after a load, an older screenshot keeps its own pixels instead of being retargeted at the
+	 * current world, where its artifact id means nothing and its source hash would never match.
+	 * Only a capture that names no world at all falls back to the current one. */
+	key.world_id = !attachment.world_id.empty() ? attachment.world_id : _agent_chat.world_id;
+	key.epoch = !attachment.epoch.empty() ? attachment.epoch : _agent_chat.epoch;
+	key.chat_id = chat.id;
+	key.artifact_id = attachment.artifact_id;
+	key.source_sha256 = attachment.sha256;
+	return key;
+}
+
 /* --- Layout helpers --- */
 
 /**
@@ -1549,6 +1618,75 @@ static int GetChatRowHeight()
 }
 
 /**
+ * Get the height the screenshot previews of a message reserve.
+ * @param message The message.
+ * @param width Available width.
+ * @return The height in pixels.
+ */
+static int GetMessageImagesHeight(const AgentChatMessage &message, int width)
+{
+	int height = 0;
+	for (const AgentChatAttachment &attachment : message.attachments) {
+		if (!IsImageAttachment(attachment)) continue;
+		const AgentChatPreviewSize size = FitAgentChatPreview(attachment.width, attachment.height,
+				std::min(width, AGENT_CHAT_PREVIEW_MAX_WIDTH), AGENT_CHAT_PREVIEW_MAX_HEIGHT);
+		if (size.width <= 0) continue;
+		if (height > 0) height += WidgetDimensions::scaled.vsep_normal;
+		height += size.height;
+	}
+	return height;
+}
+
+/** One screenshot preview of a message: which artifact it shows and where it is drawn. */
+struct AgentChatImageRow {
+	const AgentChatAttachment *attachment = nullptr; ///< The screenshot attachment.
+	Rect rect = {0, 0, -1, -1};                      ///< Screen rectangle reserved for it.
+};
+
+/**
+ * Lay out the screenshot previews of a message.
+ *
+ * Every preview gets exactly the box its own aspect ratio fills inside the transcript width, so
+ * the height the message reserves is the height of the pixels that are drawn in it.
+ * @param message The message.
+ * @param area The content rectangle of the message.
+ * @param top The screen y the previews start at.
+ * @return The previews, in message order.
+ */
+static std::vector<AgentChatImageRow> LayoutMessageImages(const AgentChatMessage &message, const Rect &area, int top)
+{
+	std::vector<AgentChatImageRow> result;
+	int y = top;
+	for (const AgentChatAttachment &attachment : message.attachments) {
+		if (!IsImageAttachment(attachment)) continue;
+		const AgentChatPreviewSize size = FitAgentChatPreview(attachment.width, attachment.height,
+				std::min(area.Width(), AGENT_CHAT_PREVIEW_MAX_WIDTH), AGENT_CHAT_PREVIEW_MAX_HEIGHT);
+		if (size.width <= 0) continue;
+		if (!result.empty()) y += WidgetDimensions::scaled.vsep_normal;
+
+		AgentChatImageRow row;
+		row.attachment = &attachment;
+		row.rect = Rect{area.left, y, area.left + size.width - 1, y + size.height - 1};
+		result.push_back(row);
+		y += size.height;
+	}
+	return result;
+}
+
+/**
+ * Get the screen y the screenshot previews of a message start at.
+ * @param message The message.
+ * @param rect The screen rectangle of the message.
+ * @return The y coordinate below the text of the message.
+ */
+static int GetMessageImagesTop(const AgentChatMessage &message, const Rect &rect)
+{
+	int top = rect.top + GetCharacterHeight(FontSize::Normal);
+	if (!message.text.empty()) top += GetStringHeight(message.text, rect.Width());
+	return top;
+}
+
+/**
  * Get the height of one message of the transcript.
  * @param message The message.
  * @param width Available width.
@@ -1558,7 +1696,9 @@ static int GetMessageHeight(const AgentChatMessage &message, int width)
 {
 	int height = GetCharacterHeight(FontSize::Normal);
 	if (!message.text.empty()) height += GetStringHeight(message.text, width);
-	if (!message.attachments.empty()) height += GetStringHeight(GetAttachmentSummary(message.attachments), width);
+	height += GetMessageImagesHeight(message, width);
+	const std::string summary = GetAttachmentSummary(message.attachments);
+	if (!summary.empty()) height += GetStringHeight(summary, width);
 	return height + WidgetDimensions::scaled.vsep_normal;
 }
 
@@ -1734,6 +1874,66 @@ static std::vector<Rect> LayoutCandidates(const Rect &area)
 	return result;
 }
 
+/**
+ * Request the screenshot previews the transcript shows but does not have yet.
+ *
+ * Only the previews that are on screen are fetched, so a long chat cannot churn the cache by
+ * asking for every screenshot it ever showed. One request per artifact is in flight at a time,
+ * the number of them is bounded, and a preview that is cached or whose failure is remembered is
+ * not requested again. The transport budget is checked before a request is started, so an
+ * exhausted budget is never mistaken for a preview that cannot be loaded. The answer is only
+ * stored when the world and epoch it was requested in are still the current ones, so a late
+ * answer is never shown for another world.
+ */
+static void AgentChatEnsurePreviews()
+{
+	Window *w = FindWindowById(WindowClass::AgentChat, 0);
+	if (w == nullptr) return;
+
+	const AgentChatEntry *chat = GetActiveChat();
+	if (chat == nullptr) return;
+
+	const Rect area = w->GetInnerRect(WID_AC_TRANSCRIPT);
+	const std::vector<Rect> layout = LayoutTranscript(chat, area, _agent_chat.scroll);
+	if (layout.size() != chat->messages.size()) return;
+
+	for (size_t i = 0; i < layout.size(); i++) {
+		if (layout[i].bottom < area.top || layout[i].top > area.bottom) continue;
+
+		const AgentChatMessage &message = chat->messages[i];
+		const int top = GetMessageImagesTop(message, layout[i]);
+		for (const AgentChatImageRow &row : LayoutMessageImages(message, layout[i], top)) {
+			if (row.rect.bottom < area.top || row.rect.top > area.bottom) continue;
+			if (_agent_chat.previews.InflightCount() >= AGENT_CHAT_MAX_PREVIEW_REQUESTS) return;
+
+			const AgentChatPreviewKey key = GetPreviewKey(*chat, *row.attachment);
+			if (_agent_chat.previews.Find(key) != nullptr) continue;
+			if (_agent_chat.previews.Failure(key) != nullptr) continue;
+
+			/* A request that is not started must not be remembered as a failed preview. */
+			if (!AgentChatCanQueueRead()) return;
+			if (!_agent_chat.previews.BeginLoad(key)) continue;
+
+			const uint64_t generation = _agent_chat.previews.Generation();
+			const std::string path = fmt::format("/v1/chats/{}/artifacts/{}/preview?width={}&height={}",
+					chat->id, row.attachment->artifact_id, AGENT_CHAT_PREVIEW_MAX_WIDTH, AGENT_CHAT_PREVIEW_MAX_HEIGHT);
+			AgentChatRequest("GET", path, Json(), [key, generation](const Json &response) {
+				std::string error;
+				std::optional<AgentChatPreviewPixels> pixels = ParseAgentChatPreview(response, key, &error);
+				if (pixels.has_value()) {
+					_agent_chat.previews.Store(generation, key, std::move(*pixels));
+				} else {
+					_agent_chat.previews.Fail(generation, key, std::move(error));
+				}
+				InvalidateAgentChatWindows();
+			}, [key, generation]() {
+				_agent_chat.previews.Fail(generation, key, "request failed");
+				InvalidateAgentChatWindows();
+			});
+		}
+	}
+}
+
 /* --- Windows --- */
 
 /** The native in-game agent chat window. */
@@ -1904,12 +2104,47 @@ struct AgentChatWindow : Window {
 			if (!message.text.empty()) {
 				y = DrawStringMultiLine(rect.left, rect.right, y, rect.bottom, message.text, colour);
 			}
-			if (!message.attachments.empty()) {
-				DrawStringMultiLine(rect.left, rect.right, y, rect.bottom, GetAttachmentSummary(message.attachments), TextColour::Grey);
+
+			/* The screenshots sit below the text, in the boxes the layout reserved for them. */
+			const int images_top = GetMessageImagesTop(message, rect);
+			for (const AgentChatImageRow &row : LayoutMessageImages(message, rect, images_top)) {
+				this->DrawMessageImage(*chat, *row.attachment, row.rect);
+			}
+			const int images_height = GetMessageImagesHeight(message, rect.Width());
+			if (images_height > 0) y = std::max(y, images_top + images_height);
+
+			const std::string summary = GetAttachmentSummary(message.attachments);
+			if (!summary.empty()) {
+				DrawStringMultiLine(rect.left, rect.right, y, rect.bottom, summary, TextColour::Grey);
 			}
 		}
 
 		this->DrawCandidates(area);
+	}
+
+	/**
+	 * Draw one screenshot preview of the transcript.
+	 *
+	 * The pixels are the artifact's own. Until they arrive, and when they cannot arrive, the
+	 * reserved box says what the player is waiting for instead of showing a made up picture.
+	 * @param chat The chat the message belongs to.
+	 * @param attachment The screenshot attachment.
+	 * @param rect The screen rectangle that was reserved for it.
+	 */
+	void DrawMessageImage(const AgentChatEntry &chat, const AgentChatAttachment &attachment, const Rect &rect) const
+	{
+		GfxFillRect(rect, PC_BLACK);
+
+		const AgentChatPreviewKey key = GetPreviewKey(chat, attachment);
+		const AgentChatPreviewPixels *pixels = _agent_chat.previews.Find(key);
+		if (pixels != nullptr) {
+			DrawAgentChatPreviewPixels(rect, *pixels);
+			return;
+		}
+
+		const StringID text = !IsAgentChatPreviewDrawable() ? STR_AGENT_CHAT_IMAGE_UNSUPPORTED :
+				(_agent_chat.previews.Failure(key) != nullptr ? STR_AGENT_CHAT_IMAGE_UNAVAILABLE : STR_AGENT_CHAT_IMAGE_LOADING);
+		DrawStringMultiLine(rect.Shrink(WidgetDimensions::scaled.framerect), GetString(text), TextColour::Grey);
 	}
 
 	/**
@@ -2227,6 +2462,8 @@ struct AgentChatWindow : Window {
 		for (size_t i = 0; i < layout.size(); i++) {
 			if (!layout[i].Contains(pt)) continue;
 			for (const AgentChatAttachment &attachment : chat->messages[i].attachments) {
+				/* A screenshot has no tile; clicking it must not center the map on an invalid one. */
+				if (IsImageAttachment(attachment)) continue;
 				if (attachment.tile != INVALID_TILE) {
 					ScrollMainWindowToTile(attachment.tile);
 					return;
@@ -3161,6 +3398,9 @@ void AgentChatGuiTick()
 		if (AgentChatCanQueueRead()) AgentChatPollEvents(active_id);
 	}
 
+	/* The transcript shows screenshots of its messages; fetching them is bounded by the cache. */
+	AgentChatEnsurePreviews();
+
 	/* Keep the status of tasks in other chats up to date as well. The budget is checked for every
 	 * single read, so a slow backend cannot turn the fast interval into a growing queue. */
 	std::vector<std::string> busy_ids;
@@ -3368,6 +3608,32 @@ nlohmann::json DescribeAgentChatUi()
 			out["selection"]["bounds"] = any ? RectToJson(ToScreenRect(*w, bounds)) : Json();
 		}
 		out["message_rows"] = std::move(message_rows);
+
+		/* The screenshot previews of the transcript: the box each one occupies and the identity of
+		 * the pixels drawn in it. Read-only, and nothing about the host: no file path is reported. */
+		Json image_rows = Json::array();
+		if (active != nullptr) {
+			const Rect area = w->GetInnerRect(WID_AC_TRANSCRIPT);
+			const std::vector<Rect> layout = LayoutTranscript(active, area, _agent_chat.scroll);
+			for (size_t i = 0; i < layout.size(); i++) {
+				const AgentChatMessage &message = active->messages[i];
+				const int top = GetMessageImagesTop(message, layout[i]);
+				for (const AgentChatImageRow &row : LayoutMessageImages(message, layout[i], top)) {
+					const AgentChatPreviewKey key = GetPreviewKey(*active, *row.attachment);
+					const AgentChatPreviewPixels *pixels = _agent_chat.previews.Find(key);
+					Json entry = Json::object();
+					entry["rect"] = RectToJson(ToScreenRect(*w, row.rect));
+					entry["artifact"] = row.attachment->artifact_id;
+					entry["sourcehash"] = row.attachment->sha256;
+					entry["pixelhash"] = pixels != nullptr ? pixels->pixel_sha256 : std::string();
+					entry["loaded"] = pixels != nullptr;
+					entry["width"] = row.rect.Width();
+					entry["height"] = row.rect.Height();
+					image_rows.push_back(std::move(entry));
+				}
+			}
+		}
+		out["image_rows"] = std::move(image_rows);
 
 		Json tray_rows = Json::array();
 		const Rect tray_area = w->GetInnerRect(WID_AC_TRAY);

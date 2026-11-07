@@ -6387,6 +6387,10 @@ STR_AGENT_CHAT_TYPE_VEHICLE                                     :Vehicle
 STR_AGENT_CHAT_TYPE_SIGN                                        :Sign
 STR_AGENT_CHAT_TYPE_COMPANY                                     :Company
 STR_AGENT_CHAT_TYPE_UNKNOWN                                     :Object
+STR_AGENT_CHAT_TYPE_IMAGE                                       :Screenshot
+STR_AGENT_CHAT_IMAGE_LOADING                                    :{GRAY}Loading screenshot...
+STR_AGENT_CHAT_IMAGE_UNAVAILABLE                                :{GRAY}Screenshot preview is not available.
+STR_AGENT_CHAT_IMAGE_UNSUPPORTED                                :{GRAY}This video driver cannot show screenshot previews.
 STR_AGENT_CHAT_STATUS_IDLE                                      :{GRAY}Agent: idle
 STR_AGENT_CHAT_STATUS_THINKING                                  :{GRAY}Agent: thinking...
 STR_AGENT_CHAT_STATUS_SENDING                                   :{GRAY}Sending message...

@@ -6648,6 +6648,10 @@ STR_AGENT_CHAT_TYPE_VEHICLE                                     :Транспо�
 STR_AGENT_CHAT_TYPE_SIGN                                        :Табличка
 STR_AGENT_CHAT_TYPE_COMPANY                                     :Компания
 STR_AGENT_CHAT_TYPE_UNKNOWN                                     :Объект
+STR_AGENT_CHAT_TYPE_IMAGE                                       :Снимок экрана
+STR_AGENT_CHAT_IMAGE_LOADING                                    :{GRAY}Загрузка снимка экрана...
+STR_AGENT_CHAT_IMAGE_UNAVAILABLE                                :{GRAY}Предпросмотр снимка недоступен.
+STR_AGENT_CHAT_IMAGE_UNSUPPORTED                                :{GRAY}Этот видеодрайвер не показывает снимки экрана.
 STR_AGENT_CHAT_STATUS_IDLE                                      :{GRAY}Агент: свободен
 STR_AGENT_CHAT_STATUS_THINKING                                  :{GRAY}Агент: думает...
 STR_AGENT_CHAT_STATUS_TOOL                                      :{GRAY}Агент: {RAW_STRING}

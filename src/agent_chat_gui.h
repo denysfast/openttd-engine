@@ -272,9 +272,17 @@ void AgentChatGuiTick();
  *   named by "chat" in the world named by "world_id" and "epoch", and is dropped when another
  *   chat, world or epoch is shown, so it can never copy the text of a transcript it was not made
  *   in. The text of the system clipboard itself is not reported, only the selected text.
+ * - "image_rows": array of {rect, artifact, sourcehash, pixelhash, loaded, width, height} with the
+ *   screen rectangle of every screenshot preview of the transcript, the artifact and source hash
+ *   it shows, the hash of the pixels actually drawn in it (empty until they are loaded) and the
+ *   size of the box. Nothing about the host is reported: no file path, no clipboard.
  * - "tray": array of {type, id, generation, tile, name, world_id, epoch, stale, generation_known,
  *   rect, remove_rect}.
  * - "candidates": array of {type, id, generation, name, world_id, epoch, rect}.
+ *
+ * A screenshot attachment is {type: "image", artifact_id, sha256, width, height, tick, world_id,
+ * epoch, stale, generation_known}; it has no tile, no file path and no pixels of its own, so the
+ * transcript reserves the box of its source aspect ratio and fetches the pixels separately.
  *
  * An attachment is {type, id, generation, name, tile, world_id, epoch, stale, generation_known}:
  * the identity of a typed reference is kept as the backend reported it. "tile" is the array
