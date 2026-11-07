@@ -1369,6 +1369,33 @@ TEST_CASE("agent_game_tools: a depot entrance reports the road that is really th
 	CHECK(stub["drivable"] == false);
 	CHECK(stub["connected"] == false);
 
+	/* A junction is not a straight road: the engine keeps the trackdirs reachable when moving in the
+	 * direction of travel, so a vehicle leaving a depot can turn. This neighbour is an L curve to the
+	 * east, and the engine does let the vehicle turn onto it. Reading the reachability with the
+	 * opposite direction would call this depot a trap. */
+	MakeRoadNormal(TileXY(10, 10), ROAD_E, ROADTYPE_ROAD, INVALID_ROADTYPE, TownID::Invalid(), OWNER_NONE, OWNER_NONE);
+	const Json turning = RoadDepotEntranceJson(TileXY(10, 11));
+	CHECK(turning["required_road_bit"] == "se");
+	CHECK(turning["has_required_bit"] == true);
+	CHECK(turning["drivable"] == true);
+	CHECK(turning["connected"] == true);
+
+	/* A one-way road is read as the engine has it: the entrance tile then only offers the trackdir
+	 * its arrow allows (`GetTileTrackStatus_Road` keeps one of the two), so the same depot is a trap
+	 * while the arrow points the other way. */
+	MakeRoadNormal(TileXY(12, 10), ROAD_X, ROADTYPE_ROAD, INVALID_ROADTYPE, TownID::Invalid(), OWNER_NONE, OWNER_NONE);
+	MakeRoadDepot(TileXY(11, 10), OWNER_NONE, DepotID(4), DiagDirection::SW, ROADTYPE_ROAD);
+	CHECK(RoadDepotEntranceJson(TileXY(11, 10))["connected"] == true);
+
+	SetDisallowedRoadDirections(TileXY(12, 10), DisallowedRoadDirections{DisallowedRoadDirection::Northbound});
+	const Json one_way_exit = RoadDepotEntranceJson(TileXY(11, 10));
+	CHECK(one_way_exit["has_required_bit"] == true);
+	CHECK(one_way_exit["drivable"] == false);
+	CHECK(one_way_exit["connected"] == false);
+
+	SetDisallowedRoadDirections(TileXY(12, 10), DisallowedRoadDirections{});
+	CHECK(RoadDepotEntranceJson(TileXY(11, 10))["connected"] == true);
+
 	/* A tile that is not a road depot has no road entrance at all. */
 	CHECK(RoadDepotEntranceJson(TileXY(8, 10)).is_null());
 }
@@ -1433,6 +1460,52 @@ TEST_CASE("agent_game_tools: a road stop access reports the entries of its own t
 	CHECK(RoadStopAccessJson(TileXY(30, 11)).is_null());
 }
 
+TEST_CASE("agent_game_tools: a planned depot exit reports only the neighbour tile")
+{
+	/* A dry run builds nothing, so the depot tile carries no exit piece. The proposal therefore
+	 * reports the neighbour tile alone and marks itself `planned`, so it is never read as the
+	 * current state of a depot that exists. */
+	TestRoadMap map;
+
+	const Json empty = RoadDepotExitProposalJson(TileXY(60, 60), DiagDirection::SW, RoadTramType::Road);
+	CHECK(empty["planned"] == true);
+	CHECK(empty["direction"] == "sw");
+	CHECK(empty["tile"]["x"] == 61);
+	CHECK(empty["tile"]["y"] == 60);
+	CHECK(empty["required_road_bit"] == "ne");
+	CHECK(empty["road_bits"].empty());
+	CHECK(empty["has_required_bit"] == false);
+	CHECK(empty["neighbour_drivable"] == false);
+	/* No current connectivity is claimed for a depot that is not on the map. */
+	CHECK_FALSE(empty.contains("connected"));
+	CHECK_FALSE(empty.contains("drivable"));
+
+	/* A road laid out for the planned exit is reported as such. */
+	MakeRoadNormal(TileXY(61, 60), ROAD_X, ROADTYPE_ROAD, INVALID_ROADTYPE, TownID::Invalid(), OWNER_NONE, OWNER_NONE);
+	const Json ready = RoadDepotExitProposalJson(TileXY(60, 60), DiagDirection::SW, RoadTramType::Road);
+	CHECK(ready["planned"] == true);
+	CHECK(Contains(ready["road_bits"], "ne"));
+	CHECK(ready["has_required_bit"] == true);
+	CHECK(ready["neighbour_drivable"] == true);
+	CHECK_FALSE(ready.contains("connected"));
+
+	/* A one-piece stub carries the piece the planned depot needs and still cannot be driven on, so
+	 * the proposal catches it before the depot is built. */
+	MakeRoadNormal(TileXY(70, 70), RoadBits{RoadBit::NE}, ROADTYPE_ROAD, INVALID_ROADTYPE, TownID::Invalid(), OWNER_NONE, OWNER_NONE);
+	const Json stub = RoadDepotExitProposalJson(TileXY(70, 71), DiagDirection::NW, RoadTramType::Road);
+	CHECK(stub["tile"]["x"] == 70);
+	CHECK(stub["tile"]["y"] == 70);
+	CHECK(stub["required_road_bit"] == "se");
+	CHECK(stub["has_required_bit"] == false);
+	CHECK(stub["neighbour_drivable"] == false);
+
+	MakeRoadNormal(TileXY(72, 70), RoadBits{RoadBit::SE}, ROADTYPE_ROAD, INVALID_ROADTYPE, TownID::Invalid(), OWNER_NONE, OWNER_NONE);
+	const Json stub_facing = RoadDepotExitProposalJson(TileXY(72, 71), DiagDirection::NW, RoadTramType::Road);
+	CHECK(stub_facing["required_road_bit"] == "se");
+	CHECK(stub_facing["has_required_bit"] == true);
+	CHECK(stub_facing["neighbour_drivable"] == false);
+}
+
 TEST_CASE("agent_game_tools: a road tile read reports its pieces and one-way state")
 {
 	TestRoadMap map;
@@ -1453,8 +1526,9 @@ TEST_CASE("agent_game_tools: a road tile read reports its pieces and one-way sta
 	CHECK(straight["one_way"] == false);
 	CHECK(straight["disallowed_directions"].empty());
 
-	/* A one-way road says which travel direction the engine disallows, and its drivable exits do
-	 * not change: the restriction applies to entering a neighbouring tile, which is a per-pair test. */
+	/* A one-way road says which travel direction the engine disallows, and the engine's own track
+	 * status of the tile then keeps only the other one. `northbound`/`southbound` are the engine's
+	 * own labels for the two one-way states, not screen directions. */
 	MakeRoadNormal(TileXY(9, 10), ROAD_X, ROADTYPE_ROAD, INVALID_ROADTYPE, TownID::Invalid(), OWNER_NONE, OWNER_NONE);
 	SetDisallowedRoadDirections(TileXY(9, 10), DisallowedRoadDirections{DisallowedRoadDirection::Northbound});
 
@@ -1462,8 +1536,23 @@ TEST_CASE("agent_game_tools: a road tile read reports its pieces and one-way sta
 	CHECK(one_way["one_way"] == true);
 	CHECK(Contains(one_way["disallowed_directions"], "northbound"));
 	CHECK_FALSE(Contains(one_way["disallowed_directions"], "southbound"));
+	/* The engine's track status keeps only the trackdir the arrow allows, so only that exit is
+	 * reported; the pieces themselves are unchanged. */
+	CHECK(Contains(one_way["road_bits"], "ne"));
+	CHECK(Contains(one_way["road_bits"], "sw"));
 	CHECK(Contains(one_way["drivable_exits"], "ne"));
-	CHECK(Contains(one_way["drivable_exits"], "sw"));
+	CHECK_FALSE(Contains(one_way["drivable_exits"], "sw"));
+
+	/* A curve joins two sides of the tile and offers no exit on the others, which the engine's own
+	 * trackdir to exit direction map reports and a "reachable on entering" test does not. */
+	MakeRoadNormal(TileXY(11, 10), ROAD_N, ROADTYPE_ROAD, INVALID_ROADTYPE, TownID::Invalid(), OWNER_NONE, OWNER_NONE);
+	const Json curve = RoadTileJson(TileXY(11, 10), RoadTramType::Road);
+	CHECK(Contains(curve["road_bits"], "ne"));
+	CHECK(Contains(curve["road_bits"], "nw"));
+	CHECK(Contains(curve["drivable_exits"], "ne"));
+	CHECK(Contains(curve["drivable_exits"], "nw"));
+	CHECK_FALSE(Contains(curve["drivable_exits"], "se"));
+	CHECK_FALSE(Contains(curve["drivable_exits"], "sw"));
 
 	/* A one-piece stub carries a piece and no drivable track at all. */
 	MakeRoadNormal(TileXY(20, 20), RoadBits{RoadBit::SE}, ROADTYPE_ROAD, INVALID_ROADTYPE, TownID::Invalid(), OWNER_NONE, OWNER_NONE);

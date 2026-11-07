@@ -808,15 +808,46 @@ RoadTramType TileRoadTramType(TileIndex tile)
 }
 
 /**
+ * The neighbour of one road connection: the tile in a direction and what that tile carries.
+ *
+ * The piece the neighbour needs is the one on its side facing the reported tile, which is the piece
+ * `ScriptRoad::AreRoadTilesConnected` and the road pathfinder both look for.
+ * @param tile The reported tile.
+ * @param dir The direction from \a tile to the neighbour tile.
+ * @param rtt The road or tram family.
+ * @return `{direction, tile, required_road_bit, road_bits, has_required_bit}`.
+ */
+Json RoadNeighbourJson(TileIndex tile, DiagDirection dir, RoadTramType rtt)
+{
+	const TileIndex neighbour = TileAddByDiagDir(tile, dir);
+	const RoadBits required = DiagDirToRoadBits(ReverseDiagDir(dir));
+	const RoadBits present = IsValidTile(neighbour) ? GetAnyRoadBits(neighbour, rtt, false) : RoadBits{};
+	const std::optional<RoadBit> required_bit = required.GetNthSetBit(0);
+
+	Json result = Json::object();
+	result["direction"] = DiagDirName(dir);
+	result["tile"] = IsValidTile(neighbour) ? TileJson(neighbour) : Json(nullptr);
+	result["required_road_bit"] = required_bit.has_value() ? Json(RoadBitName(*required_bit)) : Json(nullptr);
+	result["road_bits"] = RoadBitsJson(present);
+	result["has_required_bit"] = present.Any(required);
+	return result;
+}
+
+/**
  * One road connection of a tile: the neighbour tile in a direction and whether a vehicle can drive
  * between the two.
  *
  * The engine lets a road vehicle drive into a tile only if the tile it comes from carries the road
- * piece towards that tile and the tile it drives into offers a track reachable from the direction
- * it enters with (`RoadFindPathToDest` keeps only
- * `GetTileTrackStatus(entered) & DiagdirReachesTrackdirs(travel)`). The raw piece test alone is not
- * enough: a one-piece stub carries the piece but has no drivable track at all, so \c connected is
- * the pair and a stub never reads as a usable connection.
+ * piece towards that tile and the tile it drives into offers a track reachable from the direction it
+ * moves in: `RoadFindPathToDest` keeps only
+ * `GetTileTrackStatus(entered) & DiagdirReachesTrackdirs(enterdir)`, and `enterdir` there is the
+ * direction of motion, not the side the vehicle comes from. The depot and bay stop resets in that
+ * same function show it: a vehicle entering a depot through its door moves opposite to the stored
+ * depot direction, and it is the stored direction that is rejected. The track status of the entered
+ * tile already has its one-way restriction applied (`GetTileTrackStatus_Road` scales the trackdirs
+ * by the disallowed directions), so a one-way tile only lets a vehicle in along its arrow.
+ * The raw piece test alone is not enough: a one-piece stub carries the piece but has no drivable
+ * track at all, so \c connected is the pair and a stub never reads as a usable connection.
  * @param tile The reported tile.
  * @param dir The direction from \a tile to the neighbour tile.
  * @param rtt The road or tram family.
@@ -828,26 +859,21 @@ Json RoadLinkJson(TileIndex tile, DiagDirection dir, RoadTramType rtt, bool leav
 {
 	const TileIndex neighbour = TileAddByDiagDir(tile, dir);
 	const TileIndex entered = leaving ? neighbour : tile;
-	const DiagDirection travel = leaving ? dir : ReverseDiagDir(dir);
+	/* The direction of motion when the vehicle drives into `entered`. */
+	const DiagDirection motion = leaving ? dir : ReverseDiagDir(dir);
 	const bool valid = IsValidTile(neighbour) && IsValidTile(entered);
 
 	const RoadBits own = IsValidTile(tile) ? GetAnyRoadBits(tile, rtt, false) : RoadBits{};
 	const RoadBits required = DiagDirToRoadBits(ReverseDiagDir(dir));
 	const RoadBits present = IsValidTile(neighbour) ? GetAnyRoadBits(neighbour, rtt, false) : RoadBits{};
-	const std::optional<RoadBit> required_bit = required.GetNthSetBit(0);
 	const bool has_required_bit = present.Any(required);
 	/* The tile the vehicle comes from must carry the piece towards the other one. */
-	const bool from_ok = leaving ? own.Test(DiagDirToRoadBits(dir)) : has_required_bit;
+	const bool from_ok = leaving ? own.Any(DiagDirToRoadBits(dir)) : has_required_bit;
 	/* The engine's own reachability test on the tile the vehicle drives into. */
 	const bool drivable = valid && from_ok &&
-			(GetTileTrackStatus(entered, TransportType::Road, rtt).trackdirs & DiagdirReachesTrackdirs(travel)).Any();
+			(GetTileTrackStatus(entered, TransportType::Road, rtt).trackdirs & DiagdirReachesTrackdirs(motion)).Any();
 
-	Json result = Json::object();
-	result["direction"] = DiagDirName(dir);
-	result["tile"] = IsValidTile(neighbour) ? TileJson(neighbour) : Json(nullptr);
-	result["required_road_bit"] = required_bit.has_value() ? Json(RoadBitName(*required_bit)) : Json(nullptr);
-	result["road_bits"] = RoadBitsJson(present);
-	result["has_required_bit"] = has_required_bit;
+	Json result = RoadNeighbourJson(tile, dir, rtt);
 	result["drivable"] = drivable;
 	result["connected"] = has_required_bit && drivable;
 	return result;
@@ -2003,12 +2029,17 @@ Json ConstructDepot(const Json &params, CompanyID company, RoadType rt, bool dry
 		if (d != nullptr) result["depot_id"] = d->index.base();
 	}
 
-	/* The engine stores exactly the requested exit direction, so the entrance facts are the same
-	 * for a dry run. A depot whose entrance tile has no road on the side facing the depot is
-	 * accepted by CmdBuildRoadDepot and then traps every vehicle that leaves it. This is a snapshot
-	 * of the build: `world.query` and `world.objects` read the same facts again from the tile, so a
-	 * caller that lays the road afterwards can see them change. */
-	result["entrance"] = RoadExitJson(tile, dir, GetRoadTramType(rt));
+	/* A depot whose entrance tile has no road on the side facing the depot is accepted by
+	 * CmdBuildRoadDepot and then traps every vehicle that leaves it. A depot that is on the map is
+	 * read as it is now, exactly as `world.query` and `world.objects` read it, so a caller that lays
+	 * the road afterwards can see the answer change. A dry run builds nothing and a posted command
+	 * may not have run yet: then the depot tile carries no exit piece, so only the neighbour is
+	 * reported and no `connected` is claimed. */
+	if (!dry_run && IsRoadDepotTile(tile)) {
+		result["entrance"] = RoadDepotEntranceJson(tile);
+	} else {
+		result["entrance"] = RoadDepotExitProposalJson(tile, dir, GetRoadTramType(rt));
+	}
 	return MarkExecution(CommandResult(_posted, std::move(result)), dry_run);
 }
 
@@ -3288,6 +3319,22 @@ Json RoadDepotEntranceJson(TileIndex depot_tile)
 	return RoadExitJson(depot_tile, GetRoadDepotDirection(depot_tile), TileRoadTramType(depot_tile));
 }
 
+Json RoadDepotExitProposalJson(TileIndex depot_tile, DiagDirection dir, RoadTramType rtt)
+{
+	const TileIndex neighbour = TileAddByDiagDir(depot_tile, dir);
+
+	/* The planned depot is not on the map yet, so it has no exit piece: only the neighbour tile can
+	 * be read. `neighbour_drivable` is the engine's test on that tile alone (a vehicle entering it
+	 * from the depot side), so a one-piece stub is caught even before the depot exists. */
+	const bool neighbour_drivable = IsValidTile(neighbour) &&
+			(GetTileTrackStatus(neighbour, TransportType::Road, rtt).trackdirs & DiagdirReachesTrackdirs(dir)).Any();
+
+	Json result = RoadNeighbourJson(depot_tile, dir, rtt);
+	result["planned"] = true;
+	result["neighbour_drivable"] = neighbour_drivable;
+	return result;
+}
+
 Json RoadStopAccessJson(TileIndex stop_tile)
 {
 	if (!IsValidTile(stop_tile) || !IsStationRoadStopTile(stop_tile)) return Json(nullptr);
@@ -3328,12 +3375,19 @@ Json RoadTileJson(TileIndex tile, RoadTramType rtt)
 	const TrackStatus status = may_have_road ? GetTileTrackStatus(tile, TransportType::Road, rtt) : TrackStatus{};
 	const DisallowedRoadDirections disallowed = valid && IsNormalRoadTile(tile) ? GetDisallowedRoadDirections(tile) : DisallowedRoadDirections{};
 
-	/* The directions a vehicle can actually drive off this tile in, from the engine's own track
-	 * status. One-way restrictions of the neighbouring tiles are per pair and are reported raw
-	 * above, not folded in here. */
+	/* The directions a vehicle can actually drive off this tile in. `TrackdirToExitdir` is the
+	 * engine's own map from a trackdir to the tile edge it leaves by, and the track status already
+	 * carries the one-way restriction of this tile (`GetTileTrackStatus_Road` scales the trackdirs by
+	 * the disallowed directions), so a one-way tile offers only the direction it allows. The
+	 * one-way state of the neighbouring tiles is a per-pair test and is not folded in here. */
+	bool exit_dirs[4] = {false, false, false, false};
+	for (const Trackdir trackdir : status.trackdirs) {
+		exit_dirs[to_underlying(TrackdirToExitdir(trackdir))] = true;
+	}
+
 	Json exits = Json::array();
 	for (const DiagDirection dir : {DiagDirection::NE, DiagDirection::SE, DiagDirection::SW, DiagDirection::NW}) {
-		if ((status.trackdirs & DiagdirReachesTrackdirs(dir)).Any()) exits.push_back(DiagDirName(dir));
+		if (exit_dirs[to_underlying(dir)]) exits.push_back(DiagDirName(dir));
 	}
 
 	Json directions = Json::array();
