@@ -9,7 +9,9 @@
  * @file test_agent_bridge_refs.cpp Test the typed tile object identity and the reference
  * resolution of the agent bridge: tile categories, state fingerprints, stale validation, the
  * generic `tile` alias, a house with its town lifetime, a map object with its pool lifetime,
- * ownership, points, the error cases and the calendar conversion `world.info` reports.
+ * ownership, points, the road subtypes (a road depot with its pool lifetime, a tram depot, a level
+ * crossing, a road stop and a road bridgehead), the error cases and the calendar conversion
+ * `world.info` reports.
  *
  * The bridge reads only the requested tile, so a small allocated map is enough: no game loop, no
  * video driver and no command is needed.
@@ -20,12 +22,17 @@
 #include "../3rdparty/catch2/catch.hpp"
 
 #include "../agent_bridge.h"
+#include "../bridge_map.h"
+#include "../depot_base.h"
 #include "../map_func.h"
 #include "../object_base.h"
 #include "../object_map.h"
 #include "../openttd.h"
 #include "../rail_map.h"
+#include "../road.h"
 #include "../road_map.h"
+#include "../station_map.h"
+#include "../station_type.h"
 #include "../tile_map.h"
 #include "../timer/timer_game_calendar.h"
 #include "../town.h"
@@ -78,6 +85,43 @@ Json TileRef(const Json &row)
 	if (row.contains("town_generation") && !row["town_generation"].is_null()) ref["town_generation"] = row["town_generation"];
 	return ref;
 }
+
+/**
+ * One real road depot with a real road depot tile, removed again when the fixture goes out of scope.
+ *
+ * The tile carries the depot id and the owner, exactly as the engine's own road depot builder writes
+ * them, so the fingerprint is computed on a tile the game itself can produce.
+ */
+class TestRoadDepot {
+public:
+	TestRoadDepot(TileIndex tile, Owner owner, DiagDirection dir, RoadType rt = ROADTYPE_ROAD)
+	{
+		REQUIRE(Depot::GetNumItems() == 0);
+		REQUIRE(Depot::CanAllocateItem());
+		this->depot = Depot::Create(tile);
+		MakeRoadDepot(tile, owner, this->depot->index, dir, rt);
+	}
+
+	~TestRoadDepot() { _depot_pool.CleanPool(); }
+
+	/**
+	 * Demolish the depot and rebuild it on the same tile in the same state: the pool hands out a new
+	 * lifetime, so the tile carries a depot the caller has never seen.
+	 */
+	Depot *Rebuild(TileIndex tile, Owner owner, DiagDirection dir, RoadType rt = ROADTYPE_ROAD)
+	{
+		delete this->depot;
+		REQUIRE(Depot::CanAllocateItem());
+		this->depot = Depot::Create(tile);
+		MakeRoadDepot(tile, owner, this->depot->index, dir, rt);
+		return this->depot;
+	}
+
+	Depot *Get() const { return this->depot; }
+
+private:
+	Depot *depot = nullptr; ///< The depot the fixture created.
+};
 
 /** A town that owns a house tile, created once for the cases that need a lifetime. */
 Town *TestTown(TileIndex tile)
@@ -416,6 +460,105 @@ TEST_CASE("Agent bridge refs: ownership is part of the tile identity")
 	const TileIndex sea = TileXY(43, 43);
 	MakeWater(sea, OWNER_WATER, WaterClass::Sea, 0);
 	CHECK(FindTileObject(sea, "water")["owner"].is_null());
+}
+
+TEST_CASE("Agent bridge refs: a road depot is fingerprinted without the normal-road accessor")
+{
+	MapFixture map;
+
+	/* The tile the E12 purchase test crashed on: a built road depot. A depot stores its geometry as
+	 * the exit direction, which the normal-road accessor asserts against, so the fingerprint has to
+	 * read it through the subtype-safe helper. */
+	const TileIndex tile = TileXY(50, 50);
+	TestRoadDepot depot(tile, Owner{0}, DiagDirection::SE);
+	REQUIRE(depot.Get() != nullptr);
+
+	const Json row = FindTileObject(tile, "road");
+	REQUIRE(!row.empty());
+	CHECK(row["subtype"] == "road");
+	CHECK(row["owner"] == 0);
+	CHECK(row["fingerprint"].is_number_unsigned());
+
+	/* A read resolves the depot tile and reports the fingerprint to keep. */
+	const Json ref = TileRef(row);
+	CHECK(ResolveObjectRef(ref, true)["found"] == true);
+
+	/* Another exit direction is another state of the depot. */
+	SetRoadDepotExitDirection(tile, DiagDirection::NW);
+	const Json turned = ResolveObjectRef(ref, true);
+	CHECK(turned["found"] == false);
+	CHECK(turned["reason"] == "tile_state_changed");
+	SetRoadDepotExitDirection(tile, DiagDirection::SE);
+
+	/* The same direction after a rebuild is a different depot: the pool lifetime is part of the
+	 * identity, so a stale reference cannot act on the depot that replaced the one it saw. */
+	REQUIRE(depot.Rebuild(tile, Owner{0}, DiagDirection::SE) != nullptr);
+	const Json rebuilt = ResolveObjectRef(ref, true);
+	CHECK(rebuilt["found"] == false);
+	CHECK(rebuilt["reason"] == "tile_state_changed");
+	CHECK(rebuilt["fingerprint_now"] != ref["fingerprint"]);
+
+	/* An ownership change invalidates a reference as well. */
+	const Json rebuilt_ref = TileRef(FindTileObject(tile, "road"));
+	CHECK(ResolveObjectRef(rebuilt_ref, true)["found"] == true);
+	SetTileOwner(tile, Owner{1});
+	const Json sold = ResolveObjectRef(rebuilt_ref, true);
+	CHECK(sold["found"] == false);
+	CHECK(sold["reason"] == "tile_state_changed");
+}
+
+TEST_CASE("Agent bridge refs: the other road subtypes are read by subtype")
+{
+	MapFixture map;
+
+	/* Which road type is a road type and which is a tram type is decided by the masks the engine
+	 * fills in with `ResetRoadTypes()` at game start, and they are the state a running game has.
+	 * Without them a bare test process classifies ROADTYPE_TRAM as a road type, so the tram depot
+	 * below would be built with a road road type and carry no tram row at all. */
+	ResetRoadTypes();
+	REQUIRE(GetRoadTramType(ROADTYPE_TRAM) == RoadTramType::Tram);
+
+	/* A tram depot is the same kind of tile with a tram road type: the tram row reads it the same way,
+	 * and the tile carries no road row because it has no road type. */
+	const TileIndex depot_tile = TileXY(51, 51);
+	TestRoadDepot tram_depot(depot_tile, Owner{0}, DiagDirection::SW, ROADTYPE_TRAM);
+	REQUIRE(tram_depot.Get() != nullptr);
+	const Json tram_row = FindTileObject(depot_tile, "tram");
+	REQUIRE(!tram_row.empty());
+	CHECK(tram_row["fingerprint"].is_number_unsigned());
+	CHECK(FindTileObject(depot_tile, "road").empty());
+	CHECK(ResolveObjectRef(TileRef(tram_row), true)["found"] == true);
+
+	/* A normal road and a level crossing can carry the same road bits and the same owner: only the
+	 * subtype tells them apart, so it is part of the fingerprint. */
+	const TileIndex road = TileXY(52, 52);
+	MakeRoadNormal(road, ROAD_X, ROADTYPE_ROAD, INVALID_ROADTYPE, TownID::Invalid(), Owner{0}, OWNER_NONE);
+	const TileIndex crossing = TileXY(53, 53);
+	MakeRoadCrossing(crossing, Owner{0}, OWNER_NONE, Owner{0}, Axis::X, RAILTYPE_RAIL, ROADTYPE_ROAD, INVALID_ROADTYPE, TownID::Invalid());
+	const Json road_row = FindTileObject(road, "road");
+	const Json crossing_row = FindTileObject(crossing, "road");
+	REQUIRE(!road_row.empty());
+	REQUIRE(!crossing_row.empty());
+	CHECK(road_row["fingerprint"] != crossing_row["fingerprint"]);
+
+	/* The axis of the crossing is part of its state. */
+	MakeRoadCrossing(crossing, Owner{0}, OWNER_NONE, Owner{0}, Axis::Y, RAILTYPE_RAIL, ROADTYPE_ROAD, INVALID_ROADTYPE, TownID::Invalid());
+	CHECK(FindTileObject(crossing, "road")["fingerprint"] != crossing_row["fingerprint"]);
+
+	/* A road bridgehead reports the transport type and the direction the road bits are stored as. */
+	const TileIndex bridge = TileXY(54, 54);
+	MakeRoadBridgeRamp(bridge, Owner{0}, Owner{0}, OWNER_NONE, BridgeType{0}, DiagDirection::NE, ROADTYPE_ROAD, INVALID_ROADTYPE);
+	const Json bridge_row = FindTileObject(bridge, "bridge");
+	REQUIRE(!bridge_row.empty());
+	CHECK(bridge_row["fingerprint"].is_number_unsigned());
+	MakeRoadBridgeRamp(bridge, Owner{0}, Owner{0}, OWNER_NONE, BridgeType{0}, DiagDirection::SW, ROADTYPE_ROAD, INVALID_ROADTYPE);
+	CHECK(FindTileObject(bridge, "bridge")["fingerprint"] != bridge_row["fingerprint"]);
+
+	/* A road stop tile is a station tile: it carries no typed landscape object of its own, so no road
+	 * fingerprint is asked for it, and describing it must not read it as a normal road either. */
+	const TileIndex stop = TileXY(55, 55);
+	MakeDriveThroughRoadStop(stop, Owner{0}, Owner{0}, OWNER_NONE, StationID{0}, StationType::Bus, ROADTYPE_ROAD, INVALID_ROADTYPE, Axis::X);
+	CHECK(DescribeTileObjects(stop).empty());
 }
 
 TEST_CASE("Agent bridge refs: a map object carries the lifetime of the pooled object")

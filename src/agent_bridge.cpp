@@ -903,7 +903,11 @@ Owner TileObjectOwner(TileIndex tile, TileObjectKind kind)
  * - rail: rail tile type, rail type and, for plain rail, the track bits;
  * - signal: the signal variant of every track, the present signals and the signal states (traffic
  *   can change these, so a signal reference may go stale without anyone building anything);
- * - road and tram: the road type and the road bits of that tram type;
+ * - road and tram: the road type, the subtype of the road tile and the road bits of that tram
+ *   type. The bits are read through the subtype-safe `GetAnyRoadBits()`, because a road depot
+ *   and a level crossing store their geometry where a normal road does not: on a depot the bits
+ *   are the direction of its exit. A depot is a pooled object as well, so its pool lifetime is
+ *   mixed in, and a rebuilt depot on the same tile is not the depot the caller looked at;
  * - bridge and tunnel: transport type and direction, plus the bridge type for a bridge;
  * - mapobject: the object type, the pooled object id and the full 64 bit generation of that
  *   object, so replacing an object with one of the same type is a different identity;
@@ -986,7 +990,16 @@ uint32_t TileObjectFingerprint(TileObjectKind kind, TileIndex tile)
 		case TileObjectKind::Tram: {
 			const RoadTramType tram_type = kind == TileObjectKind::Tram ? RoadTramType::Tram : RoadTramType::Road;
 			MixFingerprint(hash, to_underlying(GetRoadType(tile, tram_type)));
-			MixFingerprint(hash, GetRoadBits(tile, tram_type).base());
+			/* The subtype says how the geometry is stored, and the same bits mean something else on a
+			 * normal road, a level crossing and a depot. GetRoadBits() asserts a normal road, so the
+			 * bits come from the subtype-safe GetAnyRoadBits(): on a depot they are its exit direction. */
+			if (IsTileType(tile, TileType::Road)) MixFingerprint(hash, to_underlying(GetRoadTileType(tile)));
+			MixFingerprint(hash, GetAnyRoadBits(tile, tram_type).base());
+			/* A road depot is a pooled object as well: a rebuilt depot is not the one the caller saw. */
+			if (IsRoadDepotTile(tile)) {
+				const Depot *depot = Depot::GetByTile(tile);
+				MixFingerprint64(hash, depot == nullptr ? 0 : depot->generation);
+			}
 			break;
 		}
 
