@@ -10,6 +10,7 @@ add_test_files(
     math_func.cpp
     rail_route.cpp
     station_catchment.cpp
+    strgen_commands.cpp
     mock_environment.h
     mock_fontcache.h
     mock_spritecache.cpp
