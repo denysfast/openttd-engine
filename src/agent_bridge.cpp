@@ -88,11 +88,12 @@ constexpr int MAX_QUERY_TILES = 4096;
 constexpr size_t MAX_OBJECT_REFS = 64;
 
 /**
- * Maximum number of captures that may wait for the next draw tick. A capture is
- * taken on the draw thread, so a request that is scheduled but not drawn yet
- * holds a receipt and a result slot; the bound keeps that reservation small.
+ * Maximum number of requests that may wait for the next draw tick. A capture is
+ * taken and the camera is read or moved on the draw thread, so a request that is
+ * scheduled but not drawn yet holds a receipt and a result slot; the bound keeps
+ * that reservation small.
  */
-constexpr size_t MAX_PENDING_CAPTURES = 4;
+constexpr size_t MAX_PENDING_DEFERRED = 4;
 
 /**
  * Generate a random (version 4) UUID.
@@ -271,15 +272,16 @@ uint64_t _next_request_id = 0;                             ///< Identifier of th
 std::map<uint64_t, PendingRequest> _pending;               ///< Requests that are in flight.
 std::map<uint64_t, std::unique_ptr<BridgeHTTPCallback>> _callbacks; ///< Callbacks of the requests in flight.
 
-/** A capture that waits for the next draw tick to be taken. */
-struct DeferredCapture {
-	std::string world_id; ///< The world the capture was requested for.
-	std::string epoch;    ///< The epoch the capture was requested for.
-	std::string task_id;  ///< The task the capture belongs to, if any.
-	Json params;          ///< The parameters of the capture.
+/** A request that waits for the next draw tick to be executed. */
+struct DeferredRequest {
+	std::string method;   ///< The method the request calls.
+	std::string world_id; ///< The world the request was issued for.
+	std::string epoch;    ///< The epoch the request was issued for.
+	std::string task_id;  ///< The task the request belongs to, if any.
+	Json params;          ///< The parameters of the request.
 };
 
-std::map<std::string, DeferredCapture> _captures; ///< Captures waiting for the draw tick, by request id.
+std::map<std::string, DeferredRequest> _deferred; ///< Requests waiting for the draw tick, by request id.
 
 /**
  * Build a successful method result.
@@ -458,14 +460,14 @@ void Send(RequestKind kind, const std::string &path, std::string payload, const 
  *
  * A receipt may only be forgotten once the backend acknowledged the delivery of
  * its result; otherwise a replay of that request would execute it a second time.
- * A capture that waits for the draw tick already holds a receipt slot, so the
- * pending captures are counted here: an ordinary request must not take the slot
- * the capture was promised, or the capture result could never be stored.
+ * A request that waits for the draw tick already holds a receipt slot, so the
+ * pending requests are counted here: an ordinary request must not take the slot
+ * a deferred request was promised, or its result could never be stored.
  * @return True iff there is room for another receipt.
  */
 bool HasReceiptCapacity()
 {
-	if (_state.receipts.size() + _captures.size() < MAX_RECEIPTS) return true;
+	if (_state.receipts.size() + _deferred.size() < MAX_RECEIPTS) return true;
 	for (const std::string &request_id : _state.receipt_order) {
 		const auto receipt = _state.receipts.find(request_id);
 		if (receipt != _state.receipts.end() && receipt->second.acknowledged) return true;
@@ -478,12 +480,12 @@ bool HasReceiptCapacity()
  *
  * Only acknowledged receipts are evicted: an unacknowledged one is the only
  * answer a replay of its request can get, so dropping it would execute the
- * request a second time. A pending capture holds a receipt slot as well, so the
+ * request a second time. A pending request holds a receipt slot as well, so the
  * room is made for both.
  */
 void MakeReceiptRoom()
 {
-	while (_state.receipts.size() + _captures.size() >= MAX_RECEIPTS) {
+	while (_state.receipts.size() + _deferred.size() >= MAX_RECEIPTS) {
 		const auto oldest = std::find_if(_state.receipt_order.begin(), _state.receipt_order.end(), [](const std::string &request_id) {
 			const auto receipt = _state.receipts.find(request_id);
 			return receipt != _state.receipts.end() && receipt->second.acknowledged;
@@ -525,12 +527,12 @@ void AcknowledgeReceipt(const std::string &request_id)
 bool QueueResult(const std::string &request_id, const Json &result)
 {
 	/*
-	 * A capture that waits for the draw tick already holds a result slot. Counting
-	 * the pending captures here keeps that slot free: an ordinary result may not
-	 * consume it, because the capture result is produced later and cannot be
+	 * A request that waits for the draw tick already holds a result slot. Counting
+	 * the pending requests here keeps that slot free: an ordinary result may not
+	 * consume it, because the deferred result is produced later and cannot be
 	 * replayed from the request.
 	 */
-	if (_state.results.size() + _captures.size() >= MAX_PENDING_RESULTS) {
+	if (_state.results.size() + _deferred.size() >= MAX_PENDING_RESULTS) {
 		Debug(Facility::Net, Severity::Warning, "In-game agent bridge: result queue is full; the backend has to catch up");
 		return false;
 	}
@@ -587,11 +589,31 @@ Json TileRow(TileIndex tile)
 }
 
 /**
+ * Does this world.project call ask for a screen projection instead of an administrative op?
+ *
+ * The administrative operations of world.project (`power`, `power_fuel`, `station_town`,
+ * `district`) are named by `op` and stay with the admin module. A call without an op that
+ * names a tile, a town or a screen pixel is a projection of the live viewport, which is a
+ * read of the camera and not an administrative operation.
+ * @param params The method parameters.
+ * @return True iff the call is a projection request.
+ */
+bool IsProjectionRequest(const Json &params)
+{
+	if (!params.is_object() || params.contains("op")) return false;
+	for (const char *key : {"tile", "tile_x", "tile_y", "town", "center", "screen_x", "screen_y"}) {
+		if (params.contains(key)) return true;
+	}
+	return false;
+}
+
+/**
  * The methods that change the world, and therefore need the write gate.
  *
  * The administrative module knows which of its own operations are read-only
  * (`world.company op=info`, `world.towns op=needs`, `world.project op=power/district`),
- * so it decides for its families; the rest is fixed by the method name.
+ * so it decides for its families; the rest is fixed by the method name. Moving the camera
+ * is a UI operation, but it is a write of the viewport state, so it takes the same gate.
  * @param method The method name.
  * @param params The method parameters.
  * @return True when the call is expected to change the world.
@@ -600,9 +622,11 @@ bool IsMutation(std::string_view method, const Json &params)
 {
 	if (method == "world.pause" || method == "world.rename" || method == "world.settings.set" ||
 			method == "world.construct" || method == "world.vehicles" || method == "world.orders" ||
-			method == "world.command") {
+			method == "world.command" || method == "world.camera.set") {
 		return true;
 	}
+	/* A projection through world.project is a read of the camera; the administrative ops keep their own answer. */
+	if (method == "world.project" && IsProjectionRequest(params)) return false;
 	return IsAdminMutation(method, params);
 }
 
@@ -1129,79 +1153,124 @@ Json CaptureFailure(const Json &capture)
 }
 
 /**
- * Finish a capture that was deferred to the draw tick.
+ * Turn a camera or projection result into a bridge result.
  *
- * Runs on the draw thread with the game state lock and the video buffer lock
- * held, so neither the world nor the frame can change underneath it. The world,
- * the epoch and the task barrier of the request are checked again: a load or a
- * Stop between scheduling and drawing must not turn into a successful capture
- * of another world. The receipt and the result are stored only here, so a
- * placeholder is never delivered as if the capture had been applied.
- *
- * The entry is removed first, which releases the receipt and result slot the
- * capture reserved. That is safe because this runs under the game state lock,
- * so no other capacity check can observe the released slot before the answer of
- * this capture is stored and queued below.
- * @param request_id The request the capture belongs to.
+ * Same shape as the other deferred method: a success is `{ok: true, value: <camera result>}`, a
+ * failure keeps the camera's own error code and its diagnostics at the top level, so a missing
+ * viewport is never reported as a success. A read is bound to the world and epoch it was taken in,
+ * like every other read of the bridge.
+ * @param camera The result of InspectGameViewport() or SetGameCamera().
+ * @param bind_world Whether to add world_id/epoch to the value (reads only).
+ * @return The bridge result.
  */
-void FinishDeferredCapture(const std::string &request_id)
+Json CameraResult(Json camera, bool bind_world)
 {
-	const auto capture = _captures.find(request_id);
-	if (capture == _captures.end()) return;
-	const DeferredCapture deferred = std::move(capture->second);
-	_captures.erase(capture);
+	if (!camera.is_object()) return Ok(std::move(camera));
+
+	if (!camera.value("ok", false)) {
+		Json result = Error(JsonString(camera, "error", "camera_failed"), JsonString(camera, "message", "the camera request failed"));
+		if (camera.contains("tick")) result["tick"] = camera["tick"];
+		return result;
+	}
+
+	if (bind_world) camera.update(WorldBinding());
+	return Ok(std::move(camera));
+}
+
+/**
+ * Run one deferred request on the draw tick.
+ *
+ * Runs with the game state lock and the video buffer lock held, so neither the world nor the frame
+ * can change underneath it. The world, the epoch and the task barrier of the request are checked
+ * again, and a write is checked against `expected_refs` a second time: a load, a Stop or a changed
+ * object between scheduling and drawing must not turn into a write of another world or object.
+ * @param deferred The request to run.
+ * @return The bridge result.
+ */
+Json RunDeferred(const DeferredRequest &deferred)
+{
+	if (!IsWorldReady()) return Error("world_not_ready", "the world is being generated or loaded");
+	if (!deferred.task_id.empty() && _state.barrier_tasks.find(deferred.task_id) != _state.barrier_tasks.end()) {
+		return Error("task_stopped", "the task has been stopped");
+	}
+
+	const bool mutation = IsMutation(deferred.method, deferred.params);
+	if (mutation) {
+		if (const std::optional<Json> stale = CheckExpectedRefs(deferred.params); stale.has_value()) return *stale;
+	}
+
+	if (deferred.method == "world.capture") {
+		const Json capture = CaptureGameFrame(deferred.params);
+		return capture.value("ok", false) ? Ok(capture) : CaptureFailure(capture);
+	}
+
+	/* world.camera.get and a world.project projection read the camera; world.camera.set moves it. */
+	const Json camera = mutation ? SetGameCamera(deferred.params) : InspectGameViewport(deferred.params);
+	return CameraResult(std::move(camera), !mutation);
+}
+
+/**
+ * Finish a request that was deferred to the draw tick.
+ *
+ * The receipt and the result are stored only here, so a placeholder is never delivered as if the
+ * request had been applied.
+ *
+ * The entry is removed first, which releases the receipt and result slot the request reserved. That
+ * is safe because this runs under the game state lock, so no other capacity check can observe the
+ * released slot before the answer of this request is stored and queued below.
+ * @param request_id The request that was deferred.
+ */
+void FinishDeferredRequest(const std::string &request_id)
+{
+	const auto entry = _deferred.find(request_id);
+	if (entry == _deferred.end()) return;
+	const DeferredRequest deferred = std::move(entry->second);
+	_deferred.erase(entry);
 
 	/*
-	 * The backend invalidates the requests of an epoch it no longer serves, so a
-	 * capture of a world that is gone is dropped instead of answered with a result
-	 * the backend would reject as stale and the bridge would retry forever.
+	 * The backend invalidates the requests of an epoch it no longer serves, so a request of a world
+	 * that is gone is dropped instead of answered with a result the backend would reject as stale
+	 * and the bridge would retry forever.
 	 */
 	if (deferred.world_id != _state.world_id || deferred.epoch != _state.epoch) {
-		Debug(Facility::Net, Severity::Info, "In-game agent bridge: dropping capture {} of a world that is gone", request_id);
+		Debug(Facility::Net, Severity::Info, "In-game agent bridge: dropping deferred {} {} of a world that is gone", deferred.method, request_id);
 		return;
 	}
 
-	Json result;
-	if (!IsWorldReady()) {
-		result = Error("world_not_ready", "the world is being generated or loaded");
-	} else if (!deferred.task_id.empty() && _state.barrier_tasks.find(deferred.task_id) != _state.barrier_tasks.end()) {
-		result = Error("task_stopped", "the task has been stopped");
-	} else {
-		const Json capture_result = CaptureGameFrame(deferred.params);
-		result = capture_result.value("ok", false) ? Ok(capture_result) : CaptureFailure(capture_result);
-	}
+	const Json result = RunDeferred(deferred);
 
 	StoreReceipt(request_id, result);
 	/*
-	 * The reservation taken by ScheduleCapture guarantees this slot: every other capacity check
-	 * counts the pending captures, and this capture has just released its own. The fallback keeps
-	 * the answer deliverable even if that invariant is ever broken, because a capture result
+	 * The reservation taken by ScheduleDeferred guarantees this slot: every other capacity check
+	 * counts the pending requests, and this request has just released its own. The fallback keeps
+	 * the answer deliverable even if that invariant is ever broken, because a deferred result
 	 * cannot be replayed from the request.
 	 */
 	if (!QueueResult(request_id, result)) {
-		Debug(Facility::Net, Severity::Warning, "In-game agent bridge: result queue is full; queueing the capture result anyway");
+		Debug(Facility::Net, Severity::Warning, "In-game agent bridge: result queue is full; queueing the deferred result anyway");
 		_state.results.push_back({{"request_id", request_id}, {"result", result}});
 	}
 }
 
 /**
- * Schedule a capture for the next draw tick.
+ * Schedule a request for the next draw tick.
  *
- * The capture must not run inside the game loop: the draw thread takes the video
- * buffer lock before the game state lock, so copying the frame from the game
- * thread would invert that order. VideoDriver::QueueOnMainThread runs the
- * callback on the next draw tick with both locks held, which is exactly the
- * context CaptureGameFrame() documents.
+ * The request must not run inside the game loop: the draw thread takes the video buffer lock before
+ * the game state lock, so touching the frame or the viewport from the game thread would invert that
+ * order. VideoDriver::QueueOnMainThread runs the callback on the next draw tick with both locks
+ * held, which is exactly the context CaptureGameFrame(), InspectGameViewport() and SetGameCamera()
+ * document.
+ * @param method The method the request calls.
  * @param request The request, as received from the backend.
  * @param request_id The id of the request.
- * @param params The parameters of the capture.
- * @param deferred Set to true iff the capture was scheduled and answers later.
- * @return The result of the request; a placeholder when the capture was scheduled.
+ * @param params The parameters of the request.
+ * @param deferred Set to true iff the request was scheduled and answers later.
+ * @return The result of the request; a placeholder when the request was scheduled.
  */
-Json ScheduleCapture(const Json &request, const std::string &request_id, const Json &params, bool &deferred)
+Json ScheduleDeferred(std::string_view method, const Json &request, const std::string &request_id, const Json &params, bool &deferred)
 {
-	/* A replay of a request that is already waiting must not schedule a second capture. */
-	if (_captures.find(request_id) != _captures.end()) {
+	/* A replay of a request that is already waiting must not schedule a second execution. */
+	if (_deferred.find(request_id) != _deferred.end()) {
 		deferred = true;
 		return Ok({{"deferred", true}});
 	}
@@ -1209,19 +1278,19 @@ Json ScheduleCapture(const Json &request, const std::string &request_id, const J
 	/* Without a GUI there is no draw tick to run the callback on, so the queue would never drain. */
 	VideoDriver *driver = VideoDriver::GetInstance();
 	if (driver == nullptr || !driver->HasGUI()) {
-		return Error("headless_unavailable", "no video driver with a GUI; the frame cannot be captured");
+		return Error("headless_unavailable", "no video driver with a GUI; the request cannot run on the draw tick");
 	}
 
-	/* Reserve the receipt and the result of the capture before it is scheduled, so the
-	 * answer can always be stored and delivered when the draw tick runs. */
-	if (_captures.size() >= MAX_PENDING_CAPTURES ||
-			_state.results.size() + _captures.size() >= MAX_PENDING_RESULTS ||
-			_state.receipts.size() + _captures.size() >= MAX_RECEIPTS) {
-		return Error("busy", "too many captures are waiting for the next draw tick");
+	/* Reserve the receipt and the result of the request before it is scheduled, so the answer can
+	 * always be stored and delivered when the draw tick runs. */
+	if (_deferred.size() >= MAX_PENDING_DEFERRED ||
+			_state.results.size() + _deferred.size() >= MAX_PENDING_RESULTS ||
+			_state.receipts.size() + _deferred.size() >= MAX_RECEIPTS) {
+		return Error("busy", "too many requests are waiting for the next draw tick");
 	}
 
-	_captures[request_id] = DeferredCapture{_state.world_id, _state.epoch, JsonString(request, "task_id"), params};
-	driver->QueueOnMainThread([request_id]() { FinishDeferredCapture(request_id); });
+	_deferred[request_id] = DeferredRequest{std::string(method), _state.world_id, _state.epoch, JsonString(request, "task_id"), params};
+	driver->QueueOnMainThread([request_id]() { FinishDeferredRequest(request_id); });
 	deferred = true;
 	return Ok({{"deferred", true}});
 }
@@ -1298,8 +1367,16 @@ Json ExecuteRequest(const Json &request, bool &deferred)
 	/* Read-only description of the native chat UI, so a GUI test can locate real targets. */
 	if (method == "ui.inspect") return Ok(::DescribeAgentChatUi());
 
-	/* The frame is copied on the draw thread, so the capture answers from the next draw tick. */
-	if (method == "world.capture") return ScheduleCapture(request, JsonString(request, "request_id"), params, deferred);
+	/*
+	 * The frame is copied and the camera is read or moved on the draw thread, so these answer from
+	 * the next draw tick. A world.project call that asks for a screen projection is a camera read;
+	 * a world.project call that names an administrative op stays with the admin module below, so
+	 * neither shadows the other.
+	 */
+	if (method == "world.capture" || method == "world.camera.get" || method == "world.camera.set" ||
+			(method == "world.project" && IsProjectionRequest(params))) {
+		return ScheduleDeferred(method, request, JsonString(request, "request_id"), params, deferred);
+	}
 
 	/*
 	 * Construction is split between two modules. The transport module owns the rail, water and
@@ -1387,7 +1464,7 @@ void HandlePollResponse(bool ok, const Json &body)
 				bool deferred = false;
 				result = ExecuteRequest(request, deferred);
 				if (deferred) {
-					/* The capture answers from the draw tick: no receipt and no result yet. */
+					/* A deferred request answers from the draw tick: no receipt and no result yet. */
 					continue;
 				}
 				StoreReceipt(request_id, result);
@@ -1491,6 +1568,55 @@ void ProcessCompletions()
 }
 
 /**
+ * The camera methods of this file, described the way the tool modules describe theirs.
+ *
+ * The parameters are the ones InspectGameViewport() and SetGameCamera() document in
+ * `src/agent_capture.h`; `parameters_header` names that file so an operator can read the exact
+ * meaning and the returned fields without guessing.
+ * @return Capability document of the camera methods.
+ */
+Json CameraCapabilities()
+{
+	const Json read_parameters = Json::array({"tile", "tile_x", "tile_y", "town", "center", "screen_x", "screen_y", "clamp_to_map"});
+	const Json write_parameters = Json::array({"tile", "tile_x", "tile_y", "town", "center", "scroll", "zoom", "zoom_delta", "instant"});
+
+	Json methods = Json::array();
+	methods.push_back({
+		{"method", "world.camera.get"},
+		{"authority", "read"},
+		{"deferred", true},
+		{"implemented", Json::array({"camera", "tile_to_screen", "screen_to_tile"})},
+		{"parameters", read_parameters},
+	});
+	methods.push_back({
+		{"method", "world.camera.set"},
+		{"authority", "write"},
+		{"deferred", true},
+		{"implemented", Json::array({"center_tile", "center_town", "scroll", "zoom", "zoom_delta"})},
+		{"parameters", write_parameters},
+	});
+	methods.push_back({
+		{"method", "world.project"},
+		{"authority", "read"},
+		{"deferred", true},
+		{"implemented", Json::array({"projection"})},
+		{"parameters", read_parameters},
+	});
+
+	Json result = Json::object();
+	result["module"] = "agent_bridge_camera";
+	result["parameters_header"] = "src/agent_capture.h";
+	result["methods"] = std::move(methods);
+	result["notes"] = Json::array({
+		"InspectGameViewport() and SetGameCamera() run on the draw tick, deferred like world.capture, so the reported camera is the frame the game draws next.",
+		"world.camera.get and a world.project projection are reads and run while the game is paused; they report the real viewport, zoom and scroll position, and project a tile to the screen or a screen pixel to a tile.",
+		"world.project is a projection only when it carries no `op` and names a tile, a town or a screen pixel; `op` stays with the administrative module (power, power_fuel, station_town, district).",
+		"world.camera.set is a write of the viewport state: it takes the single-player gate, the task barrier and expected_refs, checked when it is scheduled and again on the draw tick.",
+	});
+	return result;
+}
+
+/**
  * The methods the engine can actually serve right now.
  *
  * Composed from the core methods of this file and from the capability documents of the tool
@@ -1502,10 +1628,10 @@ void ProcessCompletions()
 Json Capabilities()
 {
 	std::vector<std::string> methods = {"world.info", "world.query", "world.objects", "world.pause",
-			"world.rename", "world.capture", "task.barrier", "ui.inspect"};
+			"world.rename", "world.capture", "world.camera.get", "world.camera.set", "task.barrier", "ui.inspect"};
 	Json modules = Json::array();
 
-	for (const Json &module : {GameToolCapabilities(), TransportToolCapabilities(), AdminToolCapabilities()}) {
+	for (const Json &module : {GameToolCapabilities(), TransportToolCapabilities(), AdminToolCapabilities(), CameraCapabilities()}) {
 		modules.push_back(module);
 		const auto entries = module.find("methods");
 		if (entries == module.end() || !entries->is_array()) continue;
@@ -1638,8 +1764,8 @@ void ResetWorld()
 	_state.receipts.clear();
 	_state.receipt_order.clear();
 	_state.barrier_tasks.clear();
-	/* Captures waiting for the draw tick belong to the world that is gone; their callbacks find nothing and drop them. */
-	_captures.clear();
+	/* Requests waiting for the draw tick belong to the world that is gone; their callbacks find nothing and drop them. */
+	_deferred.clear();
 	/* Requests in flight are kept: their completions are ignored by epoch, and UI callbacks still get their answer. */
 }
 

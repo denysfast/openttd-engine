@@ -158,3 +158,36 @@ TEST_CASE("Agent capture: camera requests are validated before the viewport is u
 		CHECK(result["error"] == "out_of_bounds");
 	}
 }
+
+TEST_CASE("Agent capture: the camera parameters the bridge advertises are recognised")
+{
+	/* world.camera.get and a world.project projection advertise exactly these names, and
+	 * world.camera.set advertises the moves. The test binary has neither a map nor a window, so the
+	 * call cannot succeed here, but a name the helper does not know is rejected as invalid_params
+	 * before anything else: that is the difference this case pins down. */
+	for (const InGameAgent::Json &params : {
+			InGameAgent::Json{{"tile", 0}},
+			InGameAgent::Json{{"tile_x", 10}, {"tile_y", 10}},
+			InGameAgent::Json{{"center", {{"x", 4}, {"y", 4}}}},
+			InGameAgent::Json{{"screen_x", 10}, {"screen_y", 10}},
+			InGameAgent::Json{{"screen_x", 10}, {"screen_y", 10}, {"clamp_to_map", false}},
+	}) {
+		const InGameAgent::Json read = InGameAgent::InspectGameViewport(params);
+		CHECK(read["ok"] == false);
+		CHECK(read["error"] != "invalid_params");
+	}
+
+	for (const InGameAgent::Json &params : {
+			InGameAgent::Json{{"tile", 0}},
+			InGameAgent::Json{{"tile_x", 10}, {"tile_y", 10}},
+			InGameAgent::Json{{"center", {{"x", 4}, {"y", 4}}}},
+			InGameAgent::Json{{"scroll", {{"dx", 8}, {"dy", 8}}}},
+			InGameAgent::Json{{"zoom", 2}},
+			InGameAgent::Json{{"zoom_delta", 1}},
+			InGameAgent::Json{{"zoom", 2}, {"instant", false}},
+	}) {
+		const InGameAgent::Json write = InGameAgent::SetGameCamera(params);
+		CHECK(write["ok"] == false);
+		CHECK(write["error"] != "invalid_params");
+	}
+}
