@@ -5,12 +5,15 @@
  * See the GNU General Public License for more details. You should have received a copy of the GNU General Public License along with OpenTTD. If not, see <https://www.gnu.org/licenses/old-licenses/gpl-2.0>.
  */
 
-/** @file agent_capture.h Capture of the live game frame for the in-game agent bridge. */
+/** @file agent_capture.h Capture of the live game frame and camera queries for the in-game agent bridge. */
 
 #ifndef AGENT_CAPTURE_H
 #define AGENT_CAPTURE_H
 
 #include "3rdparty/nlohmann/json.hpp"
+#include "landscape.h"
+#include "viewport_type.h"
+#include "zoom_func.h"
 
 /** Bridge between the running game and an external agent. */
 namespace InGameAgent {
@@ -26,6 +29,11 @@ using Json = nlohmann::json;
  * after a command shows the state that command produced instead of the frame from
  * before it. The image is written to a private temporary directory, read back, and the
  * directory is removed again, so no user file is ever touched.
+ *
+ * The capture is the whole screen frame, every window included, not an independent
+ * map-camera render: "kind": "viewport" means the screen, and "region" is a rectangle in
+ * screen pixels. To find out where a tile is on that screen, use InspectGameViewport()
+ * (or WorldToScreen()) first; the capture itself does not move the camera.
  *
  * Must be called from the main thread: the thread that runs the video driver's draw
  * tick and owns the video buffer (the one that executes VideoDriver::QueueOnMainThread
@@ -60,6 +68,113 @@ using Json = nlohmann::json;
  * @return The JSON result describing the capture.
  */
 Json CaptureGameFrame(const Json &params);
+
+/**
+ * Screen position of a world point in a viewport.
+ *
+ * This is the inverse of TranslateXYToTileCoord(): the point is remapped with RemapCoords()
+ * and then scaled by the viewport zoom with the same rounding the viewport uses when it
+ * draws (SetupViewportArea() in viewport.cpp), so the result is the screen pixel the point
+ * is actually drawn at, not an approximation. The result is in screen pixels, i.e. the same
+ * coordinate space as Viewport::left/top and the capture region.
+ *
+ * @param vp The viewport to project into.
+ * @param x  X world coordinate.
+ * @param y  Y world coordinate.
+ * @param z  Z world coordinate.
+ * @return The screen position of the point.
+ */
+inline Point WorldToScreen(const Viewport &vp, int x, int y, int z)
+{
+	const Point world = RemapCoords(x, y, z);
+	const int mask = ScaleByZoom(-1, vp.zoom);
+	return {UnScaleByZoom(world.x - (vp.virtual_left & mask), vp.zoom) + vp.left,
+			UnScaleByZoom(world.y - (vp.virtual_top & mask), vp.zoom) + vp.top};
+}
+
+/**
+ * Report the camera of the main viewport and, on request, project a tile or a screen pixel.
+ *
+ * Read-only: nothing is scrolled or zoomed. The camera is described with the real viewport
+ * state (Viewport::left/top/width/height and virtual_left/top/width/height, the scroll
+ * position and the zoom level), so a caller can tell exactly which part of the map the
+ * screen shows. All screen coordinates are screen pixels of the current frame; the
+ * "coordinate_space" of every object says which space its numbers are in.
+ *
+ * Parameters (all optional, at most one projection per call):
+ * - "tile":        tile index to project to the screen.
+ * - "tile_x"/"tile_y": tile coordinates to project to the screen (instead of "tile").
+ * - "town":        town id; its centre tile is projected to the screen.
+ * - "center":      object with tile coordinates "x"/"y" to project to the screen.
+ * - "screen_x"/"screen_y": screen pixel to project to the map (both required).
+ * - "clamp_to_map": clamp the screen-to-tile result to the map (default true).
+ *
+ * The result always contains "ok": true, "tick", "coordinate_space" ("screen_pixels"),
+ * "game_mode", "in_game", "screen" (width/height of the frame), "viewport" (left, top,
+ * width, height, virtual_left, virtual_top, virtual_width, virtual_height, zoom,
+ * zoom_name) and "camera" (center_world, center_tile, scrollpos, dest_scrollpos, zoom,
+ * zoom_name). "center_tile" is the tile coordinate of the viewport centre, or null when the
+ * centre is outside the map; it is derived from the virtual centre, so use a projection for
+ * the terrain-aware answer.
+ *
+ * A requested projection is returned as "projection":
+ * - tile to screen: "coordinate_space": "screen_pixels", "tile" (index/x/y), "world"
+ *   (x/y/z of the tile centre at ground height), "screen" (x/y), "in_viewport", "visible",
+ *   "occluding_window" (null, or the class/number of the window covering that pixel) and
+ *   "zoom".
+ * - screen to tile: "coordinate_space": "world", "screen" (x/y), "world" (x/y as returned
+ *   by TranslateXYToTileCoord(), or null when the pixel is outside the viewport), "tile"
+ *   (tile coordinates of that world position, or null when it is outside the map),
+ *   "tile_index" (the tile index, or null), "in_viewport", "visible", "occluding_window",
+ *   "clamp_to_map" and "zoom".
+ *
+ * On failure the result contains "ok": false, "error" and "tick". Possible errors are
+ * "viewport_unavailable" (no main window with a viewport), "invalid_params" and
+ * "out_of_bounds" (the tile, town or tile coordinates are not on the map).
+ *
+ * Must be called from the main thread, like CaptureGameFrame().
+ *
+ * @param params The request parameters.
+ * @return The JSON result describing the camera and the projection.
+ */
+Json InspectGameViewport(const Json &params);
+
+/**
+ * Move and zoom the main viewport through the normal native UI camera APIs.
+ *
+ * This is a UI operation, not a simulation-memory change: the camera is moved with
+ * ScrollMainWindowToTile()/ScrollMainWindowTo() and zoomed with DoZoomInOutWindow(), the
+ * same calls the mouse and the zoom buttons use, so the game state is untouched. It must
+ * run on the main thread (the draw thread that executes VideoDriver::QueueOnMainThread
+ * callbacks), like CaptureGameFrame().
+ *
+ * Parameters (at least one of "tile"/"tile_x"/"tile_y"/"town"/"center", "scroll" or
+ * "zoom"/"zoom_delta" is required):
+ * - "tile":        tile index to centre on.
+ * - "tile_x"/"tile_y": tile coordinates to centre on (instead of "tile").
+ * - "town":        town id; centres on the town centre tile.
+ * - "center":      object with tile coordinates "x"/"y" to centre on.
+ * - "scroll":      object with "dx"/"dy" in screen pixels to pan by, from the current centre.
+ * - "zoom":        absolute zoom level (0 = 4x in, 2 = normal, 6 = 8x out), clamped to the
+ *                  user's zoom limits.
+ * - "zoom_delta":  relative zoom steps, clamped to the user's zoom limits.
+ * - "instant":     jump instead of scrolling smoothly (default true).
+ *
+ * The result contains "ok": true, "tick", "changed" (whether the camera actually moved),
+ * "instant", "zoom_clamped" (the requested zoom was outside the allowed range),
+ * "coordinate_space" ("screen_pixels"), "screen", "viewport" and "camera" in the same shape
+ * as InspectGameViewport(), describing the state after the change. With "instant": true the
+ * new position is applied before the result is built, so the reported state is the state the
+ * next frame is drawn from; with "instant": false the camera is still moving and
+ * "dest_scrollpos" is the destination.
+ *
+ * On failure the result contains "ok": false, "error" and "tick". Possible errors are
+ * "viewport_unavailable", "invalid_params" and "out_of_bounds".
+ *
+ * @param params The request parameters.
+ * @return The JSON result describing the resulting camera.
+ */
+Json SetGameCamera(const Json &params);
 
 } // namespace InGameAgent
 
