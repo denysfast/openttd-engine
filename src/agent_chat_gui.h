@@ -250,9 +250,10 @@ void AgentChatGuiTick();
  * - "input": current text of the message input.
  * - "widgets": object mapping widget names to rectangles, only present when the window is open.
  *   Names are caption, chat_list, chat_scroll, new_chat, transcript, transcript_scroll, tray,
- *   add_point, add_object, add_company, input, status, send, stop and closebox (the close box has no widget
- *   id of its own, so it is looked up in the nested tree; Esc closes the window as well). The
- *   caption is the title bar, i.e. the area a real input test can drag the window by.
+ *   add_point, add_object, add_company, add_setting, input, status, send, stop and closebox (the
+ *   close box has no widget id of its own, so it is looked up in the nested tree; Esc closes the
+ *   window as well). The caption is the title bar, i.e. the area a real input test can drag the
+ *   window by.
  * - "chats": array of {id, title, selected, task_active, status}. "task_active" stays true while
  *   the task of the chat is queued, running, stopping or settling, i.e. exactly while Stop is
  *   available; "status" is the translated status text of that task.
@@ -277,12 +278,25 @@ void AgentChatGuiTick();
  *   it shows, the hash of the pixels actually drawn in it (empty until they are loaded) and the
  *   size of the box. Nothing about the host is reported: no file path, no clipboard.
  * - "tray": array of {type, id, generation, tile, name, world_id, epoch, stale, generation_known,
- *   rect, remove_rect}.
+ *   rect, remove_rect}; a setting adds setting_name, scope and, for a company scoped setting,
+ *   company_id and company_generation.
  * - "candidates": array of {type, id, generation, name, world_id, epoch, rect}.
  *
  * A screenshot attachment is {type: "image", artifact_id, sha256, width, height, tick, world_id,
  * epoch, stale, generation_known}; it has no tile, no file path and no pixels of its own, so the
  * transcript reserves the box of its source aspect ratio and fetches the pixels separately.
+ *
+ * A setting attachment is {type: "setting", setting_name, scope, company_id, company_generation,
+ * name, world_id, epoch, stale, generation_known}: `setting_name` is the exact engine key of the
+ * setting and `scope` is the scope of its descriptor (game, client or company); together they are
+ * the identity of the reference and `name` is only the label the tray shows. Both are always
+ * present: the picker attaches the scope of the row, and a setting reference without a scope is
+ * rejected by the backend. A company scoped setting is owned, so it also carries `company_id` and
+ * the pinned `company_generation` of that company, and `generation_known` is false when the owner
+ * lifetime is missing. A game or client setting carries neither an id nor a generation nor a tile
+ * nor a fingerprint. The tray chip shows the exact engine key and, for a company scoped setting,
+ * the name of the company that owns it. The attachment carries no value: the value is read when the
+ * backend resolves the reference, and a changed value never makes the reference stale.
  *
  * An attachment is {type, id, generation, name, tile, world_id, epoch, stale, generation_known}:
  * the identity of a typed reference is kept as the backend reported it. "tile" is the array
@@ -294,6 +308,20 @@ void AgentChatGuiTick();
  * in the UI ("(stale)" / "(unverified)") and are still sent, the backend resolves them.
  * - "status_window": object {left, top, text, stop} with the position of the status window and
  *   the screen rectangles of its widgets, or null when it is not open.
+ * - "settings_picker": object {open, world_id, epoch, rect, search, owner, companies, total,
+ *   matching, selected, scroll{position, capacity, count}, widgets, rows} while the settings picker
+ *   is open, and {open: false} otherwise. "search" is the current filter text, "total" the number
+ *   of settings the picker offers, "matching" the number the filter leaves, "selected" the index of
+ *   the highlighted row in the filtered list, and "rows" the rows that are on screen as
+ *   {name, scope, value, selected, rect}. "name" is the exact engine key the attachment will carry
+ *   and the text the filter matches, "scope" the scope of its descriptor, "value" the current value
+ *   as the engine formats it for the selected owner. "owner" is the company the company settings
+ *   are shown for as {company_id, company_generation, name} (null when there is none) and
+ *   "companies" the companies the owner selector offers as
+ *   {company_id, name, company_generation, selected}. The widgets are caption, search, owner, list,
+ *   scroll, select, close and closebox. The picker belongs to the active chat: selecting or creating
+ *   another chat closes it, and a company that is removed or recreated while the owner dropdown is
+ *   open is refused instead of being re-pinned to a lifetime the player did not see.
  * - "chat_ack": the timing of the last chat Send acknowledgement, the same object that world.info
  *   reports as `timing.chat_ack` (see AgentChatSendAck::ToJson()). It is bound to the world and
  *   epoch it was measured in and is never mixed with a clock of the backend process.
@@ -303,5 +331,30 @@ void AgentChatGuiTick();
  * @return The description of the agent chat UI.
  */
 nlohmann::json DescribeAgentChatUi();
+
+/**
+ * The settings the settings picker offers, for the tests.
+ *
+ * It is exactly the list the picker builds and filters: every game, client and per-company setting
+ * this build has, sorted by key, with the same text and the same value the picker shows. Nothing
+ * here opens a window or changes a setting.
+ * @param filter The filter text of the search editbox; empty for every setting.
+ * @return Array of {name, scope, value}, one entry per matching setting, where "name" is the exact
+ *         engine key the attachment carries and "scope" the scope of its descriptor; a company
+ *         setting also carries the company_id and company_generation it is shown for.
+ */
+nlohmann::json SettingPickerRowsForTest(const std::string &filter);
+
+/**
+ * The label the attachment tray shows for a setting attachment, for the tests.
+ *
+ * The attachment is built exactly as the settings picker builds it (the exact engine key is both
+ * `setting_name` and the label `name`), so the test runs the real label code and not a copy of it.
+ * @param setting_name The exact engine key of the setting.
+ * @param scope The scope of the setting: game, client or company.
+ * @param company_id The owner of a company scoped setting, or -1 when it has none.
+ * @return The label of the tray chip.
+ */
+std::string SettingAttachmentLabelForTest(const std::string &setting_name, const std::string &scope, int32_t company_id);
 
 #endif /* AGENT_CHAT_GUI_H */

@@ -30,6 +30,9 @@
 #include "../openttd.h"
 #include "../rail_map.h"
 #include "../road.h"
+#include "../company_base.h"
+#include "../settings_internal.h"
+#include "../settings_type.h"
 #include "../road_map.h"
 #include "../station_map.h"
 #include "../station_type.h"
@@ -681,4 +684,321 @@ TEST_CASE("Agent bridge refs: a pending load belongs to one world, epoch and pla
 	/* A world reset drops the armed load, so a late acknowledgement cannot apply it. */
 	ResetWorld();
 	CHECK_FALSE(HasPendingLoad());
+}
+
+/**
+ * The exact engine key of a setting, or the canonical name the engine resolved it to.
+ * @param name The key the reference named.
+ * @return The canonical name, or an empty string when this build has no such setting.
+ */
+static std::string CanonicalSettingName(const std::string &name)
+{
+	const SettingDesc *sd = GetSettingFromName(name);
+	return sd != nullptr ? sd->GetName() : std::string();
+}
+
+/**
+ * One real company in the company pool, removed again when the fixture goes out of scope.
+ *
+ * A company setting is read from the settings of a company, so the test needs a company that
+ * really exists in the pool: the id and the lifetime generation are the ones the engine hands out,
+ * which is what a company scoped reference has to name.
+ */
+class TestCompany {
+public:
+	explicit TestCompany(CompanyID id)
+	{
+		REQUIRE_FALSE(Company::IsValidID(id));
+		this->company = Company::CreateAtIndex(id);
+		REQUIRE(this->company != nullptr);
+	}
+
+	~TestCompany() { delete this->company; }
+
+	/** The lifetime generation of the company, as a reference names it. */
+	int64_t Generation() const { return static_cast<int64_t>(this->company->generation); }
+
+	Company *company = nullptr; ///< The company the fixture created.
+};
+
+/**
+ * Build a company scoped reference to a company setting.
+ * @param name The exact engine key.
+ * @param company The owner.
+ * @param generation The lifetime generation of the owner.
+ * @return The reference.
+ */
+static Json CompanySettingRef(const std::string &name, CompanyID company, int64_t generation)
+{
+	return Json{{"type", "setting"}, {"setting_name", name}, {"scope", "company"},
+			{"company_id", company.base()}, {"company_generation", generation}};
+}
+
+TEST_CASE("Agent bridge refs: a setting is identified by its exact engine key and scope")
+{
+	/* A setting is not a map object, so no map is needed; the game settings object is the one a
+	 * running game reads, so the mode is set to a running game for the duration. */
+	const GameMode previous_mode = _game_mode;
+	_game_mode = GameMode::Normal;
+
+	REQUIRE(CanonicalSettingName("economy.town_growth_rate") == "economy.town_growth_rate");
+	const uint8_t growth_before = _settings_game.economy.town_growth_rate;
+
+	const Json ref = {{"type", "setting"}, {"setting_name", "economy.town_growth_rate"}, {"scope", "game"}};
+	const Json resolved = ResolveObjectRef(ref, false);
+	REQUIRE(resolved["found"] == true);
+	CHECK(resolved["type"] == "setting");
+	CHECK(resolved["identity"] == "setting");
+	CHECK(resolved["setting_name"] == "economy.town_growth_rate");
+	CHECK(resolved["scope"] == "game");
+	/* A game setting has no owner, no id, no generation, no tile and no fingerprint. */
+	CHECK_FALSE(resolved.contains("company_id"));
+	CHECK_FALSE(resolved.contains("company_generation"));
+	CHECK_FALSE(resolved.contains("id"));
+	CHECK_FALSE(resolved.contains("generation"));
+	CHECK_FALSE(resolved.contains("tile"));
+	CHECK_FALSE(resolved.contains("fingerprint"));
+	/* The value is the engine's own typed value of that setting, not a formatted or guessed one. */
+	REQUIRE(resolved["value"].is_number_integer());
+	CHECK(resolved["value"].get<int32_t>() == static_cast<int32_t>(_settings_game.economy.town_growth_rate));
+	REQUIRE(resolved["value_text"].is_string());
+	CHECK_FALSE(resolved["value_text"].get<std::string>().empty());
+
+	/* The value is not part of the identity: changing it keeps the reference current, and a write
+	 * that names the key stays valid. */
+	_settings_game.economy.town_growth_rate = growth_before == 4 ? 3 : static_cast<uint8_t>(growth_before + 1);
+	const Json after_value_change = ResolveObjectRef(ref, true);
+	REQUIRE(after_value_change["found"] == true);
+	CHECK(after_value_change["value"].get<int32_t>() == static_cast<int32_t>(_settings_game.economy.town_growth_rate));
+	CHECK(after_value_change["value"] != resolved["value"]);
+	_settings_game.economy.town_growth_rate = growth_before;
+
+	/* A boolean setting has a boolean value, and a client setting names its own scope. */
+	const Json boolean = ResolveObjectRef(Json{{"type", "setting"}, {"setting_name", "economy.inflation"}, {"scope", "game"}}, false);
+	REQUIRE(boolean["found"] == true);
+	CHECK(boolean["scope"] == "game");
+	REQUIRE(boolean["value"].is_boolean());
+	CHECK(boolean["value"].get<bool>() == _settings_game.economy.inflation);
+
+	const Json client = ResolveObjectRef(Json{{"type", "setting"}, {"setting_name", "gui.auto_remove_signals"}, {"scope", "client"}}, false);
+	REQUIRE(client["found"] == true);
+	CHECK(client["scope"] == "client");
+	REQUIRE(client["value"].is_boolean());
+	CHECK(client["value"].get<bool>() == _settings_client.gui.auto_remove_signals);
+	CHECK_FALSE(client.contains("company_id"));
+
+	_game_mode = previous_mode;
+}
+
+TEST_CASE("Agent bridge refs: a company setting is owned by one company lifetime")
+{
+	/* The key of a per-company setting is the bare key of the company settings table. */
+	REQUIRE(CanonicalSettingName("engine_renew") == "engine_renew");
+
+	const CompanyID owner_id(0);
+	TestCompany owner(owner_id);
+	const int64_t generation = owner.Generation();
+	const bool renew_before = owner.company->settings.engine_renew;
+
+	const Json ref = CompanySettingRef("engine_renew", owner_id, generation);
+	const Json resolved = ResolveObjectRef(ref, false);
+	REQUIRE(resolved["found"] == true);
+	CHECK(resolved["setting_name"] == "engine_renew");
+	CHECK(resolved["scope"] == "company");
+	CHECK(resolved["company_id"] == owner_id.base());
+	CHECK(resolved["company_generation"] == generation);
+	/* The value is the value of that company, read through the descriptor of the setting. */
+	REQUIRE(resolved["value"].is_boolean());
+	CHECK(resolved["value"].get<bool>() == renew_before);
+
+	/* Another company's value is never substituted, and the value is not part of the identity:
+	 * changing it keeps the same owner reference current. */
+	owner.company->settings.engine_renew = !renew_before;
+	const Json after_value_change = ResolveObjectRef(ref, true);
+	REQUIRE(after_value_change["found"] == true);
+	CHECK(after_value_change["value"].get<bool>() == !renew_before);
+	CHECK(after_value_change["company_generation"] == generation);
+	owner.company->settings.engine_renew = renew_before;
+
+	/* A company scoped reference has to name its owner; the current actor is never used instead. */
+	const Json no_id = ResolveObjectRef(Json{{"type", "setting"}, {"setting_name", "engine_renew"}, {"scope", "company"}, {"company_generation", generation}}, false);
+	CHECK(no_id["found"] == false);
+	CHECK(no_id["error"] == "invalid_params");
+	CHECK(no_id["reason"] == "missing_company_id");
+
+	const Json no_generation = ResolveObjectRef(Json{{"type", "setting"}, {"setting_name", "engine_renew"}, {"scope", "company"}, {"company_id", owner_id.base()}}, false);
+	CHECK(no_generation["found"] == false);
+	CHECK(no_generation["error"] == "invalid_params");
+	CHECK(no_generation["reason"] == "missing_company_generation");
+
+	/* A company that is gone fails closed, and so does the id that was handed to another company. */
+	const Json deleted = ResolveObjectRef(CompanySettingRef("engine_renew", CompanyID(1), generation), false);
+	CHECK(deleted["found"] == false);
+	CHECK(deleted["error"] == "stale_ref");
+	CHECK(deleted["reason"] == "company_deleted");
+
+	const Json reused = ResolveObjectRef(CompanySettingRef("engine_renew", owner_id, generation + 1), false);
+	CHECK(reused["found"] == false);
+	CHECK(reused["error"] == "stale_ref");
+	CHECK(reused["reason"] == "company_lifetime_mismatch");
+	CHECK(reused["company_generation_now"] == generation);
+
+	/* A recreated company holds the same id but is another company. */
+	delete owner.company;
+	owner.company = Company::CreateAtIndex(owner_id);
+	REQUIRE(owner.company != nullptr);
+	REQUIRE(owner.Generation() != generation);
+	const Json after_reuse = ResolveObjectRef(ref, false);
+	CHECK(after_reuse["found"] == false);
+	CHECK(after_reuse["error"] == "stale_ref");
+	CHECK(after_reuse["reason"] == "company_lifetime_mismatch");
+	CHECK(after_reuse["company_generation_now"] == owner.Generation());
+}
+
+TEST_CASE("Agent bridge refs: the scope of a setting reference must be its own")
+{
+	const CompanyID owner_id(0);
+	TestCompany owner(owner_id);
+
+	/* A game setting is not owned by a company, and a company setting is not a game setting. */
+	const Json game_as_company = ResolveObjectRef(Json{{"type", "setting"}, {"setting_name", "economy.town_growth_rate"}, {"scope", "company"},
+			{"company_id", owner_id.base()}, {"company_generation", owner.Generation()}}, false);
+	CHECK(game_as_company["found"] == false);
+	CHECK(game_as_company["error"] == "stale_ref");
+	CHECK(game_as_company["reason"] == "scope_mismatch");
+	CHECK(game_as_company["scope"] == "game");
+
+	const Json company_as_game = ResolveObjectRef(Json{{"type", "setting"}, {"setting_name", "engine_renew"}, {"scope", "game"}}, false);
+	CHECK(company_as_game["found"] == false);
+	CHECK(company_as_game["reason"] == "scope_mismatch");
+	CHECK(company_as_game["scope"] == "company");
+
+	const Json client_as_game = ResolveObjectRef(Json{{"type", "setting"}, {"setting_name", "gui.auto_remove_signals"}, {"scope", "game"}}, false);
+	CHECK(client_as_game["found"] == false);
+	CHECK(client_as_game["reason"] == "scope_mismatch");
+	CHECK(client_as_game["scope"] == "client");
+
+	/* The same key with the scope of its own descriptor resolves, so the rejection above is the
+	 * scope and not the key. */
+	const Json game_as_game = ResolveObjectRef(Json{{"type", "setting"}, {"setting_name", "economy.town_growth_rate"}, {"scope", "game"}}, false);
+	CHECK(game_as_game["found"] == true);
+	const Json company_as_company = ResolveObjectRef(CompanySettingRef("engine_renew", owner_id, owner.Generation()), false);
+	CHECK(company_as_company["found"] == true);
+}
+
+TEST_CASE("Agent bridge refs: a setting reference must name its scope")
+{
+	const CompanyID owner_id(0);
+	TestCompany owner(owner_id);
+
+	/* The scope is part of the identity of every setting, game and client settings included, and it
+	 * is never inferred from the key: a reference without it is incomplete, not a shortcut. */
+	const Json game = ResolveObjectRef(Json{{"type", "setting"}, {"setting_name", "economy.town_growth_rate"}}, false);
+	CHECK(game["found"] == false);
+	CHECK(game["error"] == "invalid_params");
+	CHECK(game["reason"] == "missing_scope");
+	CHECK(game["setting_name"] == "economy.town_growth_rate");
+	/* The answer says which scope the key really has, so the caller can complete its reference. */
+	CHECK(game["scope"] == "game");
+
+	const Json client = ResolveObjectRef(Json{{"type", "setting"}, {"setting_name", "gui.auto_remove_signals"}}, false);
+	CHECK(client["found"] == false);
+	CHECK(client["error"] == "invalid_params");
+	CHECK(client["reason"] == "missing_scope");
+	CHECK(client["scope"] == "client");
+
+	/* A company setting without a scope fails the same way, even when the owner is named. */
+	const Json company = ResolveObjectRef(Json{{"type", "setting"}, {"setting_name", "engine_renew"},
+			{"company_id", owner_id.base()}, {"company_generation", owner.Generation()}}, false);
+	CHECK(company["found"] == false);
+	CHECK(company["error"] == "invalid_params");
+	CHECK(company["reason"] == "missing_scope");
+	CHECK(company["scope"] == "company");
+
+	/* An empty or a non-string scope names no scope either. */
+	const Json empty_scope = ResolveObjectRef(Json{{"type", "setting"}, {"setting_name", "economy.town_growth_rate"}, {"scope", ""}}, false);
+	CHECK(empty_scope["found"] == false);
+	CHECK(empty_scope["reason"] == "missing_scope");
+
+	const Json scope_not_a_string = ResolveObjectRef(Json{{"type", "setting"}, {"setting_name", "economy.town_growth_rate"}, {"scope", 3}}, false);
+	CHECK(scope_not_a_string["found"] == false);
+	CHECK(scope_not_a_string["error"] == "invalid_params");
+	CHECK(scope_not_a_string["reason"] == "missing_scope");
+
+	/* Naming the scope the descriptor has resolves the same key, so the scope is the only
+	 * difference between the failing and the resolving reference. */
+	const Json with_scope = ResolveObjectRef(Json{{"type", "setting"}, {"setting_name", "economy.town_growth_rate"}, {"scope", "game"}}, false);
+	REQUIRE(with_scope["found"] == true);
+	CHECK(with_scope["scope"] == "game");
+}
+
+TEST_CASE("Agent bridge refs: a setting key this build does not have is rejected")
+{
+	/* An unknown key is not a stale reference: there is no such setting to be current or not. The
+	 * references here leave the scope out on purpose - the key is resolved first, so a key error is
+	 * reported as such and not as a missing scope. */
+	const Json unknown = ResolveObjectRef(Json{{"type", "setting"}, {"setting_name", "economy.no_such_setting"}}, false);
+	CHECK(unknown["found"] == false);
+	CHECK(unknown["error"] == "unknown_setting");
+	CHECK(unknown["reason"] == "setting_not_found");
+	CHECK(unknown["setting_name"] == "economy.no_such_setting");
+	CHECK_FALSE(unknown.contains("canonical_name"));
+
+	/* A shortcut or an alias the engine would also accept is not the exact key the caller named,
+	 * so it is reported together with the canonical name instead of resolving to another setting. */
+	const Json alias = ResolveObjectRef(Json{{"type", "setting"}, {"setting_name", "company.engine_renew"}}, false);
+	CHECK(alias["found"] == false);
+	CHECK(alias["error"] == "unknown_setting");
+	CHECK(alias["canonical_name"] == "engine_renew");
+
+	const Json shortcut = ResolveObjectRef(Json{{"type", "setting"}, {"setting_name", "town_growth_rate"}}, false);
+	CHECK(shortcut["found"] == false);
+	CHECK(shortcut["canonical_name"] == "economy.town_growth_rate");
+
+	/* A reference without a key is an invalid argument, not an unknown setting. */
+	const Json missing = ResolveObjectRef(Json{{"type", "setting"}}, false);
+	CHECK(missing["found"] == false);
+	CHECK(missing["error"] == "invalid_params");
+	CHECK(missing["reason"] == "missing_setting_name");
+
+	const Json not_a_string = ResolveObjectRef(Json{{"type", "setting"}, {"setting_name", 12}}, false);
+	CHECK(not_a_string["found"] == false);
+	CHECK(not_a_string["error"] == "invalid_params");
+	CHECK(not_a_string["reason"] == "missing_setting_name");
+}
+
+TEST_CASE("Agent bridge refs: a setting reference belongs to one world and epoch")
+{
+	const GameMode previous_mode = _game_mode;
+	_game_mode = GameMode::Normal;
+
+	const Json context = Context();
+	const std::string world_id = context["world_id"].get<std::string>();
+	const std::string epoch = context["epoch"].get<std::string>();
+	REQUIRE_FALSE(world_id.empty());
+
+	Json ref = {{"type", "setting"}, {"setting_name", "economy.town_growth_rate"}, {"scope", "game"}, {"world_id", world_id}};
+	if (!epoch.empty()) ref["epoch"] = epoch;
+	CHECK(ResolveObjectRef(ref, false)["found"] == true);
+
+	/* A reference of another world or epoch can never resolve, whatever the key is. */
+	const Json other_world = ResolveObjectRef(Json{{"type", "setting"}, {"setting_name", "economy.town_growth_rate"}, {"scope", "game"}, {"world_id", "world-of-another-savegame"}}, false);
+	CHECK(other_world["found"] == false);
+	CHECK(other_world["error"] == "stale_ref");
+	CHECK(other_world["reason"] == "world_mismatch");
+
+	const Json other_epoch = ResolveObjectRef(Json{{"type", "setting"}, {"setting_name", "economy.town_growth_rate"}, {"scope", "game"}, {"epoch", "epoch-of-another-load"}}, false);
+	CHECK(other_epoch["found"] == false);
+	CHECK(other_epoch["error"] == "stale_ref");
+	CHECK(other_epoch["reason"] == "epoch_mismatch");
+
+	/* A load starts a new epoch and a new world, so the reference of the world that was left is
+	 * stale afterwards - the key still exists, the world it named does not. */
+	ResetWorld();
+	const Json stale = ResolveObjectRef(ref, false);
+	CHECK(stale["found"] == false);
+	CHECK(stale["error"] == "stale_ref");
+	CHECK(stale["reason"] == "world_mismatch");
+
+	_game_mode = previous_mode;
 }

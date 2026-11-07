@@ -30,6 +30,7 @@ add_test_files(
     test_agent_chat_image.cpp
     test_agent_chat_selection.cpp
     test_agent_chat_send_ack.cpp
+    test_agent_chat_settings.cpp
     test_agent_command_catalog.cpp
     test_agent_company_economy.cpp
     test_agent_game_tools.cpp

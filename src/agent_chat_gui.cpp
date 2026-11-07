@@ -24,7 +24,12 @@
 #include "core/utf8.hpp"
 #include "gfx_func.h"
 #include "gfx_layout.h"
+#include "dropdown_func.h"
 #include "map_func.h"
+#include "querystring_gui.h"
+#include "settings_internal.h"
+#include "settings_table.h"
+#include "settings_type.h"
 #include "string_func.h"
 #include "strings_func.h"
 #include "tilehighlight_func.h"
@@ -88,6 +93,10 @@ struct AgentChatAttachment {
 	int64_t generation = -1;        ///< Lifetime generation of the object, -1 when the backend did not report one.
 	TileIndex tile = INVALID_TILE;  ///< Tile of a point or tile reference, or the location of an object.
 	std::string name;               ///< Human readable name, shown in the attachment tray.
+	std::string setting_name;       ///< Exact engine key of a setting reference, the identity of the reference.
+	std::string scope;              ///< Scope of a setting reference: "game", "client" or "company".
+	int32_t company_id = -1;        ///< Company that owns a company scoped setting, -1 when the reference has no owner.
+	int64_t company_generation = -1; ///< Lifetime generation of that company, -1 when it is unknown.
 	std::string what;               ///< Extra classification of a tile reference.
 	std::string world_id;           ///< World the reference was created in.
 	std::string epoch;              ///< Load epoch the reference was created in.
@@ -307,6 +316,7 @@ static std::string GetAttachmentTypeName(const std::string &type)
 	if (type == "group") return GetString(STR_AGENT_CHAT_TYPE_GROUP);
 	if (type == "engine") return GetString(STR_AGENT_CHAT_TYPE_ENGINE);
 	if (type == "cargo") return GetString(STR_AGENT_CHAT_TYPE_CARGO);
+	if (type == "setting") return GetString(STR_AGENT_CHAT_TYPE_SETTING);
 	if (type == "object" || type == "mapobject") return GetString(STR_AGENT_CHAT_TYPE_OBJECT);
 	if (type == "image") return GetString(STR_AGENT_CHAT_TYPE_IMAGE);
 
@@ -413,12 +423,34 @@ static bool IsImageAttachment(const AgentChatAttachment &attachment)
 }
 
 /**
+ * Get the label of the company that owns a company scoped setting.
+ * @param company The company.
+ * @return The name of the company, or a plain id when that company is gone.
+ */
+static std::string SettingOwnerLabel(CompanyID company)
+{
+	const Company *c = Company::GetIfValid(company);
+	if (c == nullptr) return GetString(STR_AGENT_CHAT_ATTACHMENT_COMPANY_ID, company.base());
+	if (!c->name.empty()) return SanitiseBackendText(c->name);
+	return GetString(STR_COMPANY_NAME, company.base());
+}
+
+/**
  * Get the label of an attachment, as shown in the attachment tray.
  * @param attachment The attachment.
  * @return The label.
  */
 static std::string GetAttachmentLabel(const AgentChatAttachment &attachment)
 {
+	/* A setting has no id and no tile: its exact engine key is the name a player can check, and a
+	 * company scoped setting also names the company that owns it, because the same key holds a
+	 * different value for every company. This comes before the generic name, because the picker
+	 * stores that same key as the label and the owner would otherwise never be shown. */
+	if (!attachment.setting_name.empty()) {
+		const std::string key = SanitiseBackendText(attachment.setting_name);
+		if (attachment.scope != "company" || attachment.company_id < 0) return key;
+		return GetString(STR_AGENT_CHAT_ATTACHMENT_SETTING_COMPANY, key, SettingOwnerLabel(CompanyID(attachment.company_id)));
+	}
 	if (!attachment.name.empty()) return SanitiseBackendText(attachment.name);
 	/* A pooled object is named by its id; a typed tile object has no id of its own and is named
 	 * by its category, subtype and location instead. */
@@ -432,6 +464,10 @@ static std::string GetAttachmentLabel(const AgentChatAttachment &attachment)
 
 /**
  * Check whether an attachment refers to an object of another world or epoch.
+ *
+ * A setting reference also names its scope, so one without a scope cannot resolve at all, and a
+ * company scoped setting is stale when the company that owns it is gone or was recreated: the id
+ * alone is not an identity, so the reference cannot resolve to that company any more.
  * @param attachment The attachment.
  * @return \c true when the reference cannot be resolved in the current world.
  */
@@ -439,6 +475,11 @@ static bool IsAttachmentStale(const AgentChatAttachment &attachment)
 {
 	if (!attachment.world_id.empty() && attachment.world_id != _agent_chat.world_id) return true;
 	if (!attachment.epoch.empty() && attachment.epoch != _agent_chat.epoch) return true;
+	if (attachment.type == "setting" && attachment.scope.empty()) return true;
+	if (attachment.type == "setting" && attachment.scope == "company" && attachment.company_id >= 0) {
+		const Company *company = Company::GetIfValid(CompanyID(attachment.company_id));
+		if (company == nullptr || attachment.company_generation < 0 || GetPoolGeneration(*company) != attachment.company_generation) return true;
+	}
 	return false;
 }
 
@@ -470,6 +511,8 @@ static bool IsPooledAttachmentType(const std::string &type)
 static bool IsAttachmentGenerationUnknown(const AgentChatAttachment &attachment)
 {
 	if (attachment.generation >= 0) return false;
+	/* A company scoped setting is owned by one company lifetime, which is its generation. */
+	if (attachment.type == "setting" && attachment.scope == "company") return attachment.company_generation < 0;
 	return IsPooledAttachmentType(attachment.type);
 }
 
@@ -517,6 +560,11 @@ static Json AttachmentToJson(const AgentChatAttachment &attachment)
 	/* Always write the canonical object shape; the array form is only read for compatibility. */
 	if (attachment.tile != INVALID_TILE) j["tile"] = Json{{"x", TileX(attachment.tile)}, {"y", TileY(attachment.tile)}};
 	if (!attachment.name.empty()) j["name"] = attachment.name;
+	if (!attachment.setting_name.empty()) j["setting_name"] = attachment.setting_name;
+	if (!attachment.scope.empty()) j["scope"] = attachment.scope;
+	/* A company scoped setting is owned: the id alone is not an identity, the lifetime is. */
+	if (attachment.company_id >= 0) j["company_id"] = attachment.company_id;
+	if (attachment.company_generation >= 0) j["company_generation"] = attachment.company_generation;
 	if (!attachment.what.empty()) j["what"] = attachment.what;
 	if (!attachment.world_id.empty()) j["world_id"] = attachment.world_id;
 	if (!attachment.epoch.empty()) j["epoch"] = attachment.epoch;
@@ -593,6 +641,10 @@ static AgentChatAttachment ParseAttachment(const Json &j)
 	attachment.id = static_cast<int32_t>(JsonInt(j, "id", -1));
 	attachment.generation = JsonInt(j, "generation", -1);
 	attachment.name = JsonString(j, "name");
+	attachment.setting_name = JsonString(j, "setting_name");
+	attachment.scope = JsonString(j, "scope");
+	attachment.company_id = static_cast<int32_t>(JsonInt(j, "company_id", -1));
+	attachment.company_generation = JsonInt(j, "company_generation", -1);
 	attachment.what = JsonString(j, "what");
 	attachment.world_id = JsonString(j, "world_id");
 	attachment.epoch = JsonString(j, "epoch");
@@ -606,7 +658,7 @@ static AgentChatAttachment ParseAttachment(const Json &j)
 	if (j.is_object()) {
 		for (auto it = j.begin(); it != j.end(); ++it) {
 			const std::string &key = it.key();
-			if (key == "type" || key == "id" || key == "generation" || key == "tile" || key == "name" || key == "what" || key == "world_id" || key == "epoch" ||
+			if (key == "type" || key == "id" || key == "generation" || key == "tile" || key == "name" || key == "setting_name" || key == "scope" || key == "company_id" || key == "company_generation" || key == "what" || key == "world_id" || key == "epoch" ||
 					key == "artifact_id" || key == "sha256" || key == "width" || key == "height" || key == "tick") continue;
 			attachment.extra[key] = it.value();
 		}
@@ -742,6 +794,7 @@ static void InvalidateAgentChatWindows()
 	InvalidateWindowClassesData(WindowClass::AgentChat, 0);
 	SetWindowClassesDirty(WindowClass::AgentChat);
 	SetWindowClassesDirty(WindowClass::AgentChatStatus);
+	SetWindowClassesDirty(WindowClass::AgentChatSettings);
 }
 
 /**
@@ -826,6 +879,21 @@ static void AgentChatRequest(const std::string &method, const std::string &path,
 /** Undo the shade the chat window took to uncover the map while a click was awaited. */
 static void RestoreAgentChatPickingShade();
 
+/** Open the settings picker of the chat window. */
+static void ShowAgentChatSettingPicker();
+
+/**
+ * Close the settings picker of the chat window.
+ *
+ * The picker belongs to the chat it was opened in, like the candidate list: a chat that is created
+ * or selected while it is open gets its own picker, so a choice made for one chat can never land in
+ * another. The draft and the attachment tray are not chat scoped, so they are left alone.
+ */
+static void CloseSettingPicker()
+{
+	CloseWindowByClass(WindowClass::AgentChatSettings);
+}
+
 /** Read the world context of the transport, resetting the chat list when the world changed. */
 static void AgentChatSyncContext()
 {
@@ -855,6 +923,9 @@ static void AgentChatSyncContext()
 		}
 		/* A tile of the old world cannot be picked any more, so the window must not stay shaded. */
 		RestoreAgentChatPickingShade();
+		/* The settings picker shows values of the world that was left, so it is closed with it and
+		 * cannot attach a reference of the old epoch. */
+		CloseWindowByClass(WindowClass::AgentChatSettings);
 		/* The text draft does not refer to the world, so it is kept on purpose. */
 		/* A submission of the world that was left can no longer be answered, and a late answer of
 		 * it must not end the feedback of the new world. The last painted timing keeps the world
@@ -952,8 +1023,10 @@ static void AgentChatLoadChats()
 		}
 		if (_agent_chat.active < 0 && !_agent_chat.chats.empty()) _agent_chat.active = 0;
 
-		/* The selection belongs to the chat it was made in: another chat drops it. */
+		/* The selection and the settings picker belong to the chat they were made in: another chat
+		 * drops them. */
 		const AgentChatEntry *active = GetActiveChat();
+		if ((active != nullptr ? active->id : std::string()) != previous) CloseSettingPicker();
 		BindTranscriptSelection(active);
 
 		if (active != nullptr) AgentChatLoadMessages(active->id);
@@ -1010,6 +1083,9 @@ static void AgentChatCreateChat(std::function<void(const std::string &)> then = 
 		_agent_chat.active = static_cast<int>(_agent_chat.chats.size() - 1);
 		_agent_chat.chats_loaded = true;
 		_agent_chat.selection.BindChat(chat_id, _agent_chat.world_id, _agent_chat.epoch);
+		/* The created chat is the active one now, so a picker that was open for the chat the player
+		 * was looking at is closed with it. The draft and the tray keep their existing policy. */
+		CloseSettingPicker();
 
 		if (then) then(chat_id);
 	}, [on_failure]() {
@@ -2386,6 +2462,9 @@ struct AgentChatWindow : Window {
 			case WID_AC_ADD_COMPANY:
 				this->ShowCompanyCandidates();
 				break;
+			case WID_AC_ADD_SETTING:
+				ShowAgentChatSettingPicker();
+				break;
 
 			case WID_AC_CHAT_LIST:
 				this->ClickChatList(pt);
@@ -2424,6 +2503,8 @@ struct AgentChatWindow : Window {
 		_agent_chat.active = row;
 		_agent_chat.scroll = INT32_MAX;
 		_agent_chat.candidates_open = false;
+		/* The picker was opened for the chat that is left, so it closes with the switch. */
+		CloseSettingPicker();
 		AgentChatLoadMessages(_agent_chat.chats[row].id);
 		AgentChatPollEvents(_agent_chat.chats[row].id);
 		this->UpdateWidgetStates();
@@ -3217,7 +3298,537 @@ struct AgentChatWindow : Window {
 		this->UpdateScrollbars();
 		this->SetDirty();
 	}
+
+	void Close([[maybe_unused]] int data = 0) override
+	{
+		/* The settings picker attaches to the message of this window, so it is scoped to it and
+		 * does not outlive it. */
+		CloseWindowByClass(WindowClass::AgentChatSettings);
+		this->Window::Close();
+	}
 };
+
+/* --- Settings picker --- */
+
+/**
+ * One setting the settings picker offers.
+ *
+ * The key is the identity of the reference that is attached: the current value is only shown, so
+ * the player can tell two similar keys apart, and it is never part of the reference.
+ */
+struct AgentSettingPickerRow {
+	std::string name;       ///< Exact engine key of the setting.
+	std::string scope;      ///< Scope of the setting, "game", "client" or "company".
+	std::string value_text; ///< Current value, as the engine formats it, for the selected owner.
+};
+
+/**
+ * One company the owner selector offered, with the lifetime the player was shown.
+ *
+ * The dropdown is a snapshot: a company that is removed or recreated between opening the dropdown
+ * and choosing a row must not be silently replaced by whichever company holds the id then, so the
+ * lifetime that was shown is kept and checked against the company that exists when it is chosen.
+ */
+struct AgentSettingPickerOwner {
+	CompanyID company;  ///< The company the dropdown offered.
+	int64_t generation; ///< Lifetime generation of that company when the dropdown was opened.
+};
+
+/**
+ * Name of the scope of a setting, as the protocol names it.
+ * @param type The setting type.
+ * @return The scope name.
+ */
+static std::string_view SettingScopeOf(SettingType type)
+{
+	switch (type) {
+		case ST_GAME: return "game";
+		case ST_CLIENT: return "client";
+		case ST_COMPANY: return "company";
+		default: return "unknown";
+	}
+}
+
+/**
+ * The object a setting of the picker is read from.
+ *
+ * A per-company setting is read from the selected owner and from nothing else, exactly like the
+ * bridge resolves a company scoped reference: the picker never shows the client's company defaults
+ * or the value of whichever company the actor happens to be. Game and client settings keep the
+ * object their scope names.
+ * @param sd The setting.
+ * @param owner The company the picker shows company settings for; it must be valid for them.
+ * @return The object the setting lives in.
+ */
+static const void *SettingPickerObject(const SettingDesc &sd, CompanyID owner)
+{
+	switch (sd.GetType()) {
+		case ST_GAME: return &GetGameSettings();
+		case ST_CLIENT: return &_settings_client;
+		case ST_COMPANY: return &Company::Get(owner)->settings;
+		default: NOT_REACHED();
+	}
+}
+
+/**
+ * The company the picker shows company settings for when it opens.
+ *
+ * The owner of the chat is the local company. It is only used when that company really exists, so
+ * an empty pool never turns into a guessed company 0; otherwise the first company of the game is
+ * used, and a game without companies leaves the picker without an owner.
+ * @return The company, or CompanyID::Invalid() when there is none.
+ */
+static CompanyID DefaultSettingPickerOwner()
+{
+	if (Company::IsValidID(_local_company)) return _local_company;
+	for (const Company *company : Company::Iterate()) return company->index;
+	return CompanyID::Invalid();
+}
+
+/**
+ * Every setting the picker offers, sorted by key.
+ *
+ * The list is built from the engine's own descriptors, so the picker offers exactly the settings
+ * this build has: a setting that is not valid in this savegame version is left out, and a setting
+ * added to the tables later needs no change here. The private and secret tables are left out on
+ * purpose - a secret setting's value is a credential, and the picker shows values. The key is also
+ * what the filter matches, so the list stays searchable without a translated title.
+ * @param owner The company the values of company settings are read from.
+ * @return The rows of the picker, sorted by key.
+ */
+static std::vector<AgentSettingPickerRow> BuildSettingPickerRows(CompanyID owner)
+{
+	std::vector<AgentSettingPickerRow> rows;
+	auto add = [&rows, owner](const SettingDesc &sd) {
+		if (!SlIsObjectCurrentlyValid(sd.save.version_from, sd.save.version_to)) return;
+
+		const SettingType type = sd.GetType();
+		AgentSettingPickerRow row;
+		row.name = sd.GetName();
+		row.scope = std::string(SettingScopeOf(type));
+		/* A company setting has no value without an owner, and the picker never shows another
+		 * company's value or the client defaults instead. */
+		if (type == ST_COMPANY && !Company::IsValidID(owner)) {
+			rows.push_back(std::move(row));
+			return;
+		}
+		row.value_text = sd.FormatValue(SettingPickerObject(sd, owner));
+		rows.push_back(std::move(row));
+	};
+
+	for (const SettingDesc *sd : GetFilteredSettingCollection([](const SettingDesc &) { return true; })) add(*sd);
+	for (const SettingVariant &desc : _company_settings) add(*GetSettingDesc(desc));
+
+	std::sort(rows.begin(), rows.end(), [](const AgentSettingPickerRow &a, const AgentSettingPickerRow &b) { return a.name < b.name; });
+	return rows;
+}
+
+/**
+ * Check whether a setting row matches the filter text.
+ * @param row The row.
+ * @param filter The search text; empty matches every row.
+ * @return \c true when the exact key contains the text.
+ */
+static bool SettingRowMatches(const AgentSettingPickerRow &row, std::string_view filter)
+{
+	return filter.empty() || StrContainsIgnoreCase(row.name, filter);
+}
+
+/** Height of one row of the settings picker, in pixels. */
+static int GetSettingPickerRowHeight()
+{
+	return GetCharacterHeight(FontSize::Normal) + WidgetDimensions::scaled.vsep_normal;
+}
+
+/** The native settings picker of the agent chat window. */
+struct AgentChatSettingsWindow : Window {
+	QueryString search_editbox;              ///< Filter editbox; a QueryString, so typing and the on-screen keyboard work as in every other list filter.
+	Scrollbar *vscroll = nullptr;            ///< Scrollbar of the setting list.
+	std::string world_id;                    ///< World the picker was opened in.
+	std::string epoch;                       ///< Load epoch the picker was opened in.
+	CompanyID owner = CompanyID::Invalid();  ///< Company whose values the company settings show.
+	int64_t owner_generation = -1;           ///< Lifetime of #owner, pinned when the picker opens or an owner is chosen.
+	std::vector<AgentSettingPickerOwner> offered_owners; ///< Companies the open owner dropdown offered, with the lifetimes shown.
+	std::vector<AgentSettingPickerRow> rows; ///< Every setting the picker offers, sorted by key.
+	std::vector<size_t> visible;             ///< Indices of #rows that match the filter.
+	size_t selected = 0;                     ///< Index into #visible of the highlighted row.
+
+	AgentChatSettingsWindow(WindowDesc &desc) : Window(desc), search_editbox(64)
+	{
+		this->world_id = _agent_chat.world_id;
+		this->epoch = _agent_chat.epoch;
+		this->owner = DefaultSettingPickerOwner();
+		this->PinOwner();
+		this->rows = BuildSettingPickerRows(this->owner);
+
+		this->CreateNestedTree();
+		this->vscroll = this->GetScrollbar(WID_ASP_SCROLL);
+		this->FinishInitNested(0);
+
+		this->querystrings[WID_ASP_SEARCH] = &this->search_editbox;
+		this->search_editbox.text.Assign("");
+		/* The filter can be cleared with the usual editbox cancel, and Enter attaches the
+		 * highlighted setting, so the picker is usable without the mouse. */
+		this->search_editbox.cancel_button = QueryString::ACTION_CLEAR;
+		this->search_editbox.ok_button = WID_ASP_SELECT;
+		this->SetFocusedWidget(WID_ASP_SEARCH);
+
+		this->Refilter();
+	}
+
+	/**
+	 * Get the usable area of a panel widget.
+	 * @param widget The widget.
+	 * @return The area inside the frame of the widget.
+	 */
+	Rect GetInnerRect(WidgetID widget) const
+	{
+		return this->GetWidget<NWidgetBase>(widget)->GetCurrentRect().Shrink(WidgetDimensions::scaled.framerect);
+	}
+
+	/** Pin the lifetime of the owner the picker opens with, so a recreated company is not mistaken for it. */
+	void PinOwner()
+	{
+		const Company *company = Company::GetIfValid(this->owner);
+		this->owner_generation = company != nullptr ? GetPoolGeneration(*company) : -1;
+	}
+
+	/**
+	 * Show the companies of the game and select the owner the company settings are read from.
+	 *
+	 * The list is the real company pool, so the owner is always a company that exists; it is never
+	 * an id that was guessed from the current actor.
+	 */
+	void ShowOwnerDropdown()
+	{
+		DropDownList list;
+		this->offered_owners.clear();
+		for (const Company *company : Company::Iterate()) {
+			/* The lifetime the row is offered with is the one the player sees, and it is the one a
+			 * choice of that row has to resolve to. */
+			this->offered_owners.push_back({company->index, GetPoolGeneration(*company)});
+			list.push_back(MakeDropDownListStringItem(SettingOwnerLabel(company->index), company->index.base()));
+		}
+		if (list.empty()) return;
+		/* The dropdown marks the row whose result is `selected`, and the result of a row is the
+		 * company id - not its position in the list, which company ids are not. */
+		ShowDropDownList(this, std::move(list), this->owner == CompanyID::Invalid() ? -1 : this->owner.base(), WID_ASP_OWNER);
+	}
+
+	/**
+	 * Switch the owner of the company settings and show their values for that company.
+	 * @param company The new owner.
+	 * @param generation The lifetime of that company the player chose; it is pinned as it was shown.
+	 */
+	void SelectOwner(CompanyID company, int64_t generation)
+	{
+		this->owner = company;
+		this->owner_generation = generation;
+		this->rows = BuildSettingPickerRows(this->owner);
+		this->Refilter();
+		this->SetDirty();
+	}
+
+	/** Recompute the visible rows from the filter text and show the list from the top again. */
+	void Refilter()
+	{
+		const std::string filter(this->search_editbox.text.GetText());
+		this->visible.clear();
+		for (size_t i = 0; i < this->rows.size(); i++) {
+			if (SettingRowMatches(this->rows[i], filter)) this->visible.push_back(i);
+		}
+		this->selected = 0;
+		this->vscroll->SetPosition(0);
+		this->UpdateScrollbar();
+		this->SetWidgetDirty(WID_ASP_LIST);
+	}
+
+	/** Update the range and the position of the scrollbar to the filtered list. */
+	void UpdateScrollbar()
+	{
+		const int capacity = std::max(1, this->GetInnerRect(WID_ASP_LIST).Height() / GetSettingPickerRowHeight());
+		this->vscroll->SetCapacity(capacity);
+		this->vscroll->SetCount(std::max<int>(capacity, this->visible.size()));
+		this->vscroll->SetStepSize(1);
+		this->ScrollSelectionIntoView();
+	}
+
+	/** Scroll the list so the highlighted row is on screen. */
+	void ScrollSelectionIntoView()
+	{
+		if (this->visible.empty()) {
+			this->vscroll->SetPosition(0);
+			return;
+		}
+
+		const int capacity = std::max(1, this->vscroll->GetCapacity());
+		const int index = static_cast<int>(this->selected);
+		int position = this->vscroll->GetPosition();
+		if (index < position) position = index;
+		if (index >= position + capacity) position = index - capacity + 1;
+		this->vscroll->SetPosition(std::max(0, position));
+	}
+
+	/**
+	 * Highlight one row of the filtered list.
+	 * @param index The index into #visible; it is clamped to the list.
+	 */
+	void SelectIndex(int index)
+	{
+		if (this->visible.empty()) return;
+		this->selected = static_cast<size_t>(std::clamp(index, 0, static_cast<int>(this->visible.size()) - 1));
+		this->ScrollSelectionIntoView();
+		this->SetWidgetDirty(WID_ASP_LIST);
+	}
+
+	/**
+	 * Attach the highlighted setting to the message and close the picker.
+	 *
+	 * The picker only reads: it never changes the setting, and the attachment is a reference the
+	 * backend resolves itself. A picker that was opened in another world or epoch attaches nothing,
+	 * so a load that happened while it was open cannot put a reference of the world that is gone
+	 * into the tray of the new world. A company setting carries the owner it was shown for and the
+	 * lifetime of that company, so a company that was removed or recreated in the meantime is not
+	 * silently replaced by whichever company holds the id now.
+	 */
+	void AttachSelected()
+	{
+		if (this->visible.empty()) return;
+		const AgentSettingPickerRow &row = this->rows[this->visible[this->selected]];
+
+		if (this->world_id != _agent_chat.world_id || this->epoch != _agent_chat.epoch) {
+			_agent_chat.error = GetString(STR_AGENT_CHAT_SETTING_PICKER_STALE);
+			this->Close();
+			InvalidateAgentChatWindows();
+			return;
+		}
+
+		AgentChatAttachment attachment;
+		attachment.type = "setting";
+		attachment.setting_name = row.name;
+		attachment.scope = row.scope;
+		/* The key is the label: it is the identity the backend resolves. The current value belongs
+		 * to the setting, not to the reference, so it is not frozen into the label. */
+		attachment.name = row.name;
+		attachment.world_id = _agent_chat.world_id;
+		attachment.epoch = _agent_chat.epoch;
+
+		if (row.scope == "company") {
+			const Company *company = Company::GetIfValid(this->owner);
+			/* The owner the player saw has to be the owner that is attached: a company that was
+			 * removed or recreated while the picker was open must not silently hand the reference
+			 * to whichever company holds the id now. */
+			if (company == nullptr || this->owner_generation < 0 || GetPoolGeneration(*company) != this->owner_generation) {
+				_agent_chat.error = GetString(STR_AGENT_CHAT_SETTING_PICKER_OWNER_GONE);
+				this->Close();
+				InvalidateAgentChatWindows();
+				return;
+			}
+			attachment.company_id = this->owner.base();
+			attachment.company_generation = this->owner_generation;
+		}
+
+		_agent_chat.tray.push_back(std::move(attachment));
+
+		this->Close();
+		InvalidateAgentChatWindows();
+	}
+
+	void OnPaint() override
+	{
+		/* Without a company there is no owner to choose, and no company setting to show. */
+		this->SetWidgetDisabledState(WID_ASP_OWNER, Company::GetNumItems() == 0);
+		this->DrawWidgets();
+	}
+
+	std::string GetWidgetString(WidgetID widget, StringID stringid) const override
+	{
+		if (widget != WID_ASP_OWNER) return this->Window::GetWidgetString(widget, stringid);
+		/* The owner selector names the company the company settings are shown for. */
+		return GetString(stringid, this->owner == CompanyID::Invalid() ? GetString(STR_AGENT_CHAT_SETTING_PICKER_OWNER_NONE) : SettingOwnerLabel(this->owner));
+	}
+
+	void DrawWidget(const Rect &r, WidgetID widget) const override
+	{
+		if (widget != WID_ASP_LIST) return;
+
+		const Rect area = r.Shrink(WidgetDimensions::scaled.framerect);
+		if (this->visible.empty()) {
+			DrawStringMultiLine(area, GetString(STR_AGENT_CHAT_SETTING_PICKER_EMPTY), TextColour::Grey);
+			return;
+		}
+
+		const int row_height = GetSettingPickerRowHeight();
+		const int first = this->vscroll->GetPosition();
+		const int last = std::min<int>(this->visible.size(), first + this->vscroll->GetCapacity());
+		const int name_right = area.left + area.Width() * 3 / 5;
+		int y = area.top;
+		for (int i = first; i < last; i++) {
+			const AgentSettingPickerRow &row = this->rows[this->visible[i]];
+			const Rect line = Rect{area.left, y, area.right, y + row_height - 1};
+			const bool selected = static_cast<size_t>(i) == this->selected;
+			if (selected) GfxFillRect(line, PC_DARK_BLUE);
+
+			const TextColour colour = selected ? TextColour::White : TextColour::Black;
+			/* The key is what the attachment will name; the value is what the setting holds now. */
+			DrawString(line.left, name_right, line.top, row.name, colour);
+			DrawString(name_right, line.right, line.top, row.value_text, colour, AlignmentH::End);
+			y += row_height;
+		}
+	}
+
+	void OnClick(Point pt, WidgetID widget, [[maybe_unused]] int click_count) override
+	{
+		switch (widget) {
+			case WID_ASP_OWNER:
+				this->ShowOwnerDropdown();
+				break;
+
+			case WID_ASP_SELECT:
+				this->AttachSelected();
+				break;
+
+			case WID_ASP_CLOSE:
+				this->Close();
+				break;
+
+			case WID_ASP_LIST:
+				this->ClickList(pt);
+				break;
+
+			default:
+				break;
+		}
+	}
+
+	void OnDropdownSelect(WidgetID widget, int index, [[maybe_unused]] int click_result) override
+	{
+		if (widget != WID_ASP_OWNER) return;
+
+		/* The result of a row is the company id it offered. */
+		const CompanyID chosen = static_cast<CompanyID>(index);
+		int64_t offered_generation = -1;
+		bool offered = false;
+		for (const AgentSettingPickerOwner &entry : this->offered_owners) {
+			if (entry.company != chosen) continue;
+			offered_generation = entry.generation;
+			offered = true;
+			break;
+		}
+		if (!offered) return;
+
+		/* The choice names the company and the lifetime the player was shown. A company that was
+		 * removed or recreated while the dropdown was open is not silently replaced by whichever
+		 * company holds the id now, and a refused choice leaves the owner that was shown before
+		 * exactly as stale as it was: it is never re-pinned to a lifetime the player did not see. */
+		const Company *company = Company::GetIfValid(chosen);
+		if (company == nullptr || offered_generation < 0 || GetPoolGeneration(*company) != offered_generation) {
+			_agent_chat.error = GetString(STR_AGENT_CHAT_SETTING_PICKER_OWNER_GONE);
+			InvalidateAgentChatWindows();
+			return;
+		}
+
+		this->SelectOwner(chosen, offered_generation);
+	}
+
+	/**
+	 * Handle a click in the setting list: highlight the row and attach it.
+	 * @param pt Click position.
+	 */
+	void ClickList(Point pt)
+	{
+		const Rect area = this->GetInnerRect(WID_ASP_LIST);
+		if (!area.Contains(pt)) return;
+
+		const int index = (pt.y - area.top) / GetSettingPickerRowHeight() + this->vscroll->GetPosition();
+		if (index < 0 || static_cast<size_t>(index) >= this->visible.size()) return;
+		this->SelectIndex(index);
+		this->AttachSelected();
+	}
+
+	void OnEditboxChanged(WidgetID widget) override
+	{
+		if (widget != WID_ASP_SEARCH) return;
+		this->Refilter();
+	}
+
+	void OnScrollbarScroll(WidgetID widget) override
+	{
+		if (widget == WID_ASP_SCROLL) this->SetWidgetDirty(WID_ASP_LIST);
+	}
+
+	void OnResize() override
+	{
+		this->UpdateScrollbar();
+	}
+
+	EventState OnKeyPress([[maybe_unused]] char32_t key, uint16_t keycode) override
+	{
+		if (keycode == WKC_ESC) {
+			this->Close();
+			return EventState::Handled;
+		}
+
+		/* The editbox keeps the text keys; the list keys are only reached when it did not take
+		 * them, so typing in the filter never moves the highlight. */
+		const int capacity = std::max(1, this->vscroll->GetCapacity());
+		const int current = static_cast<int>(this->selected);
+		switch (keycode) {
+			case WKC_UP: this->SelectIndex(current - 1); return EventState::Handled;
+			case WKC_DOWN: this->SelectIndex(current + 1); return EventState::Handled;
+			case WKC_PAGEUP: this->SelectIndex(current - capacity); return EventState::Handled;
+			case WKC_PAGEDOWN: this->SelectIndex(current + capacity); return EventState::Handled;
+			case WKC_HOME: this->SelectIndex(0); return EventState::Handled;
+			case WKC_END: this->SelectIndex(INT32_MAX); return EventState::Handled;
+			default: return EventState::NotHandled;
+		}
+	}
+};
+
+/** Widget parts of the settings picker of the agent chat window. */
+static constexpr std::initializer_list<NWidgetPart> _nested_agent_chat_settings_widgets = {
+	NWidget(NWID_HORIZONTAL),
+		NWidget(WWT_CLOSEBOX, Colours::Grey),
+		NWidget(WWT_CAPTION, Colours::Grey, WID_ASP_CAPTION), SetResize(1, 0), SetStringTip(STR_AGENT_CHAT_SETTING_PICKER_CAPTION),
+		NWidget(WWT_RESIZEBOX, Colours::Grey),
+	EndContainer(),
+	NWidget(NWID_VERTICAL),
+		NWidget(WWT_EDITBOX, Colours::Grey, WID_ASP_SEARCH), SetMinimalSize(0, 12), SetFill(1, 0), SetResize(1, 0), SetStringTip(STR_AGENT_CHAT_SETTING_PICKER_SEARCH_OSKTITLE, STR_AGENT_CHAT_SETTING_PICKER_SEARCH_TOOLTIP),
+		NWidget(NWID_HORIZONTAL),
+			NWidget(WWT_DROPDOWN, Colours::Grey, WID_ASP_OWNER), SetMinimalSize(160, 12), SetFill(1, 0), SetResize(1, 0), SetStringTip(STR_AGENT_CHAT_SETTING_PICKER_OWNER, STR_AGENT_CHAT_SETTING_PICKER_OWNER_TOOLTIP),
+		EndContainer(),
+		NWidget(NWID_HORIZONTAL),
+			NWidget(WWT_PANEL, Colours::Grey, WID_ASP_LIST), SetMinimalSize(360, 220), SetFill(1, 1), SetResize(1, 1), SetScrollbar(WID_ASP_SCROLL),
+			EndContainer(),
+			NWidget(NWID_VERTICAL),
+				NWidget(NWID_VSCROLLBAR, Colours::Grey, WID_ASP_SCROLL),
+			EndContainer(),
+		EndContainer(),
+		NWidget(NWID_HORIZONTAL),
+			NWidget(WWT_PUSHTXTBTN, Colours::Grey, WID_ASP_SELECT), SetFill(1, 0), SetResize(1, 0), SetStringTip(STR_AGENT_CHAT_SETTING_PICKER_SELECT, STR_AGENT_CHAT_SETTING_PICKER_SELECT_TOOLTIP),
+			NWidget(WWT_PUSHTXTBTN, Colours::Grey, WID_ASP_CLOSE), SetFill(1, 0), SetResize(1, 0), SetStringTip(STR_AGENT_CHAT_SETTING_PICKER_CLOSE, STR_AGENT_CHAT_SETTING_PICKER_CLOSE_TOOLTIP),
+		EndContainer(),
+	EndContainer(),
+};
+
+/** Window description of the settings picker. */
+static WindowDesc _agent_chat_settings_window_desc(
+	WindowPosition::Automatic, "agent_chat_settings", 440, 340,
+	WindowClass::AgentChatSettings, WindowClass::AgentChat,
+	{},
+	_nested_agent_chat_settings_widgets
+);
+
+/** Open the settings picker, or bring it to the front when it is already open. */
+static void ShowAgentChatSettingPicker()
+{
+	Window *w = BringWindowToFrontById(WindowClass::AgentChatSettings, 0);
+	if (w != nullptr) {
+		w->SetDirty();
+		return;
+	}
+	new AgentChatSettingsWindow(_agent_chat_settings_window_desc);
+}
 
 /** Undo the shade the chat window took to uncover the map while a click was awaited. */
 static void RestoreAgentChatPickingShade()
@@ -3265,6 +3876,7 @@ static constexpr std::initializer_list<NWidgetPart> _nested_agent_chat_widgets =
 				NWidget(WWT_PUSHTXTBTN, Colours::Grey, WID_AC_ADD_POINT), SetFill(1, 0), SetResize(1, 0), SetStringTip(STR_AGENT_CHAT_ADD_POINT, STR_AGENT_CHAT_ADD_POINT_TOOLTIP),
 				NWidget(WWT_PUSHTXTBTN, Colours::Grey, WID_AC_ADD_OBJECT), SetFill(1, 0), SetResize(1, 0), SetStringTip(STR_AGENT_CHAT_ADD_OBJECT, STR_AGENT_CHAT_ADD_OBJECT_TOOLTIP),
 				NWidget(WWT_PUSHTXTBTN, Colours::Grey, WID_AC_ADD_COMPANY), SetFill(1, 0), SetResize(1, 0), SetStringTip(STR_AGENT_CHAT_ADD_COMPANY, STR_AGENT_CHAT_ADD_COMPANY_TOOLTIP),
+				NWidget(WWT_PUSHTXTBTN, Colours::Grey, WID_AC_ADD_SETTING), SetFill(1, 0), SetResize(1, 0), SetStringTip(STR_AGENT_CHAT_ADD_SETTING, STR_AGENT_CHAT_ADD_SETTING_TOOLTIP),
 			EndContainer(),
 			/* An edit box so the window can take the global edit box focus: the backends deliver
 			 * typed text (and only typed text) through HandleTextInput() to a focused edit box.
@@ -3567,6 +4179,7 @@ nlohmann::json DescribeAgentChatUi()
 			{"add_point", WID_AC_ADD_POINT},
 			{"add_object", WID_AC_ADD_OBJECT},
 			{"add_company", WID_AC_ADD_COMPANY},
+			{"add_setting", WID_AC_ADD_SETTING},
 			{"input", WID_AC_INPUT},
 			{"status", WID_AC_STATUS},
 			{"send", WID_AC_SEND},
@@ -3683,6 +4296,13 @@ nlohmann::json DescribeAgentChatUi()
 			if (attachment.id >= 0) entry["id"] = attachment.id;
 			if (attachment.generation >= 0) entry["generation"] = attachment.generation;
 			if (attachment.tile != INVALID_TILE) entry["tile"] = Json{{"x", TileX(attachment.tile)}, {"y", TileY(attachment.tile)}};
+			if (!attachment.setting_name.empty()) {
+				/* A setting names its scope and, when it is owned, the company and its lifetime. */
+				entry["setting_name"] = attachment.setting_name;
+				entry["scope"] = attachment.scope;
+				if (attachment.company_id >= 0) entry["company_id"] = attachment.company_id;
+				if (attachment.company_generation >= 0) entry["company_generation"] = attachment.company_generation;
+			}
 			entry["stale"] = IsAttachmentStale(attachment);
 			entry["rect"] = RectToJson(ToScreenRect(*w, chips[i]));
 			entry["remove_rect"] = RectToJson(ToScreenRect(*w, Rect{chips[i].right - remove_width, chips[i].top, chips[i].right, chips[i].bottom}));
@@ -3701,6 +4321,72 @@ nlohmann::json DescribeAgentChatUi()
 		out["candidate_rows"] = std::move(candidate_rows);
 	}
 
+	/* The settings picker: its real geometry, the filter text and the rows that are on screen, so a
+	 * real input test can click a row instead of guessing a pixel. Nothing here changes the picker. */
+	AgentChatSettingsWindow *picker = dynamic_cast<AgentChatSettingsWindow *>(FindWindowById(WindowClass::AgentChatSettings, 0));
+	if (picker == nullptr) {
+		out["settings_picker"] = Json{{"open", false}};
+	} else {
+		Json entry = Json::object();
+		entry["open"] = true;
+		entry["world_id"] = picker->world_id;
+		entry["epoch"] = picker->epoch;
+		entry["search"] = std::string(picker->search_editbox.text.GetText());
+		entry["total"] = picker->rows.size();
+		entry["matching"] = picker->visible.size();
+		entry["selected"] = picker->selected;
+		entry["scroll"] = Json{{"position", picker->vscroll->GetPosition()},
+				{"capacity", picker->vscroll->GetCapacity()}, {"count", picker->vscroll->GetCount()}};
+		/* The owner the company settings are shown for, and the companies the selector offers. The
+		 * lifetime is the pinned one, so a recreated company is visible as a different owner. */
+		const Company *owner = Company::GetIfValid(picker->owner);
+		entry["owner"] = owner == nullptr ? Json() : Json{{"company_id", picker->owner.base()},
+				{"company_generation", picker->owner_generation}, {"name", SettingOwnerLabel(picker->owner)}};
+		Json companies = Json::array();
+		for (const Company *company : Company::Iterate()) {
+			companies.push_back({{"company_id", company->index.base()}, {"name", SettingOwnerLabel(company->index)},
+					{"company_generation", GetPoolGeneration(*company)}, {"selected", company->index == picker->owner}});
+		}
+		entry["companies"] = std::move(companies);
+		entry["rect"] = RectToJson(Rect{picker->left, picker->top, picker->left + picker->width - 1, picker->top + picker->height - 1});
+
+		Json widgets = Json::object();
+		const std::pair<const char *, WidgetID> picker_widgets[] = {
+			{"caption", WID_ASP_CAPTION},
+			{"search", WID_ASP_SEARCH},
+			{"owner", WID_ASP_OWNER},
+			{"list", WID_ASP_LIST},
+			{"scroll", WID_ASP_SCROLL},
+			{"select", WID_ASP_SELECT},
+			{"close", WID_ASP_CLOSE},
+		};
+		for (const auto &[name, widget] : picker_widgets) {
+			widgets[name] = RectToJson(ToScreenRect(*picker, picker->GetWidget<NWidgetBase>(widget)->GetCurrentRect()));
+		}
+		const NWidgetBase *closebox = picker->nested_root->GetWidgetOfType(WWT_CLOSEBOX);
+		if (closebox != nullptr) widgets["closebox"] = RectToJson(ToScreenRect(*picker, closebox->GetCurrentRect()));
+		entry["widgets"] = std::move(widgets);
+
+		Json rows = Json::array();
+		const Rect area = picker->GetInnerRect(WID_ASP_LIST);
+		const int row_height = GetSettingPickerRowHeight();
+		const int first = picker->vscroll->GetPosition();
+		const int last = std::min<int>(picker->visible.size(), first + picker->vscroll->GetCapacity());
+		for (int i = first; i < last; i++) {
+			const AgentSettingPickerRow &row = picker->rows[picker->visible[i]];
+			const int top = area.top + (i - first) * row_height;
+			Json row_entry = Json::object();
+			row_entry["name"] = row.name;
+			row_entry["scope"] = row.scope;
+			row_entry["value"] = row.value_text;
+			row_entry["selected"] = (static_cast<size_t>(i) == picker->selected);
+			row_entry["rect"] = RectToJson(ToScreenRect(*picker, Rect{area.left, top, area.right, top + row_height - 1}));
+			rows.push_back(std::move(row_entry));
+		}
+		entry["rows"] = std::move(rows);
+		out["settings_picker"] = std::move(entry);
+	}
+
 	Window *status = FindWindowById(WindowClass::AgentChatStatus, 0);
 	if (status != nullptr) {
 		Json entry = Json::object();
@@ -3715,4 +4401,40 @@ nlohmann::json DescribeAgentChatUi()
 	}
 
 	return out;
+}
+
+std::string SettingAttachmentLabelForTest(const std::string &setting_name, const std::string &scope, int32_t company_id)
+{
+	/* The picker stores the exact engine key as the label of the attachment, so the test builds the
+	 * same attachment AttachSelected() builds and runs the real label code on it. */
+	AgentChatAttachment attachment;
+	attachment.type = "setting";
+	attachment.setting_name = setting_name;
+	attachment.scope = scope;
+	attachment.name = setting_name;
+	attachment.company_id = company_id;
+	return GetAttachmentLabel(attachment);
+}
+
+nlohmann::json SettingPickerRowsForTest(const std::string &filter)
+{
+	/* The same owner the picker opens with, so the values and the owner fields are the real ones. */
+	const CompanyID owner = DefaultSettingPickerOwner();
+	const Company *company = Company::GetIfValid(owner);
+	Json rows = Json::array();
+	for (const AgentSettingPickerRow &row : BuildSettingPickerRows(owner)) {
+		if (!SettingRowMatches(row, filter)) continue;
+		Json entry = {{"name", row.name}, {"scope", row.scope}, {"value", row.value_text}};
+		if (row.scope == "company") {
+			if (company == nullptr) {
+				entry["company_id"] = nullptr;
+				entry["company_generation"] = nullptr;
+			} else {
+				entry["company_id"] = owner.base();
+				entry["company_generation"] = GetPoolGeneration(*company);
+			}
+		}
+		rows.push_back(std::move(entry));
+	}
+	return rows;
 }

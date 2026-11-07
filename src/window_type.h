@@ -779,6 +779,12 @@ enum class WindowClass : uint16_t {
 	 */
 	AgentChatStatus,
 
+	/**
+	 * Settings picker of the in-game agent chat window; %Window numbers:
+	 *   - 0 = #AgentChatSettingsWidgets
+	 */
+	AgentChatSettings,
+
 	Invalid = 0xFFFF, ///< Invalid window.
 };
 

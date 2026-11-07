@@ -146,12 +146,19 @@ Json DescribeTileObjects(TileIndex tile);
  * Resolve one typed reference against the current world, as `world.objects` does.
  *
  * A reference is `{type, id?, tile?, generation?, fingerprint?, what?, town_generation?,
- * object_generation?, world_id?, epoch?}`. A read resolves the object as it is now and reports its
- * identity; a write (`require_identity`) additionally rejects a pooled reference without a
- * generation, a tile object without a fingerprint (or, for a house, without the generation of its
- * town, or for a map object without the generation of the pooled object behind it) and any
- * reference whose recorded state is no longer current. A `point` reference names a location only
- * and has no identity to check.
+ * object_generation?, setting_name?, scope?, company_id?, company_generation?, world_id?,
+ * epoch?}`. A read resolves the object as it is now and reports its identity; a write
+ * (`require_identity`) additionally rejects a pooled reference without a generation, a tile object
+ * without a fingerprint (or, for a house, without the generation of its town, or for a map object
+ * without the generation of the pooled object behind it) and any reference whose recorded state is
+ * no longer current. A `point` reference names a location only and has no identity to check. A
+ * `setting` reference is identified by its exact engine key (`setting_name`) and its `scope`, and
+ * both are mandatory: its value may change while the reference stays current, a key this build does
+ * not have is rejected as `unknown_setting`, a reference without a scope as `missing_scope` and a
+ * scope that is not the scope of the descriptor as `scope_mismatch`. A company scoped setting is
+ * owned, so the reference must also name `company_id` and `company_generation` and only resolves
+ * while that company lifetime exists: a deleted or recreated owner fails closed instead of
+ * resolving whichever company holds the id now.
  * @param ref The reference.
  * @param require_identity True for a write's `expected_refs`.
  * @return The resolved object, or a stale_ref entry with `reason`.

@@ -22,10 +22,22 @@ enum AgentChatWidgets : WidgetID {
 	WID_AC_ADD_POINT,         ///< Button to add a map point attachment.
 	WID_AC_ADD_OBJECT,        ///< Button to add a game object attachment.
 	WID_AC_ADD_COMPANY,       ///< Button to add a company attachment.
+	WID_AC_ADD_SETTING,       ///< Button to add a game setting attachment.
 	WID_AC_INPUT,             ///< Multiline message input.
 	WID_AC_STATUS,            ///< Status line of the selected chat.
 	WID_AC_SEND,              ///< Button to send the composed message.
 	WID_AC_STOP,              ///< Button to stop the running task.
+};
+
+/** Widgets of the #AgentChatSettingsWindow class (the settings picker). */
+enum AgentChatSettingsWidgets : WidgetID {
+	WID_ASP_CAPTION, ///< Caption of the window.
+	WID_ASP_SEARCH,  ///< Filter editbox of the setting list.
+	WID_ASP_OWNER,   ///< Dropdown that selects the company whose values company settings show.
+	WID_ASP_LIST,    ///< List of settings.
+	WID_ASP_SCROLL,  ///< Scrollbar of the setting list.
+	WID_ASP_SELECT,  ///< Button to attach the highlighted setting.
+	WID_ASP_CLOSE,   ///< Button to close the picker without attaching anything.
 };
 
 /** Widgets of the #AgentChatStatusWindow class. */

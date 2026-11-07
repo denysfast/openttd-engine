@@ -44,6 +44,8 @@
 #include "rail_map.h"
 #include "rev.h"
 #include "saveload/saveload_func.h"
+#include "settings_internal.h"
+#include "settings_type.h"
 #include "road_map.h"
 #include "signs_base.h"
 #include "signs_cmd.h"
@@ -2119,13 +2121,200 @@ Json ResolveTileObjectRef(std::string_view ref_type, const Json &ref, bool requi
 }
 
 /**
+ * Name of a setting scope, as used in the protocol.
+ * @param type The setting type.
+ * @return The scope name.
+ */
+std::string_view SettingScopeName(SettingType type)
+{
+	switch (type) {
+		case ST_GAME: return "game";
+		case ST_COMPANY: return "company";
+		case ST_CLIENT: return "client";
+		default: return "unknown";
+	}
+}
+
+/**
+ * The object a setting is read from.
+ *
+ * The engine keeps game settings in the game (or new game) settings object, client settings in the
+ * client settings object and per-company settings in the settings of one company. A per-company
+ * setting is read from the company the reference names and from nothing else: there is no fallback
+ * to the client's company defaults or to whoever the current actor is, because that would silently
+ * resolve another company's value.
+ * @param sd The setting.
+ * @param company The company a per-company setting is read from; it must be valid.
+ * @return The object the setting lives in.
+ */
+const void *SettingObjectForRef(const SettingDesc &sd, CompanyID company)
+{
+	switch (sd.GetType()) {
+		case ST_GAME: return &GetGameSettings();
+		case ST_CLIENT: return &_settings_client;
+		case ST_COMPANY: return &Company::Get(company)->settings;
+		default: NOT_REACHED();
+	}
+}
+
+/**
+ * The typed current value of a setting.
+ *
+ * The value is read through the setting descriptor of that very setting, so it has the type the
+ * setting has: a boolean setting reports a boolean and not 0 or 1, an integer setting reports the
+ * number the engine stores, a string setting reports its string. A list setting has no scalar value
+ * of its own; its engine formatted text is the value and this returns null.
+ * @param sd The setting.
+ * @param object The object the setting lives in.
+ * @return The typed value.
+ */
+Json SettingValueJson(const SettingDesc &sd, const void *object)
+{
+	if (sd.IsIntSetting()) {
+		const IntSettingDesc &isd = *sd.AsIntSetting();
+		const int32_t value = isd.Read(object);
+		if (isd.IsBoolSetting()) return Json(value != 0);
+		return Json(value);
+	}
+	if (sd.IsStringSetting()) return Json(sd.AsStringSetting()->Read(object));
+	return Json(nullptr);
+}
+
+/**
+ * Resolve a reference to one engine setting.
+ *
+ * A reference is `{type: "setting", setting_name, scope, company_id?, company_generation?,
+ * world_id?, epoch?, name?}`. The exact engine setting key and its scope are the whole identity of
+ * a setting: the value of the setting may change and the reference stays current, while a key this
+ * build does not have cannot be resolved at all. A shortcut or an alias the engine would also
+ * accept (`company.engine_renew`, `town_growth_rate`) is not the key the caller named, so it is
+ * reported as unknown together with the canonical name instead of silently resolving to another
+ * setting. The world and the epoch are checked by #ResolveRef before this is called, so a
+ * reference of a world that was left is stale.
+ *
+ * `scope` is mandatory for every setting, game and client settings included, and it is never
+ * inferred from the key: it must be the scope of the descriptor that holds the key. A per-company
+ * setting is owned by one company, and the id of a company is reused after the company is gone, so
+ * the owner is pinned: a company scoped reference has to name `company_id` and
+ * `company_generation`, and it only resolves while that very company lifetime still exists. A
+ * missing, deleted or recreated owner fails closed instead of resolving whichever company holds the
+ * id now. Game and client settings have no owner, no id and no generation at all.
+ *
+ * A write (`require_identity`) needs nothing more than that: there is no value to match, because
+ * the value is what a write changes.
+ * @param ref The reference.
+ * @param require_identity True for a write's `expected_refs`.
+ * @return The resolved setting, or an unknown_setting / scope / owner failure entry.
+ */
+Json ResolveSettingRef(const Json &ref, [[maybe_unused]] bool require_identity)
+{
+	const std::string name = JsonString(ref, "setting_name");
+	if (name.empty()) return RefFailure("setting", "missing_setting_name", "invalid_params");
+
+	const SettingDesc *sd = GetSettingFromName(name);
+	if (sd == nullptr) {
+		Json row = RefFailure("setting", "setting_not_found", "unknown_setting");
+		row["setting_name"] = name;
+		return row;
+	}
+	if (sd->GetName() != name) {
+		Json row = RefFailure("setting", "setting_not_found", "unknown_setting");
+		row["setting_name"] = name;
+		row["canonical_name"] = sd->GetName();
+		return row;
+	}
+
+	/* The scope is part of the identity, and every reference names it: a key is only ever owned by
+	 * the object its descriptor names, so a reference without a scope is incomplete and a reference
+	 * that claims another scope was built for a different thing. The scope is never inferred from
+	 * the key, because a key that moved between tables would then resolve to another setting
+	 * without the caller noticing. */
+	const std::string_view scope = SettingScopeName(sd->GetType());
+	const std::string named_scope = JsonString(ref, "scope");
+	if (named_scope.empty()) {
+		Json row = RefFailure("setting", "missing_scope", "invalid_params");
+		row["setting_name"] = sd->GetName();
+		row["scope"] = std::string(scope);
+		return row;
+	}
+	if (named_scope != scope) {
+		Json row = RefFailure("setting", "scope_mismatch");
+		row["setting_name"] = sd->GetName();
+		row["scope"] = std::string(scope);
+		row["scope_named"] = named_scope;
+		return row;
+	}
+
+	CompanyID company = CompanyID::Invalid();
+	int64_t company_generation = -1;
+	if (sd->GetType() == ST_COMPANY) {
+		/* The owner has to be named: the current actor is not the owner of a stored reference. */
+		int64_t company_id = 0;
+		if (!ReadBoundedInteger(ref, "company_id", static_cast<int64_t>(MAX_COMPANIES) - 1, company_id)) {
+			Json row = RefFailure("setting", "missing_company_id", "invalid_params");
+			row["setting_name"] = sd->GetName();
+			row["scope"] = std::string(scope);
+			return row;
+		}
+		if (!ReadBoundedInteger(ref, "company_generation", std::numeric_limits<int64_t>::max(), company_generation)) {
+			Json row = RefFailure("setting", "missing_company_generation", "invalid_params");
+			row["setting_name"] = sd->GetName();
+			row["scope"] = std::string(scope);
+			row["company_id"] = company_id;
+			return row;
+		}
+
+		company = static_cast<CompanyID>(company_id);
+		const Company *owner = Company::GetIfValid(company);
+		if (owner == nullptr) {
+			Json row = RefFailure("setting", "company_deleted");
+			row["setting_name"] = sd->GetName();
+			row["scope"] = std::string(scope);
+			row["company_id"] = company_id;
+			row["company_generation"] = company_generation;
+			return row;
+		}
+		if (owner->generation != static_cast<uint64_t>(company_generation)) {
+			/* The id was reused by a recreated company: same id, another company. */
+			Json row = RefFailure("setting", "company_lifetime_mismatch");
+			row["setting_name"] = sd->GetName();
+			row["scope"] = std::string(scope);
+			row["company_id"] = company_id;
+			row["company_generation"] = company_generation;
+			row["company_generation_now"] = owner->generation;
+			return row;
+		}
+	}
+
+	const void *object = SettingObjectForRef(*sd, company);
+
+	Json row = {
+		{"type", "setting"},
+		{"found", true},
+		{"identity", "setting"},
+		{"setting_name", sd->GetName()},
+		{"scope", std::string(scope)},
+		{"value", SettingValueJson(*sd, object)},
+		/* The text the engine's own settings window shows for the value, so the caller does not
+		 * have to format units, currencies or enum names itself. */
+		{"value_text", sd->FormatValue(object)},
+	};
+	if (sd->GetType() == ST_COMPANY) {
+		row["company_id"] = company.base();
+		row["company_generation"] = company_generation;
+	}
+	return row;
+}
+
+/**
  * Resolve one typed object reference against the current world.
  *
- * A reference is `{type, id?, tile?, generation?, world_id?, epoch?}`, exactly as the protocol
- * schema and `PickObjects()` describe it. The world and the epoch are checked first: a reference
- * read from another world or epoch can never resolve to a current object, so it is reported as
- * stale instead of being matched by id. Then the id and the generation are read as bounded
- * integers, and only then narrowed into the pool.
+ * A reference is `{type, id?, tile?, generation?, setting_name?, scope?, company_id?,
+ * company_generation?, world_id?, epoch?}`, exactly as the protocol schema and `PickObjects()`
+ * describe it; a setting reference always names `setting_name` and `scope`. The world and the
+ * epoch are checked first: a reference read from another world or epoch can never resolve to a
+ * current object, so it is reported as stale instead of being matched by id. Then the id and the
+ * generation are read as bounded integers, and only then narrowed into the pool.
  *
  * A pooled reference that names a generation is stale when that lifetime is gone, even if the id
  * has been reused. `require_identity` is set for a write: there a pooled reference must name a
@@ -2238,6 +2427,8 @@ Json ResolveRef(const Json &ref, bool require_identity)
 			row["owner"] = g.owner.base();
 		});
 	}
+	/* A setting is identified by its engine key, not by a pool id or a tile. */
+	if (type == "setting") return ResolveSettingRef(ref, require_identity);
 	/* The objects a tile itself carries: typed categories, the generic `tile` and `point`. */
 	if (type == "tile" || type == "point" || TileObjectKindFromName(type).has_value()) {
 		return ResolveTileObjectRef(type, ref, require_identity);
@@ -3237,18 +3428,23 @@ Json CoreContracts()
 		{"legacy", "world.info.date stays the raw day counter; it is not a date a player recognises, so do not show it"},
 	};
 	contracts["refs"] = {
-		{"identity_kinds", "pool (id + generation), tile (tile + fingerprint, plus town_id/town_generation for a house), point (location only, never stale)"},
+		{"identity_kinds", "pool (id + generation), tile (tile + fingerprint, plus town_id/town_generation for a house), point (location only, never stale), setting (exact engine key + scope, plus the pinned owner company_id/company_generation of a company scoped setting)"},
 		{"tile_types", "terrain, water, tree, rail, signal, road, tram, bridge, tunnel, mapobject, house; `tile` is the generic spelling and takes `what`"},
 		{"tile_fields", "type, what, subtype, identity, tile, owner, fingerprint"},
 		{"owner", "the owner the engine records for that category: rail, signal, bridge, tunnel, water and mapobject use the tile owner; road and tram use the owner of their own transport type, so the road and the tram on one tile can report different owners; terrain, tree and house report null; OWNER_WATER (open sea) and OWNER_NONE report null"},
 		{"house_fields", "a house adds town_id and town_generation: the identity is the tile (the stored house id, its translated HouseID and the random bits) plus the lifetime of its town, never the whole town. A house has no pool generation of its own, so a same-type reconstruction on the same tile in the same town with the same random bits is not distinguishable"},
 		{"mapobject_fields", "a map object adds object_id and object_generation: the pooled object behind the tile is part of the identity, so replacing it with one of the same type is a different identity"},
 		{"point_fields", "type=point, identity=point, tile; no fingerprint, so a point names a location and can never be stale"},
+		{"setting_fields", "type=setting, identity=setting, setting_name, scope (game, client or company; always named, never inferred); a resolved setting adds value (the typed current value: a boolean for a boolean setting, a number for an integer setting, a string for a string setting, null for a list setting) and value_text (the text the engine's own settings window shows). A company scoped setting is owned and adds company_id and company_generation; a game or client setting carries neither an id nor a generation nor a tile nor a fingerprint"},
+		{"setting_identity", "the exact engine setting key (the descriptor's own name, e.g. economy.town_growth_rate) together with its scope is the identity: a value change does not make the reference stale, so a write that names the key is current while the key exists. scope is mandatory for every setting, game and client included: a reference without it answers error=invalid_params with reason=missing_scope, and one that names another scope than the descriptor that holds the key answers scope_mismatch. The scope is never inferred from the key, so a key that moved between tables cannot resolve to another setting unnoticed. A shortcut or alias the engine would also accept is not the key the caller named and answers error=unknown_setting with canonical_name instead of resolving to another setting"},
+		{"setting_owner", "a company scoped setting is owned by one company, and company ids are reused: the reference must name company_id and company_generation, and it resolves only against that company lifetime. A missing owner answers error=invalid_params with reason=missing_company_id or missing_company_generation, a deleted owner answers reason=company_deleted and a recreated company that holds the id now answers reason=company_lifetime_mismatch with company_generation_now. The owner is never taken from the current actor, and a company scoped setting never falls back to the client company defaults"},
+		{"setting_world", "a setting reference is bound to the world and epoch it was read in like every other reference, so a reference of a world that was left answers world_mismatch or epoch_mismatch"},
 		{"fingerprint", "FNV-1a over the native tile values that identify the object and its state (tile type, height, the category fields, the recorded owner and both halves of every 64 bit pool lifetime), not over map-array bytes and not over an address"},
 		{"signal_note", "signal states are changed by passing trains, so a signal reference can go stale without anyone building anything: inspect again instead of treating it as an error"},
 		{"write_rule", "expected_refs of a write must name a generation for a pooled type, and a fingerprint plus town_generation (house) or object_generation (map object) for a tile object; a point needs nothing"},
-		{"stale", "a stale reference answers found=false with error=stale_ref and a reason: world_mismatch, epoch_mismatch, deleted, generation_required, generation_mismatch, tile_type_mismatch, tile_state_changed, fingerprint_required, town_generation_required, town_lifetime_mismatch, object_generation_required, object_lifetime_mismatch"},
-		{"invalid", "error=invalid_params with reason=invalid_ref, missing_type, invalid_id, invalid_tile, invalid_fingerprint, invalid_generation or unknown_what"},
+		{"stale", "a stale reference answers found=false with error=stale_ref and a reason: world_mismatch, epoch_mismatch, deleted, generation_required, generation_mismatch, tile_type_mismatch, tile_state_changed, fingerprint_required, town_generation_required, town_lifetime_mismatch, object_generation_required, object_lifetime_mismatch, scope_mismatch, company_deleted, company_lifetime_mismatch"},
+		{"invalid", "error=invalid_params with reason=invalid_ref, missing_type, invalid_id, invalid_tile, invalid_fingerprint, invalid_generation, missing_setting_name, missing_scope, missing_company_id, missing_company_generation or unknown_what"},
+		{"unknown_setting", "a setting key this build does not have, or a shortcut of one, answers found=false with error=unknown_setting and reason=setting_not_found; canonical_name is reported when the engine resolved the shortcut to a real key"},
 		{"unsupported", "a type the kernel cannot resolve answers error=unsupported_ref_type with reason=unknown_type or not_a_pooled_object (a cargo has no lifetime)"},
 		{"bounded", "a tile reference reads only the requested tile: no map scan and no render"},
 	};

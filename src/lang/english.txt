@@ -6447,3 +6447,21 @@ STR_AGENT_CHAT_SUBTYPE_ELECTRIC                                :electric
 STR_AGENT_CHAT_SUBTYPE_AIR                                     :air
 STR_AGENT_CHAT_ADD_COMPANY                                      :Add company
 STR_AGENT_CHAT_ADD_COMPANY_TOOLTIP                              :Pick a company to attach to the message
+STR_AGENT_CHAT_ADD_SETTING                                      :Add setting
+STR_AGENT_CHAT_ADD_SETTING_TOOLTIP                              :Pick a game setting to attach to the message
+STR_AGENT_CHAT_TYPE_SETTING                                     :Setting
+STR_AGENT_CHAT_SETTING_PICKER_CAPTION                           :{WHITE}Attach a setting
+STR_AGENT_CHAT_SETTING_PICKER_SEARCH_OSKTITLE                   :Search settings
+STR_AGENT_CHAT_SETTING_PICKER_SEARCH_TOOLTIP                    :Type to filter the settings by key or title
+STR_AGENT_CHAT_SETTING_PICKER_SELECT                            :Attach
+STR_AGENT_CHAT_SETTING_PICKER_SELECT_TOOLTIP                    :Attach the highlighted setting to the message
+STR_AGENT_CHAT_SETTING_PICKER_CLOSE                             :Close
+STR_AGENT_CHAT_SETTING_PICKER_CLOSE_TOOLTIP                     :Close the settings picker without attaching anything
+STR_AGENT_CHAT_SETTING_PICKER_EMPTY                             :{GRAY}No setting matches the filter.
+STR_AGENT_CHAT_SETTING_PICKER_STALE                             :The game changed while the settings picker was open; nothing was attached.
+STR_AGENT_CHAT_SETTING_PICKER_OWNER                             :Owner: {STRING}
+STR_AGENT_CHAT_SETTING_PICKER_OWNER_TOOLTIP                     :Choose the company whose value a company setting shows
+STR_AGENT_CHAT_SETTING_PICKER_OWNER_NONE                        :no company
+STR_AGENT_CHAT_SETTING_PICKER_OWNER_GONE                        :The company of the settings picker changed; nothing was attached.
+STR_AGENT_CHAT_ATTACHMENT_SETTING_COMPANY                       :{STRING} (company {STRING})
+STR_AGENT_CHAT_ATTACHMENT_COMPANY_ID                            :company #{NUM}
