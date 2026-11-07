@@ -52,6 +52,12 @@ static const size_t AGENT_CHAT_MAX_INPUT = 8000;
 /** Interval between two polls of the backend, in milliseconds. */
 static const uint AGENT_CHAT_POLL_INTERVAL_MS = 1000;
 
+/** Interval used while a task is stopping or settling, until the backend reports it terminal. */
+static const uint AGENT_CHAT_FINISHING_POLL_INTERVAL_MS = 250;
+
+/** Number of requests in flight above which a periodic read is skipped instead of queued. */
+static const int AGENT_CHAT_MAX_PENDING_REQUESTS = 4;
+
 /** Number of text lines shown in the message input. */
 static const int AGENT_CHAT_INPUT_LINES = 3;
 
@@ -89,6 +95,7 @@ struct AgentChatEntry {
 	std::vector<AgentChatMessage> messages; ///< Cached transcript.
 	bool task_active = false;       ///< Whether a task is running for this chat.
 	bool task_finishing = false;    ///< Whether the turn of the task ended while its writes may still be settling.
+	bool stop_pending = false;      ///< Whether a stop was requested and its barrier is not acknowledged yet.
 	std::string task_status;        ///< Short status of the running task, shown to the player.
 };
 
@@ -615,6 +622,30 @@ static AgentChatEntry *FindBusyChat()
 	return nullptr;
 }
 
+/**
+ * Check whether any chat has a task that is stopping or settling.
+ * @return \c true when at least one task still waits for its barrier acknowledgement.
+ */
+static bool HasFinishingChat()
+{
+	for (const AgentChatEntry &chat : _agent_chat.chats) {
+		if (chat.task_active && (chat.task_finishing || chat.stop_pending)) return true;
+	}
+	return false;
+}
+
+/**
+ * Check whether one more periodic read fits into the in-flight budget.
+ *
+ * Only the periodic reads are gated: an explicit Stop or Send is a user action and is queued
+ * unconditionally, so a slow backend can never drop it.
+ * @return \c true when the read may be queued.
+ */
+static bool AgentChatCanQueueRead()
+{
+	return _agent_chat.pending_requests < AGENT_CHAT_MAX_PENDING_REQUESTS;
+}
+
 /** Mark the agent chat windows dirty. */
 static void InvalidateAgentChatWindows()
 {
@@ -678,13 +709,15 @@ static void AgentChatRefreshChat(const std::string &chat_id);
  * @param path Request path, including the query string.
  * @param body Request body, ignored for GET requests.
  * @param on_success Called on the main thread with the response of a successful request.
+ * @param on_failure Called on the main thread when the request failed; optional.
  */
-static void AgentChatRequest(const std::string &method, const std::string &path, const Json &body, std::function<void(const Json &)> on_success)
+static void AgentChatRequest(const std::string &method, const std::string &path, const Json &body, std::function<void(const Json &)> on_success, std::function<void()> on_failure = {})
 {
 	_agent_chat.pending_requests++;
-	InGameAgent::Request(method, path, body, [on_success = std::move(on_success)](Json response, bool ok) {
+	InGameAgent::Request(method, path, body, [on_success = std::move(on_success), on_failure = std::move(on_failure)](Json response, bool ok) {
 		_agent_chat.pending_requests--;
 		if (!ok) {
+			if (on_failure) on_failure();
 			std::string message = JsonString(response, "message");
 			if (message.empty() && response.is_object() && response.contains("error")) message = JsonString(response["error"], "message");
 			if (message.empty()) message = JsonString(response, "error");
@@ -768,6 +801,11 @@ static void ApplyChatTaskState(AgentChatEntry &chat, const Json &dto)
 	 * to be re-read until the backend reports the task terminal. */
 	chat.task_finishing = chat.task_active && (status == "settling" || status == "stopping");
 	if (chat.task_active && chat.task_status.empty()) chat.task_status = GetString(STR_AGENT_CHAT_STATUS_THINKING);
+
+	/* A requested stop stays pending until the backend reports the task terminal; a fresh `running`
+	 * read alone is not a failure of the stop, it can race the stop request on its way. The stop
+	 * request failing clears the flag, and so does the terminal DTO or event. */
+	if (!chat.task_active) chat.stop_pending = false;
 }
 
 /** Load the chat list of the current world. */
@@ -1018,6 +1056,9 @@ static void AgentChatApplyEvent(AgentChatEntry &chat, const Json &event)
 	} else if (type == "epoch_changed" || type == "world_changed") {
 		_agent_chat.chats_loaded = false;
 	}
+
+	/* A stop request is only pending while its task exists; the acknowledged barrier ends the task. */
+	if (!chat.task_active) chat.stop_pending = false;
 }
 
 /**
@@ -1141,20 +1182,42 @@ static void AgentChatStop(const std::string &chat_id)
 		}
 	}
 
+	/* The request is on its way, so the task is stopping from now on - but it is not stopped: only
+	 * the acknowledged barrier ends it. Marking it locally lets the fast refresh below start now
+	 * instead of on the next one-second poll. */
+	AgentChatEntry *pending = FindChatById(id);
+	if (pending != nullptr && pending->task_active) {
+		pending->stop_pending = true;
+		pending->task_finishing = true;
+		pending->task_status = GetString(STR_AGENT_CHAT_STATUS_STOPPING);
+		InvalidateAgentChatWindows();
+	}
+	_agent_chat.next_poll = std::chrono::steady_clock::now();
+
 	AgentChatRequest("POST", "/v1/chats/" + id + "/stop", Json::object(), [id](const Json &response) {
 		AgentChatEntry *chat = FindChatById(id);
 		if (chat != nullptr) {
 			/* The stop request only marks the task stopping; it stays active (and stoppable) until
-			 * its barrier is acknowledged, so the answer decides whether Stop is still needed. */
+			 * its barrier is acknowledged, so the answer decides whether Stop is still needed. The
+			 * answer can still be the stale `stopping` of the request itself, so the chat DTO is
+			 * re-read right away and the fast refresh keeps reading it until it is terminal. */
 			const Json &task = response.is_object() && response.contains("task") ? response["task"] : Json();
 			const std::string status = JsonString(task, "status");
 			chat->task_active = IsActiveTaskStatus(status);
 			chat->task_finishing = chat->task_active;
 			chat->task_status = chat->task_active ? GetTaskStatusText(status) : GetString(STR_AGENT_CHAT_STATUS_STOPPED);
 			if (chat->task_active && chat->task_status.empty()) chat->task_status = GetString(STR_AGENT_CHAT_STATUS_STOPPING);
+			if (!chat->task_active) chat->stop_pending = false;
 		}
+		/* Read the authoritative state now, not at the next regular poll. */
+		_agent_chat.next_poll = std::chrono::steady_clock::now();
 		AgentChatPollEvents(id);
 		AgentChatRefreshChat(id);
+	}, [id]() {
+		/* The stop request itself failed, so nothing is pending any more; the task state is left to
+		 * the authoritative reads, which keep the task active until the backend says otherwise. */
+		AgentChatEntry *chat = FindChatById(id);
+		if (chat != nullptr) chat->stop_pending = false;
 	});
 }
 
@@ -2460,35 +2523,47 @@ void AgentChatGuiTick()
 		AgentChatUpdateStatusWindow();
 		return;
 	}
-	_agent_chat.next_poll = now + std::chrono::milliseconds(AGENT_CHAT_POLL_INTERVAL_MS);
+	/* While a task is stopping or settling the authoritative state is read four times as often, so
+	 * a stop shows up as soon as its barrier landed instead of on the next one-second poll. */
+	const uint interval = HasFinishingChat() ? AGENT_CHAT_FINISHING_POLL_INTERVAL_MS : AGENT_CHAT_POLL_INTERVAL_MS;
+	_agent_chat.next_poll = now + std::chrono::milliseconds(interval);
 
 	if (!_agent_chat.chats_loaded) {
-		AgentChatLoadChats();
+		if (AgentChatCanQueueRead()) AgentChatLoadChats();
 		AgentChatUpdateStatusWindow();
 		return;
+	}
+
+	/* A task whose turn ended, or whose stop is still pending, may still be settling; only the
+	 * chat DTO knows when its writes and its barrier settled, so Stop stays available until then.
+	 * That authoritative read comes first: on the fast interval the transcript and the event polls
+	 * of a busy chat must never take the last slot and starve the state Stop depends on. */
+	std::vector<std::string> finishing_ids;
+	for (const AgentChatEntry &chat : _agent_chat.chats) {
+		if (chat.task_active && (chat.task_finishing || chat.stop_pending)) finishing_ids.push_back(chat.id);
+	}
+	for (const std::string &id : finishing_ids) {
+		if (!AgentChatCanQueueRead()) break;
+		AgentChatRefreshChat(id);
 	}
 
 	const AgentChatEntry *active = GetActiveChat();
 	const std::string active_id = active != nullptr ? active->id : std::string();
 	if (active != nullptr) {
-		AgentChatLoadMessages(active_id);
-		AgentChatPollEvents(active_id);
+		if (AgentChatCanQueueRead()) AgentChatLoadMessages(active_id);
+		if (AgentChatCanQueueRead()) AgentChatPollEvents(active_id);
 	}
 
-	/* Keep the status of tasks in other chats up to date as well. */
+	/* Keep the status of tasks in other chats up to date as well. The budget is checked for every
+	 * single read, so a slow backend cannot turn the fast interval into a growing queue. */
 	std::vector<std::string> busy_ids;
 	for (const AgentChatEntry &chat : _agent_chat.chats) {
 		if (chat.task_active && chat.id != active_id) busy_ids.push_back(chat.id);
 	}
-	for (const std::string &id : busy_ids) AgentChatPollEvents(id);
-
-	/* A task whose turn ended may still be settling or stopping; only the chat DTO knows when its
-	 * writes and its barrier settled, so Stop stays available until then. */
-	std::vector<std::string> finishing_ids;
-	for (const AgentChatEntry &chat : _agent_chat.chats) {
-		if (chat.task_active && chat.task_finishing) finishing_ids.push_back(chat.id);
+	for (const std::string &id : busy_ids) {
+		if (!AgentChatCanQueueRead()) break;
+		AgentChatPollEvents(id);
 	}
-	for (const std::string &id : finishing_ids) AgentChatRefreshChat(id);
 
 	AgentChatUpdateStatusWindow();
 }
@@ -2519,6 +2594,7 @@ nlohmann::json DescribeAgentChatUi()
 		entry["title"] = chat.title;
 		entry["selected"] = active != nullptr && active->id == chat.id;
 		entry["task_active"] = chat.task_active;
+		entry["stop_pending"] = chat.stop_pending;
 		entry["status"] = GetChatStatusText(chat);
 		chats.push_back(std::move(entry));
 	}
