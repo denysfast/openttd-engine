@@ -60,9 +60,13 @@ static const int AGENT_CHAT_TRAY_LINES = 2;
 struct AgentChatAttachment {
 	std::string type;               ///< Reference type, e.g. "point", "town" or "vehicle".
 	int32_t id = -1;                ///< Object id of an object reference, -1 for points and tiles.
+	int64_t generation = -1;        ///< Lifetime generation of the object, -1 when the backend did not report one.
 	TileIndex tile = INVALID_TILE;  ///< Tile of a point or tile reference, or the location of an object.
 	std::string name;               ///< Human readable name, shown in the attachment tray.
 	std::string what;               ///< Extra classification of a tile reference.
+	std::string world_id;           ///< World the reference was created in.
+	std::string epoch;              ///< Load epoch the reference was created in.
+	Json extra = Json::object();    ///< Reference fields this UI does not know, kept verbatim.
 };
 
 /** One message of a chat transcript. */
@@ -185,6 +189,21 @@ static const Json &JsonArray(const Json &j, const char *key)
 }
 
 /**
+ * Make text that came from the backend safe to draw.
+ *
+ * The string formatter interprets the private-use control code range, so a
+ * message that happens to contain those code points could change the layout of
+ * the window or read parameters that are not there. Invalid UTF-8 is replaced
+ * as well; newlines are kept so multiline messages stay readable.
+ * @param text The text to sanitise.
+ * @return The sanitised text.
+ */
+static std::string SanitiseBackendText(std::string_view text)
+{
+	return StrMakeValid(text, {StringValidationSetting::ReplaceWithQuestionMark, StringValidationSetting::AllowNewline, StringValidationSetting::ReplaceTabCrNlWithSpace});
+}
+
+/**
  * Get the human readable name of an attachment type.
  * @param type The attachment type.
  * @return The name of the type.
@@ -209,10 +228,49 @@ static std::string GetAttachmentTypeName(const std::string &type)
  */
 static std::string GetAttachmentLabel(const AgentChatAttachment &attachment)
 {
-	if (!attachment.name.empty()) return attachment.name;
+	if (!attachment.name.empty()) return SanitiseBackendText(attachment.name);
 	if (attachment.tile != INVALID_TILE) return GetString(STR_AGENT_CHAT_ATTACHMENT_POINT, TileX(attachment.tile), TileY(attachment.tile));
 	if (attachment.id >= 0) return GetString(STR_AGENT_CHAT_ATTACHMENT_OBJECT, GetAttachmentTypeName(attachment.type), attachment.id);
 	return GetAttachmentTypeName(attachment.type);
+}
+
+/**
+ * Check whether an attachment refers to an object of another world or epoch.
+ * @param attachment The attachment.
+ * @return \c true when the reference cannot be resolved in the current world.
+ */
+static bool IsAttachmentStale(const AgentChatAttachment &attachment)
+{
+	if (!attachment.world_id.empty() && attachment.world_id != _agent_chat.world_id) return true;
+	if (!attachment.epoch.empty() && attachment.epoch != _agent_chat.epoch) return true;
+	return false;
+}
+
+/**
+ * Check whether an attachment refers to a pooled object without a lifetime generation.
+ * Ids of pooled objects (towns, stations, industries, vehicles, signs) are reused after the
+ * object is deleted, so without a generation the reference cannot be proven to be the object
+ * that was picked. Points and tiles are plain map coordinates and are never pooled.
+ * @param attachment The attachment.
+ * @return \c true when the reference is a pooled object whose generation is unknown.
+ */
+static bool IsAttachmentGenerationUnknown(const AgentChatAttachment &attachment)
+{
+	if (attachment.generation >= 0) return false;
+	return attachment.type != "point" && attachment.type != "tile";
+}
+
+/**
+ * Get the label of an attachment as shown to the player, marking stale references.
+ * @param attachment The attachment.
+ * @return The label.
+ */
+static std::string GetAttachmentDisplayLabel(const AgentChatAttachment &attachment)
+{
+	const std::string label = GetAttachmentLabel(attachment);
+	if (IsAttachmentStale(attachment)) return GetString(STR_AGENT_CHAT_ATTACHMENT_STALE, label);
+	if (IsAttachmentGenerationUnknown(attachment)) return GetString(STR_AGENT_CHAT_ATTACHMENT_UNVERIFIED, label);
+	return label;
 }
 
 /**
@@ -225,7 +283,7 @@ static std::string GetAttachmentSummary(const std::vector<AgentChatAttachment> &
 	std::string summary;
 	for (const AgentChatAttachment &attachment : attachments) {
 		if (!summary.empty()) summary += ", ";
-		summary += GetAttachmentLabel(attachment);
+		summary += GetAttachmentDisplayLabel(attachment);
 	}
 	return summary;
 }
@@ -237,12 +295,15 @@ static std::string GetAttachmentSummary(const std::vector<AgentChatAttachment> &
  */
 static Json AttachmentToJson(const AgentChatAttachment &attachment)
 {
-	Json j = Json::object();
+	Json j = attachment.extra.is_object() ? attachment.extra : Json::object();
 	j["type"] = attachment.type;
 	if (attachment.id >= 0) j["id"] = attachment.id;
+	if (attachment.generation >= 0) j["generation"] = attachment.generation;
 	if (attachment.tile != INVALID_TILE) j["tile"] = Json::array({TileX(attachment.tile), TileY(attachment.tile)});
 	if (!attachment.name.empty()) j["name"] = attachment.name;
 	if (!attachment.what.empty()) j["what"] = attachment.what;
+	if (!attachment.world_id.empty()) j["world_id"] = attachment.world_id;
+	if (!attachment.epoch.empty()) j["epoch"] = attachment.epoch;
 	return j;
 }
 
@@ -256,8 +317,20 @@ static AgentChatAttachment ParseAttachment(const Json &j)
 	AgentChatAttachment attachment;
 	attachment.type = JsonString(j, "type", "point");
 	attachment.id = static_cast<int32_t>(JsonInt(j, "id", -1));
+	attachment.generation = JsonInt(j, "generation", -1);
 	attachment.name = JsonString(j, "name");
 	attachment.what = JsonString(j, "what");
+	attachment.world_id = JsonString(j, "world_id");
+	attachment.epoch = JsonString(j, "epoch");
+
+	/* Keep the reference fields this UI does not know about, so they survive a round trip. */
+	if (j.is_object()) {
+		for (auto it = j.begin(); it != j.end(); ++it) {
+			const std::string &key = it.key();
+			if (key == "type" || key == "id" || key == "generation" || key == "tile" || key == "name" || key == "what" || key == "world_id" || key == "epoch") continue;
+			attachment.extra[key] = it.value();
+		}
+	}
 
 	const Json &tile = j.is_object() && j.contains("tile") ? j["tile"] : Json();
 	if (tile.is_array() && tile.size() == 2 && tile[0].is_number() && tile[1].is_number()) {
@@ -281,6 +354,19 @@ static Json RectToJson(const Rect &r)
 	j["right"] = r.right;
 	j["bottom"] = r.bottom;
 	return j;
+}
+
+/**
+ * Convert a window-local rectangle to screen pixels.
+ * Nested widget rectangles and #Window::GetInnerRect are relative to the window, so the window
+ * position has to be added before the rectangle can be used for real input.
+ * @param w The window the rectangle belongs to.
+ * @param r The rectangle, relative to the window.
+ * @return The rectangle in screen pixels.
+ */
+static Rect ToScreenRect(const Window &w, const Rect &r)
+{
+	return Rect{r.left + w.left, r.top + w.top, r.right + w.left, r.bottom + w.top};
 }
 
 /**
@@ -358,7 +444,7 @@ static void AgentChatRequest(const std::string &method, const std::string &path,
 			if (message.empty() && response.is_object() && response.contains("error")) message = JsonString(response["error"], "message");
 			if (message.empty()) message = JsonString(response, "error");
 			if (message.empty()) message = GetString(STR_AGENT_CHAT_ERROR_UNKNOWN);
-			_agent_chat.error = GetString(STR_AGENT_CHAT_ERROR, message);
+			_agent_chat.error = GetString(STR_AGENT_CHAT_ERROR, SanitiseBackendText(message));
 			InvalidateAgentChatWindows();
 			return;
 		}
@@ -400,6 +486,33 @@ static void AgentChatSyncContext()
 	_agent_chat.connected = connected;
 }
 
+/**
+ * Read the task state of a chat from a chat DTO.
+ *
+ * The backend reports the running task as `task_active`/`task_status`; the
+ * `latest_task` object is used as a fallback for payloads that only carry the
+ * last task. A chat without any of these fields is treated as idle.
+ * @param chat The chat to update.
+ * @param dto The chat DTO.
+ */
+static void ApplyChatTaskState(AgentChatEntry &chat, const Json &dto)
+{
+	const bool has_active = dto.is_object() && dto.contains("task_active") && !dto["task_active"].is_null();
+	chat.task_active = JsonBool(dto, "task_active", false);
+	chat.task_status = SanitiseBackendText(JsonString(dto, "task_status"));
+
+	const Json &latest = dto.is_object() && dto.contains("latest_task") ? dto["latest_task"] : Json();
+	if (latest.is_object()) {
+		const std::string status = JsonString(latest, "status");
+		if (!has_active) {
+			chat.task_active = JsonBool(latest, "active", false) || status == "queued" || status == "dispatched" || status == "running" || status == "started";
+		}
+		if (chat.task_status.empty()) chat.task_status = SanitiseBackendText(status);
+	}
+
+	if (chat.task_active && chat.task_status.empty()) chat.task_status = GetString(STR_AGENT_CHAT_STATUS_THINKING);
+}
+
 /** Load the chat list of the current world. */
 static void AgentChatLoadChats()
 {
@@ -421,8 +534,8 @@ static void AgentChatLoadChats()
 			AgentChatEntry chat;
 			chat.id = JsonString(entry, "chat_id", JsonString(entry, "id"));
 			if (chat.id.empty()) continue;
-			chat.title = JsonString(entry, "title");
-			chat.task_active = JsonBool(entry, "task_active");
+			chat.title = SanitiseBackendText(JsonString(entry, "title"));
+			ApplyChatTaskState(chat, entry);
 			_agent_chat.chats.push_back(std::move(chat));
 		}
 
@@ -474,7 +587,7 @@ static void AgentChatCreateChat(std::function<void()> then = {})
 			_agent_chat.error = GetString(STR_AGENT_CHAT_ERROR_UNKNOWN);
 			return;
 		}
-		chat.title = JsonString(chat_json, "title", GetString(STR_AGENT_CHAT_DEFAULT_TITLE, static_cast<int32_t>(_agent_chat.chats.size() + 1)));
+		chat.title = SanitiseBackendText(JsonString(chat_json, "title", GetString(STR_AGENT_CHAT_DEFAULT_TITLE, static_cast<int32_t>(_agent_chat.chats.size() + 1))));
 
 		_agent_chat.chats.push_back(std::move(chat));
 		_agent_chat.active = static_cast<int>(_agent_chat.chats.size() - 1);
@@ -517,8 +630,8 @@ static void AgentChatLoadMessages(const std::string &chat_id)
 			AgentChatMessage message;
 			message.seq = JsonInt(entry, "seq", 0);
 			message.role = JsonString(entry, "role", "assistant");
-			message.text = JsonString(entry, "text");
-			message.status = JsonString(entry, "status");
+			message.text = SanitiseBackendText(JsonString(entry, "text"));
+			message.status = SanitiseBackendText(JsonString(entry, "status"));
 			for (const Json &attachment : JsonArray(entry, "attachments")) {
 				message.attachments.push_back(ParseAttachment(attachment));
 			}
@@ -555,7 +668,7 @@ static void AgentChatApplyEvent(AgentChatEntry &chat, const Json &event)
 		chat.task_status = GetString(STR_AGENT_CHAT_STATUS_THINKING);
 	} else if (type == "tool_call") {
 		chat.task_active = true;
-		const std::string tool = JsonString(event, "tool", JsonString(event, "name"));
+		const std::string tool = SanitiseBackendText(JsonString(event, "tool", JsonString(event, "name")));
 		chat.task_status = tool.empty() ? GetString(STR_AGENT_CHAT_STATUS_THINKING) : GetString(STR_AGENT_CHAT_STATUS_TOOL, tool);
 	} else if (type == "tool_result") {
 		chat.task_active = true;
@@ -749,7 +862,7 @@ static std::vector<Rect> LayoutTrayChips(const Rect &area)
 	const int height = GetCharacterHeight(FontSize::Normal) + WidgetDimensions::scaled.vsep_normal;
 
 	for (const AgentChatAttachment &attachment : _agent_chat.tray) {
-		const int width = GetStringBoundingBox(GetAttachmentLabel(attachment)).width + WidgetDimensions::scaled.hsep_wide * 2 + GetCharacterHeight(FontSize::Normal);
+		const int width = GetStringBoundingBox(GetAttachmentDisplayLabel(attachment)).width + WidgetDimensions::scaled.hsep_wide * 2 + GetCharacterHeight(FontSize::Normal);
 		if (x + width > area.right && x > area.left) {
 			x = area.left;
 			y += height;
@@ -884,7 +997,7 @@ struct AgentChatWindow : Window {
 			if (i == _agent_chat.active) GfxFillRect(row, PC_DARK_BLUE);
 			if (chat.task_active) GfxFillRect(Rect{row.left, row.top, row.left + ScaleGUITrad(2), row.bottom}, PC_ORANGE);
 
-			std::string title = chat.title.empty() ? chat.id : chat.title;
+			const std::string title = SanitiseBackendText(chat.title.empty() ? chat.id : chat.title);
 			DrawString(row.left + ScaleGUITrad(4), row.right, row.top, title, i == _agent_chat.active ? TextColour::White : TextColour::Black);
 			y += row_height;
 		}
@@ -954,7 +1067,7 @@ struct AgentChatWindow : Window {
 
 		for (size_t i = 0; i < rows.size(); i++) {
 			const Json &candidate = _agent_chat.candidates[i];
-			std::string label = JsonString(candidate, "name");
+			std::string label = SanitiseBackendText(JsonString(candidate, "name"));
 			if (label.empty()) label = GetString(STR_AGENT_CHAT_ATTACHMENT_OBJECT, GetAttachmentTypeName(JsonString(candidate, "type", "object")), JsonInt(candidate, "id", -1));
 			DrawString(rows[i].left + ScaleGUITrad(4), rows[i].right, rows[i].top, label, TextColour::Cream);
 		}
@@ -977,7 +1090,7 @@ struct AgentChatWindow : Window {
 			const Rect &chip = chips[i];
 			DrawFrameRect(chip, Colours::Grey, FrameFlag::Lowered);
 			const int remove_width = GetCharacterHeight(FontSize::Normal);
-			DrawString(chip.left + WidgetDimensions::scaled.hsep_wide, chip.right - remove_width, chip.top + WidgetDimensions::scaled.vsep_normal / 2, GetAttachmentLabel(_agent_chat.tray[i]), TextColour::Black);
+			DrawString(chip.left + WidgetDimensions::scaled.hsep_wide, chip.right - remove_width, chip.top + WidgetDimensions::scaled.vsep_normal / 2, GetAttachmentDisplayLabel(_agent_chat.tray[i]), TextColour::Black);
 			DrawString(chip.right - remove_width, chip.right, chip.top + WidgetDimensions::scaled.vsep_normal / 2, GetString(STR_AGENT_CHAT_TRAY_REMOVE), TextColour::Red);
 		}
 
@@ -1288,6 +1401,8 @@ struct AgentChatWindow : Window {
 		AgentChatAttachment attachment;
 		attachment.type = "point";
 		attachment.tile = tile;
+		attachment.world_id = _agent_chat.world_id;
+		attachment.epoch = _agent_chat.epoch;
 		attachment.name = GetString(STR_AGENT_CHAT_ATTACHMENT_POINT, TileX(tile), TileY(tile));
 		_agent_chat.tray.push_back(std::move(attachment));
 		this->UpdateWidgetStates();
@@ -1312,6 +1427,8 @@ struct AgentChatWindow : Window {
 			attachment.type = "tile";
 			attachment.tile = tile;
 			attachment.what = "landscape";
+			attachment.world_id = _agent_chat.world_id;
+			attachment.epoch = _agent_chat.epoch;
 			attachment.name = GetString(STR_AGENT_CHAT_ATTACHMENT_TILE, TileX(tile), TileY(tile));
 			_agent_chat.tray.push_back(std::move(attachment));
 		} else if (candidates.size() == 1) {
@@ -1334,6 +1451,9 @@ struct AgentChatWindow : Window {
 		AgentChatAttachment attachment = ParseAttachment(candidate);
 		if (attachment.type.empty()) attachment.type = "object";
 		if (attachment.name.empty()) attachment.name = GetString(STR_AGENT_CHAT_ATTACHMENT_OBJECT, GetAttachmentTypeName(attachment.type), attachment.id);
+		/* The candidate may already name its world and epoch; only fill in what is missing. */
+		if (attachment.world_id.empty()) attachment.world_id = _agent_chat.world_id;
+		if (attachment.epoch.empty()) attachment.epoch = _agent_chat.epoch;
 		_agent_chat.tray.push_back(std::move(attachment));
 		this->UpdateWidgetStates();
 		this->SetDirty();
@@ -1509,23 +1629,30 @@ struct AgentChatWindow : Window {
 static constexpr std::initializer_list<NWidgetPart> _nested_agent_chat_widgets = {
 	NWidget(NWID_HORIZONTAL),
 		NWidget(WWT_CLOSEBOX, Colours::Grey),
-		NWidget(WWT_CAPTION, Colours::Grey, WID_AC_CAPTION), SetStringTip(STR_AGENT_CHAT_CAPTION),
+		/* The caption takes the extra width of the title bar; without a resize step of its own the
+		 * title bar (and with it the whole window) could not grow horizontally. */
+		NWidget(WWT_CAPTION, Colours::Grey, WID_AC_CAPTION), SetResize(1, 0), SetStringTip(STR_AGENT_CHAT_CAPTION),
 		NWidget(WWT_SHADEBOX, Colours::Grey),
 		NWidget(WWT_STICKYBOX, Colours::Grey),
 		NWidget(WWT_RESIZEBOX, Colours::Grey),
 	EndContainer(),
 	NWidget(NWID_HORIZONTAL),
 		NWidget(NWID_VERTICAL),
-			NWidget(WWT_PANEL, Colours::Grey, WID_AC_CHAT_LIST), SetMinimalSize(120, 120), SetResize(0, 1), SetScrollbar(WID_AC_CHAT_SCROLL), SetToolTip(STR_AGENT_CHAT_CHAT_LIST_TOOLTIP),
-			EndContainer(),
-			NWidget(NWID_VERTICAL),
-				NWidget(NWID_VSCROLLBAR, Colours::Grey, WID_AC_CHAT_SCROLL),
+			/* Chat list and its scrollbar are one row, so the scrollbar stays a narrow vertical bar
+			 * beside the list instead of being stretched over the width of the sidebar. */
+			NWidget(NWID_HORIZONTAL),
+				NWidget(WWT_PANEL, Colours::Grey, WID_AC_CHAT_LIST), SetMinimalSize(120, 120), SetFill(0, 1), SetResize(0, 1), SetScrollbar(WID_AC_CHAT_SCROLL), SetToolTip(STR_AGENT_CHAT_CHAT_LIST_TOOLTIP),
+				EndContainer(),
+				NWidget(NWID_VERTICAL),
+					NWidget(NWID_VSCROLLBAR, Colours::Grey, WID_AC_CHAT_SCROLL),
+				EndContainer(),
 			EndContainer(),
 			NWidget(WWT_PUSHTXTBTN, Colours::Grey, WID_AC_NEW_CHAT), SetFill(1, 0), SetStringTip(STR_AGENT_CHAT_NEW_CHAT, STR_AGENT_CHAT_NEW_CHAT_TOOLTIP),
 		EndContainer(),
 		NWidget(NWID_VERTICAL),
 			NWidget(NWID_HORIZONTAL),
-				NWidget(WWT_PANEL, Colours::Grey, WID_AC_TRANSCRIPT), SetFill(1, 1), SetResize(1, 1), SetScrollbar(WID_AC_TRANSCRIPT_SCROLL), SetToolTip(STR_AGENT_CHAT_TRANSCRIPT_TOOLTIP),
+				/* The transcript carries the minimal size of the window and absorbs all extra space. */
+				NWidget(WWT_PANEL, Colours::Grey, WID_AC_TRANSCRIPT), SetMinimalSize(480, 180), SetFill(1, 1), SetResize(1, 1), SetScrollbar(WID_AC_TRANSCRIPT_SCROLL), SetToolTip(STR_AGENT_CHAT_TRANSCRIPT_TOOLTIP),
 				EndContainer(),
 				NWidget(NWID_VERTICAL),
 					NWidget(NWID_VSCROLLBAR, Colours::Grey, WID_AC_TRANSCRIPT_SCROLL),
@@ -1534,8 +1661,8 @@ static constexpr std::initializer_list<NWidgetPart> _nested_agent_chat_widgets =
 			NWidget(WWT_PANEL, Colours::Grey, WID_AC_TRAY), SetMinimalSize(0, 24), SetFill(1, 0), SetResize(1, 0),
 			EndContainer(),
 			NWidget(NWID_HORIZONTAL),
-				NWidget(WWT_PUSHTXTBTN, Colours::Grey, WID_AC_ADD_POINT), SetFill(1, 0), SetStringTip(STR_AGENT_CHAT_ADD_POINT, STR_AGENT_CHAT_ADD_POINT_TOOLTIP),
-				NWidget(WWT_PUSHTXTBTN, Colours::Grey, WID_AC_ADD_OBJECT), SetFill(1, 0), SetStringTip(STR_AGENT_CHAT_ADD_OBJECT, STR_AGENT_CHAT_ADD_OBJECT_TOOLTIP),
+				NWidget(WWT_PUSHTXTBTN, Colours::Grey, WID_AC_ADD_POINT), SetFill(1, 0), SetResize(1, 0), SetStringTip(STR_AGENT_CHAT_ADD_POINT, STR_AGENT_CHAT_ADD_POINT_TOOLTIP),
+				NWidget(WWT_PUSHTXTBTN, Colours::Grey, WID_AC_ADD_OBJECT), SetFill(1, 0), SetResize(1, 0), SetStringTip(STR_AGENT_CHAT_ADD_OBJECT, STR_AGENT_CHAT_ADD_OBJECT_TOOLTIP),
 			EndContainer(),
 			NWidget(WWT_PANEL, Colours::Grey, WID_AC_INPUT), SetMinimalSize(0, 48), SetFill(1, 0), SetResize(1, 0), SetToolTip(STR_AGENT_CHAT_INPUT_TOOLTIP),
 			EndContainer(),
@@ -1551,7 +1678,7 @@ static constexpr std::initializer_list<NWidgetPart> _nested_agent_chat_widgets =
 
 /** Window description of the agent chat window. */
 static WindowDesc _agent_chat_window_desc(
-	WindowPosition::Automatic, "agent_chat", 620, 400,
+	WindowPosition::Automatic, "agent_chat", 760, 460,
 	WindowClass::AgentChat, WindowClass::None,
 	{},
 	_nested_agent_chat_widgets
@@ -1582,7 +1709,7 @@ struct AgentChatStatusWindow : Window {
 		const AgentChatEntry *busy = FindBusyChat();
 		if (busy == nullptr) return GetString(STR_AGENT_CHAT_STATUS_IDLE);
 
-		const std::string title = busy->title.empty() ? busy->id : busy->title;
+		const std::string title = SanitiseBackendText(busy->title.empty() ? busy->id : busy->title);
 		return GetString(STR_AGENT_CHAT_STATUS_WINDOW, GetChatStatusText(*busy), title);
 	}
 
@@ -1721,8 +1848,13 @@ nlohmann::json DescribeAgentChatUi()
 		Json entry = Json::object();
 		entry["type"] = attachment.type;
 		entry["id"] = attachment.id;
-		entry["name"] = GetAttachmentLabel(attachment);
+		entry["generation"] = attachment.generation;
+		entry["name"] = GetAttachmentDisplayLabel(attachment);
 		entry["tile"] = attachment.tile == INVALID_TILE ? Json() : Json::array({TileX(attachment.tile), TileY(attachment.tile)});
+		entry["world_id"] = attachment.world_id;
+		entry["epoch"] = attachment.epoch;
+		entry["stale"] = IsAttachmentStale(attachment);
+		entry["generation_known"] = !IsAttachmentGenerationUnknown(attachment);
 		tray.push_back(std::move(entry));
 	}
 	out["tray"] = std::move(tray);
@@ -1732,7 +1864,10 @@ nlohmann::json DescribeAgentChatUi()
 		Json entry = Json::object();
 		entry["type"] = JsonString(candidate, "type");
 		entry["id"] = JsonInt(candidate, "id", -1);
+		entry["generation"] = JsonInt(candidate, "generation", -1);
 		entry["name"] = JsonString(candidate, "name");
+		entry["world_id"] = JsonString(candidate, "world_id");
+		entry["epoch"] = JsonString(candidate, "epoch");
 		candidates.push_back(std::move(entry));
 	}
 	out["candidates"] = std::move(candidates);
@@ -1745,15 +1880,35 @@ nlohmann::json DescribeAgentChatUi()
 			entry["role"] = message.role;
 			entry["text"] = message.text;
 			entry["status"] = message.status;
+			Json attachments = Json::array();
+			for (const AgentChatAttachment &attachment : message.attachments) {
+				Json item = Json::object();
+				item["type"] = attachment.type;
+				item["id"] = attachment.id;
+				item["generation"] = attachment.generation;
+				item["name"] = GetAttachmentDisplayLabel(attachment);
+				item["tile"] = attachment.tile == INVALID_TILE ? Json() : Json::array({TileX(attachment.tile), TileY(attachment.tile)});
+				item["world_id"] = attachment.world_id;
+				item["epoch"] = attachment.epoch;
+				item["stale"] = IsAttachmentStale(attachment);
+				item["generation_known"] = !IsAttachmentGenerationUnknown(attachment);
+				attachments.push_back(std::move(item));
+			}
+			entry["attachments"] = std::move(attachments);
 			messages.push_back(std::move(entry));
 		}
 	}
 	out["messages"] = std::move(messages);
 
-	/* Report the actual rectangles of the window and of the targets inside it. */
+	/* Report the actual rectangles of the window and of the targets inside it. Nested widget
+	 * rectangles and #Window::GetInnerRect are window-local, so they are offset by the window
+	 * position; "coordinate_space" names the space of every rectangle in this object. */
+	out["coordinate_space"] = "screen";
 	AgentChatWindow *w = dynamic_cast<AgentChatWindow *>(FindWindowById(WindowClass::AgentChat, 0));
 	out["window_open"] = w != nullptr;
 	if (w != nullptr) {
+		out["window_rect"] = RectToJson(Rect{w->left, w->top, w->left + w->width - 1, w->top + w->height - 1});
+
 		Json widgets = Json::object();
 		const std::pair<const char *, WidgetID> widget_names[] = {
 			{"chat_list", WID_AC_CHAT_LIST},
@@ -1770,8 +1925,11 @@ nlohmann::json DescribeAgentChatUi()
 			{"stop", WID_AC_STOP},
 		};
 		for (const auto &[name, widget] : widget_names) {
-			widgets[name] = RectToJson(w->GetWidget<NWidgetBase>(widget)->GetCurrentRect());
+			widgets[name] = RectToJson(ToScreenRect(*w, w->GetWidget<NWidgetBase>(widget)->GetCurrentRect()));
 		}
+		/* The close box has no widget id of its own, so look it up in the nested tree. */
+		const NWidgetBase *closebox = w->nested_root->GetWidgetOfType(WWT_CLOSEBOX);
+		if (closebox != nullptr) widgets["closebox"] = RectToJson(ToScreenRect(*w, closebox->GetCurrentRect()));
 		out["widgets"] = std::move(widgets);
 
 		Json chat_rows = Json::array();
@@ -1783,7 +1941,7 @@ nlohmann::json DescribeAgentChatUi()
 			const int top = list.top + (i - first) * row_height;
 			Json entry = Json::object();
 			entry["id"] = _agent_chat.chats[i].id;
-			entry["rect"] = RectToJson(Rect{list.left, top, list.right, top + row_height - 1});
+			entry["rect"] = RectToJson(ToScreenRect(*w, Rect{list.left, top, list.right, top + row_height - 1}));
 			chat_rows.push_back(std::move(entry));
 		}
 		out["chat_rows"] = std::move(chat_rows);
@@ -1795,7 +1953,7 @@ nlohmann::json DescribeAgentChatUi()
 			for (size_t i = 0; i < layout.size(); i++) {
 				Json entry = Json::object();
 				entry["seq"] = active->messages[i].seq;
-				entry["rect"] = RectToJson(layout[i]);
+				entry["rect"] = RectToJson(ToScreenRect(*w, layout[i]));
 				message_rows.push_back(std::move(entry));
 			}
 		}
@@ -1807,9 +1965,9 @@ nlohmann::json DescribeAgentChatUi()
 		for (size_t i = 0; i < chips.size(); i++) {
 			const int remove_width = GetCharacterHeight(FontSize::Normal);
 			Json entry = Json::object();
-			entry["name"] = GetAttachmentLabel(_agent_chat.tray[i]);
-			entry["rect"] = RectToJson(chips[i]);
-			entry["remove_rect"] = RectToJson(Rect{chips[i].right - remove_width, chips[i].top, chips[i].right, chips[i].bottom});
+			entry["name"] = GetAttachmentDisplayLabel(_agent_chat.tray[i]);
+			entry["rect"] = RectToJson(ToScreenRect(*w, chips[i]));
+			entry["remove_rect"] = RectToJson(ToScreenRect(*w, Rect{chips[i].right - remove_width, chips[i].top, chips[i].right, chips[i].bottom}));
 			tray_rows.push_back(std::move(entry));
 		}
 		out["tray_rows"] = std::move(tray_rows);
@@ -1819,7 +1977,7 @@ nlohmann::json DescribeAgentChatUi()
 		for (size_t i = 0; i < rows.size(); i++) {
 			Json entry = Json::object();
 			entry["name"] = JsonString(_agent_chat.candidates[i], "name");
-			entry["rect"] = RectToJson(rows[i]);
+			entry["rect"] = RectToJson(ToScreenRect(*w, rows[i]));
 			candidate_rows.push_back(std::move(entry));
 		}
 		out["candidate_rows"] = std::move(candidate_rows);
@@ -1828,8 +1986,11 @@ nlohmann::json DescribeAgentChatUi()
 	Window *status = FindWindowById(WindowClass::AgentChatStatus, 0);
 	if (status != nullptr) {
 		Json entry = Json::object();
-		entry["text"] = RectToJson(status->GetWidget<NWidgetBase>(WID_ACS_TEXT)->GetCurrentRect());
-		entry["stop"] = RectToJson(status->GetWidget<NWidgetBase>(WID_ACS_STOP)->GetCurrentRect());
+		/* The status window has its own position, so its rectangles need its own offset. */
+		entry["left"] = status->left;
+		entry["top"] = status->top;
+		entry["text"] = RectToJson(ToScreenRect(*status, status->GetWidget<NWidgetBase>(WID_ACS_TEXT)->GetCurrentRect()));
+		entry["stop"] = RectToJson(ToScreenRect(*status, status->GetWidget<NWidgetBase>(WID_ACS_STOP)->GetCurrentRect()));
 		out["status_window"] = std::move(entry);
 	} else {
 		out["status_window"] = Json();

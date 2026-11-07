@@ -14,7 +14,8 @@
 
 /**
  * Open the in-game agent chat window, or bring it to the front when it is already open.
- * The window is also reachable with the "agent_chat" hotkey (Ctrl+Shift+A by default).
+ * The window is also reachable with the "agent_chat" hotkey (Ctrl+Shift+A by default) and
+ * from the newspaper menu of the main toolbar.
  */
 void ShowAgentChatWindow();
 
@@ -35,17 +36,32 @@ void AgentChatGuiTick();
  * Nothing in here executes an action or changes any state.
  *
  * Layout of the returned object:
+ * - "coordinate_space": string, always "screen"; every rectangle in this object is in screen
+ *   pixels, i.e. window-local widget rectangles already have the window position added.
  * - "hotkey": string, the hotkey that opens the window.
  * - "window_open": bool, whether the chat window is open.
+ * - "window_rect": rectangle of the chat window itself, only present when it is open.
  * - "connected", "world_id", "epoch", "connection_id": transport state.
  * - "active_chat": string id of the selected chat, empty when there is none.
  * - "input": current text of the message input.
  * - "widgets": object mapping widget names to rectangles, only present when the window is open.
- * - "chats": array of {id, title, rect, selected, task_active}.
- * - "messages": array of {seq, role, text, rect}.
- * - "tray": array of {type, id, tile, name, rect, remove_rect}.
- * - "candidates": array of {type, id, name, rect}.
- * - "status_window": object with the status indicator rectangles, or null.
+ *   Names are chat_list, chat_scroll, new_chat, transcript, transcript_scroll, tray, add_point,
+ *   add_object, input, status, send, stop and closebox (the close box has no widget id of its
+ *   own, so it is looked up in the nested tree; Esc closes the window as well).
+ * - "chats": array of {id, title, selected, task_active, status}.
+ * - "messages": array of {seq, role, text, status, attachments}.
+ * - "tray": array of {type, id, generation, tile, name, world_id, epoch, stale, generation_known,
+ *   rect, remove_rect}.
+ * - "candidates": array of {type, id, generation, name, world_id, epoch, rect}.
+ *
+ * An attachment is {type, id, generation, name, tile, world_id, epoch, stale, generation_known}:
+ * the identity of a typed reference is kept as the backend reported it. "stale" marks a reference
+ * that belongs to another world or epoch than the current one, and "generation_known" is false
+ * for a pooled object (town, station, industry, vehicle, sign) whose generation the backend did
+ * not report, because such an id may already belong to another object. Both cases are labelled
+ * in the UI ("(stale)" / "(unverified)") and are still sent, the backend resolves them.
+ * - "status_window": object {left, top, text, stop} with the position of the status window and
+ *   the screen rectangles of its widgets, or null when it is not open.
  *
  * A rectangle is an object {left, top, right, bottom} in screen pixels.
  *

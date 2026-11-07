@@ -6346,6 +6346,7 @@ STR_BADGE_CONFIG_NAME                                           :Name
 STR_BADGE_FILTER_ANY_LABEL                                      :Any {STRING}
 
 STR_AGENT_CHAT_CAPTION                                          :{WHITE}Agent chat
+STR_AGENT_CHAT_MENU_ENTRY                                       :Agent chat
 STR_AGENT_CHAT_NEW_CHAT                                         :New chat
 STR_AGENT_CHAT_NEW_CHAT_TOOLTIP                                 :Start a new chat with the in-game agent
 STR_AGENT_CHAT_SEND                                             :Send
@@ -6375,6 +6376,8 @@ STR_AGENT_CHAT_MESSAGE_STATUS                                   : ({STRING})
 STR_AGENT_CHAT_ATTACHMENT_POINT                                 :Point {NUM}, {NUM}
 STR_AGENT_CHAT_ATTACHMENT_TILE                                  :Tile {NUM}, {NUM}
 STR_AGENT_CHAT_ATTACHMENT_OBJECT                                :{STRING} {NUM}
+STR_AGENT_CHAT_ATTACHMENT_STALE                                 :{STRING} (stale)
+STR_AGENT_CHAT_ATTACHMENT_UNVERIFIED                            :{STRING} (unverified)
 STR_AGENT_CHAT_TYPE_POINT                                       :Point
 STR_AGENT_CHAT_TYPE_TILE                                        :Tile
 STR_AGENT_CHAT_TYPE_TOWN                                        :Town

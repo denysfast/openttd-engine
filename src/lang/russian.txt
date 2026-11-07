@@ -6607,6 +6607,7 @@ STR_BADGE_CONFIG_NAME                                           :Названи�
 STR_BADGE_FILTER_ANY_LABEL                                      :Любой {STRING}
 
 STR_AGENT_CHAT_CAPTION                                          :{WHITE}Чат с агентом
+STR_AGENT_CHAT_MENU_ENTRY                                       :Чат с агентом
 STR_AGENT_CHAT_NEW_CHAT                                         :Новый чат
 STR_AGENT_CHAT_NEW_CHAT_TOOLTIP                                 :Начать новый чат с игровым агентом
 STR_AGENT_CHAT_SEND                                             :Отправить
@@ -6636,6 +6637,8 @@ STR_AGENT_CHAT_MESSAGE_STATUS                                   : ({STRING})
 STR_AGENT_CHAT_ATTACHMENT_POINT                                 :Точка {NUM}, {NUM}
 STR_AGENT_CHAT_ATTACHMENT_TILE                                  :Тайл {NUM}, {NUM}
 STR_AGENT_CHAT_ATTACHMENT_OBJECT                                :{STRING} {NUM}
+STR_AGENT_CHAT_ATTACHMENT_STALE                                 :{STRING} (устарело)
+STR_AGENT_CHAT_ATTACHMENT_UNVERIFIED                            :{STRING} (не проверено)
 STR_AGENT_CHAT_TYPE_POINT                                       :Точка
 STR_AGENT_CHAT_TYPE_TILE                                        :Тайл
 STR_AGENT_CHAT_TYPE_TOWN                                        :Город
