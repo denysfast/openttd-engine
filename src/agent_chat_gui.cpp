@@ -596,6 +596,9 @@ static void AgentChatRequest(const std::string &method, const std::string &path,
 	});
 }
 
+/** Undo the shade the chat window took to uncover the map while a click was awaited. */
+static void RestoreAgentChatPickingShade();
+
 /** Read the world context of the transport, resetting the chat list when the world changed. */
 static void AgentChatSyncContext()
 {
@@ -619,6 +622,8 @@ static void AgentChatSyncContext()
 			_agent_chat.picking_point = false;
 			_agent_chat.picking_object = false;
 		}
+		/* A tile of the old world cannot be picked any more, so the window must not stay shaded. */
+		RestoreAgentChatPickingShade();
 		/* The text draft does not refer to the world, so it is kept on purpose. */
 	}
 
@@ -1165,6 +1170,12 @@ struct AgentChatWindow : Window {
 	Scrollbar *chat_scroll = nullptr;       ///< Scrollbar of the chat list.
 	Scrollbar *transcript_scroll = nullptr; ///< Scrollbar of the transcript.
 
+	/* Temporary shade that uncovers the map while a click is awaited. */
+	bool picking_shaded = false;              ///< This window was shaded by StartPicking().
+	bool picking_was_shaded = false;          ///< Shade state before StartPicking() shaded it.
+	bool picking_had_input_focus = false;     ///< The message input had the focus before picking.
+	Rect picking_restore_rect = {0, 0, 0, 0}; ///< Window rectangle before StartPicking() shaded it.
+
 	AgentChatWindow(WindowDesc &desc) : Window(desc)
 	{
 		this->CreateNestedTree();
@@ -1666,6 +1677,46 @@ struct AgentChatWindow : Window {
 	}
 
 	/**
+	 * Shade this window while a map click is awaited, so the chat does not cover the map.
+	 *
+	 * Only this window is touched. The shade state, the rectangle and the input focus are
+	 * remembered so RestoreAfterPicking() can put them back exactly; a window that cannot shade
+	 * keeps its state untouched.
+	 */
+	void ShadeForPicking()
+	{
+		if (this->picking_shaded || this->shade_select == nullptr) return;
+
+		this->picking_was_shaded = this->IsShaded();
+		this->picking_had_input_focus = this->nested_focus != nullptr && this->nested_focus->type == WWT_EDITBOX;
+		this->picking_restore_rect = Rect{this->left, this->top, this->left + this->width - 1, this->top + this->height - 1};
+		this->picking_shaded = true;
+		this->SetShaded(true);
+		this->SetDirty();
+	}
+
+	/** Undo #ShadeForPicking(): put the shade state, the rectangle and the input focus back. */
+	void RestoreAfterPicking()
+	{
+		if (!this->picking_shaded) return;
+		this->picking_shaded = false;
+
+		/* A closing window keeps what it has; the engine does not restore anything for it. */
+		if (this->z_position == WindowList::iterator() || *this->z_position != this) return;
+
+		this->SetShaded(this->picking_was_shaded);
+		if (!this->picking_was_shaded) {
+			/* SetShaded() restores the size, but a window moved while it was shaded would keep
+			 * the moved position, so the remembered one is restored. */
+			this->left = this->picking_restore_rect.left;
+			this->top = this->picking_restore_rect.top;
+		}
+		if (this->picking_had_input_focus && this->nested_focus == nullptr) this->SetFocusedWidget(WID_AC_INPUT);
+		this->UpdateWidgetStates();
+		this->SetDirty();
+	}
+
+	/**
 	 * Start picking a tile on the map.
 	 * @param point Whether a point (rather than an object) is picked.
 	 */
@@ -1676,12 +1727,15 @@ struct AgentChatWindow : Window {
 		_agent_chat.picking_object = !point;
 		_agent_chat.candidates_open = false;
 		_agent_chat.candidates = Json::array();
+		/* The map has to be reachable: an open chat window covers the tiles around the camera. */
+		this->ShadeForPicking();
 		this->UpdateWidgetStates();
 		this->SetDirty();
 	}
 
 	void OnPlaceObject([[maybe_unused]] Point pt, TileIndex tile) override
 	{
+		this->RestoreAfterPicking();
 		if (_agent_chat.picking_point) {
 			AddPointAttachment(tile);
 		} else if (_agent_chat.picking_object) {
@@ -1694,6 +1748,7 @@ struct AgentChatWindow : Window {
 	{
 		_agent_chat.picking_point = false;
 		_agent_chat.picking_object = false;
+		this->RestoreAfterPicking();
 		this->UpdateWidgetStates();
 		this->SetDirty();
 	}
@@ -2101,6 +2156,13 @@ struct AgentChatWindow : Window {
 	}
 };
 
+/** Undo the shade the chat window took to uncover the map while a click was awaited. */
+static void RestoreAgentChatPickingShade()
+{
+	AgentChatWindow *w = dynamic_cast<AgentChatWindow *>(FindWindowById(WindowClass::AgentChat, 0));
+	if (w != nullptr) w->RestoreAfterPicking();
+}
+
 /** Widget parts of the agent chat window. */
 static constexpr std::initializer_list<NWidgetPart> _nested_agent_chat_widgets = {
 	NWidget(NWID_HORIZONTAL),
@@ -2393,8 +2455,26 @@ nlohmann::json DescribeAgentChatUi()
 	out["coordinate_space"] = "screen";
 	AgentChatWindow *w = dynamic_cast<AgentChatWindow *>(FindWindowById(WindowClass::AgentChat, 0));
 	out["window_open"] = w != nullptr;
+
+	/* The viewport is where a map click lands; a test picks a point inside it and outside the
+	 * (shaded) chat window instead of guessing coordinates. */
+	const Window *main = FindWindowById(WindowClass::MainWindow, 0);
+	if (main != nullptr && main->viewport != nullptr) {
+		out["viewport_rect"] = RectToJson(Rect{main->viewport->left, main->viewport->top,
+				main->viewport->left + main->viewport->width - 1, main->viewport->top + main->viewport->height - 1});
+	}
+
 	if (w != nullptr) {
 		out["window_rect"] = RectToJson(Rect{w->left, w->top, w->left + w->width - 1, w->top + w->height - 1});
+		/* The actual shade state, not the intent: a window that cannot shade stays unshaded. */
+		out["shaded"] = w->IsShaded();
+		out["picking"] = Json::object({
+			{"active", _agent_chat.picking_point || _agent_chat.picking_object},
+			{"kind", _agent_chat.picking_point ? "point" : (_agent_chat.picking_object ? "object" : "")},
+			{"shaded", w->picking_shaded},
+			{"was_shaded", w->picking_was_shaded},
+			{"restore_rect", RectToJson(w->picking_restore_rect)},
+		});
 
 		Json widgets = Json::object();
 		const std::pair<const char *, WidgetID> widget_names[] = {
