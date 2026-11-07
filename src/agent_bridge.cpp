@@ -10,6 +10,7 @@
 #include "stdafx.h"
 #include "agent_bridge.h"
 
+#include "agent_capture.h"
 #include "agent_chat_gui.h"
 #include "command_func.h"
 #include "company_base.h"
@@ -38,6 +39,7 @@
 #include "town.h"
 #include "town_cmd.h"
 #include "vehicle_base.h"
+#include "video/video_driver.hpp"
 
 #include "3rdparty/fmt/format.h"
 
@@ -81,6 +83,13 @@ constexpr int MAX_QUERY_LIMIT = 500;
 constexpr int MAX_QUERY_TILES = 4096;
 /** Maximum number of references a single world.objects or expected_refs may carry. */
 constexpr size_t MAX_OBJECT_REFS = 64;
+
+/**
+ * Maximum number of captures that may wait for the next draw tick. A capture is
+ * taken on the draw thread, so a request that is scheduled but not drawn yet
+ * holds a receipt and a result slot; the bound keeps that reservation small.
+ */
+constexpr size_t MAX_PENDING_CAPTURES = 4;
 
 /**
  * Generate a random (version 4) UUID.
@@ -258,6 +267,16 @@ BridgeState _state;                                        ///< The bridge state
 uint64_t _next_request_id = 0;                             ///< Identifier of the next request.
 std::map<uint64_t, PendingRequest> _pending;               ///< Requests that are in flight.
 std::map<uint64_t, std::unique_ptr<BridgeHTTPCallback>> _callbacks; ///< Callbacks of the requests in flight.
+
+/** A capture that waits for the next draw tick to be taken. */
+struct DeferredCapture {
+	std::string world_id; ///< The world the capture was requested for.
+	std::string epoch;    ///< The epoch the capture was requested for.
+	std::string task_id;  ///< The task the capture belongs to, if any.
+	Json params;          ///< The parameters of the capture.
+};
+
+std::map<std::string, DeferredCapture> _captures; ///< Captures waiting for the draw tick, by request id.
 
 /**
  * Build a successful method result.
@@ -1042,12 +1061,114 @@ CompanyID RequestCompanyId(const Json &request)
 }
 
 /**
+ * Turn a failed capture into a bridge error, keeping the diagnostics of the capture.
+ * @param capture The failed capture result.
+ * @return The error result.
+ */
+Json CaptureFailure(const Json &capture)
+{
+	Json result = Error(JsonString(capture, "error", "capture_failed"), "the frame could not be captured");
+	for (const char *key : {"tick", "tick_now", "width", "height", "pixels", "max_pixels", "png_bytes", "max_bytes", "max_body_bytes"}) {
+		if (capture.contains(key)) result[key] = capture[key];
+	}
+	return result;
+}
+
+/**
+ * Finish a capture that was deferred to the draw tick.
+ *
+ * Runs on the draw thread with the game state lock and the video buffer lock
+ * held, so neither the world nor the frame can change underneath it. The world,
+ * the epoch and the task barrier of the request are checked again: a load or a
+ * Stop between scheduling and drawing must not turn into a successful capture
+ * of another world. The receipt and the result are stored only here, so a
+ * placeholder is never delivered as if the capture had been applied.
+ * @param request_id The request the capture belongs to.
+ */
+void FinishDeferredCapture(const std::string &request_id)
+{
+	const auto capture = _captures.find(request_id);
+	if (capture == _captures.end()) return;
+	const DeferredCapture deferred = std::move(capture->second);
+	_captures.erase(capture);
+
+	/*
+	 * The backend invalidates the requests of an epoch it no longer serves, so a
+	 * capture of a world that is gone is dropped instead of answered with a result
+	 * the backend would reject as stale and the bridge would retry forever.
+	 */
+	if (deferred.world_id != _state.world_id || deferred.epoch != _state.epoch) {
+		Debug(Facility::Net, Severity::Info, "In-game agent bridge: dropping capture {} of a world that is gone", request_id);
+		return;
+	}
+
+	Json result;
+	if (!IsWorldReady()) {
+		result = Error("world_not_ready", "the world is being generated or loaded");
+	} else if (!deferred.task_id.empty() && _state.barrier_tasks.find(deferred.task_id) != _state.barrier_tasks.end()) {
+		result = Error("task_stopped", "the task has been stopped");
+	} else {
+		const Json capture_result = CaptureGameFrame(deferred.params);
+		result = capture_result.value("ok", false) ? Ok(capture_result) : CaptureFailure(capture_result);
+	}
+
+	StoreReceipt(request_id, result);
+	if (!QueueResult(request_id, result)) {
+		Debug(Facility::Net, Severity::Warning, "In-game agent bridge: result queue is full; the capture result stays in its receipt");
+	}
+}
+
+/**
+ * Schedule a capture for the next draw tick.
+ *
+ * The capture must not run inside the game loop: the draw thread takes the video
+ * buffer lock before the game state lock, so copying the frame from the game
+ * thread would invert that order. VideoDriver::QueueOnMainThread runs the
+ * callback on the next draw tick with both locks held, which is exactly the
+ * context CaptureGameFrame() documents.
+ * @param request The request, as received from the backend.
+ * @param request_id The id of the request.
+ * @param params The parameters of the capture.
+ * @param deferred Set to true iff the capture was scheduled and answers later.
+ * @return The result of the request; a placeholder when the capture was scheduled.
+ */
+Json ScheduleCapture(const Json &request, const std::string &request_id, const Json &params, bool &deferred)
+{
+	/* A replay of a request that is already waiting must not schedule a second capture. */
+	if (_captures.find(request_id) != _captures.end()) {
+		deferred = true;
+		return Ok({{"deferred", true}});
+	}
+
+	/* Without a GUI there is no draw tick to run the callback on, so the queue would never drain. */
+	VideoDriver *driver = VideoDriver::GetInstance();
+	if (driver == nullptr || !driver->HasGUI()) {
+		return Error("headless_unavailable", "no video driver with a GUI; the frame cannot be captured");
+	}
+
+	/* Reserve the receipt and the result of the capture before it is scheduled, so the
+	 * answer can always be stored and delivered when the draw tick runs. */
+	if (_captures.size() >= MAX_PENDING_CAPTURES ||
+			_state.results.size() + _captures.size() >= MAX_PENDING_RESULTS ||
+			_state.receipts.size() + _captures.size() >= MAX_RECEIPTS) {
+		return Error("busy", "too many captures are waiting for the next draw tick");
+	}
+
+	_captures[request_id] = DeferredCapture{_state.world_id, _state.epoch, JsonString(request, "task_id"), params};
+	driver->QueueOnMainThread([request_id]() { FinishDeferredCapture(request_id); });
+	deferred = true;
+	return Ok({{"deferred", true}});
+}
+
+/**
  * Execute one request from the backend on the main thread.
  * @param request The request, as received from the backend.
- * @return The result of the request.
+ * @param deferred Set to true iff the request answers later, from the draw tick.
+ * @return The result of the request; a placeholder when the request was deferred.
  */
-Json ExecuteRequest(const Json &request)
+Json ExecuteRequest(const Json &request, bool &deferred)
 {
+	deferred = false;
 	const std::string method = JsonString(request, "method");
 	const Json params = request.contains("params") && request["params"].is_object() ? request["params"] : Json::object();
 	const std::string task_id = JsonString(request, "task_id");
@@ -1088,6 +1209,9 @@ Json ExecuteRequest(const Json &request)
 
 	/* Read-only description of the native chat UI, so a GUI test can locate real targets. */
 	if (method == "ui.inspect") return Ok(::DescribeAgentChatUi());
+
+	/* The frame is copied on the draw thread, so the capture answers from the next draw tick. */
+	if (method == "world.capture") return ScheduleCapture(request, JsonString(request, "request_id"), params, deferred);
 
 	return Error("unsupported_method", method);
 }
@@ -1144,7 +1268,12 @@ void HandlePollResponse(bool ok, const Json &body)
 					complete = false;
 					break;
 				}
-				result = ExecuteRequest(request);
+				bool deferred = false;
+				result = ExecuteRequest(request, deferred);
+				if (deferred) {
+					/* The capture answers from the draw tick: no receipt and no result yet. */
+					continue;
+				}
 				StoreReceipt(request_id, result);
 			}
 
@@ -1256,7 +1385,7 @@ void SendHello()
 		{"world_id", _state.world_id},
 		{"epoch", _state.epoch},
 		{"build", std::string(_openttd_revision)},
-		{"capabilities", Json::array({"world.info", "world.query", "world.objects", "world.pause", "world.rename", "task.barrier", "ui.inspect"})},
+		{"capabilities", Json::array({"world.info", "world.query", "world.objects", "world.pause", "world.rename", "world.capture", "task.barrier", "ui.inspect"})},
 	};
 
 	Send(RequestKind::Hello, "/v1/engine/hello", body.dump(), _state.engine_token, _state.epoch, nullptr);
@@ -1358,6 +1487,8 @@ void ResetWorld()
 	_state.receipts.clear();
 	_state.receipt_order.clear();
 	_state.barrier_tasks.clear();
+	/* Captures waiting for the draw tick belong to the world that is gone; their callbacks find nothing and drop them. */
+	_captures.clear();
 	/* Requests in flight are kept: their completions are ignored by epoch, and UI callbacks still get their answer. */
 }
 
