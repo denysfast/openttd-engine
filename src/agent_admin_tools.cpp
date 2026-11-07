@@ -458,7 +458,15 @@ bool RunBuildIndustryArea(Targs... args)
 }
 
 /**
- * Add the cost and the engine error of one command result to a result document.
+ * Add the cost, the engine error and the execution mode of one command result to a result document.
+ *
+ * The mode is stated explicitly, also for an actual execution: a receipt that leaves `dry_run` out
+ * cannot be told apart from one that never carried the flag, and the audit reads this boolean to
+ * decide whether a write really applied. The flags belong to this helper only, because it is the
+ * one that is called after `Command<Tcmd>::Post` captured the engine's own result; a read, a save
+ * or a load acceptance never gets them. This module has no dry run, so an executed command states
+ * `dry_run` false and `estimated` false.
+ *
  * @param result The result document to complete.
  * @param cost The result the engine reported.
  * @return The completed document.
@@ -466,6 +474,8 @@ bool RunBuildIndustryArea(Targs... args)
 Json AddCommandResult(Json result, const CommandCost &cost)
 {
 	result["cost"] = static_cast<int64_t>(cost.GetCost());
+	result["estimated"] = false;
+	result["dry_run"] = false;
 	if (cost.Failed()) {
 		result["ok"] = false;
 		result["error"] = "command_failed";
@@ -494,6 +504,9 @@ Json AddCommandResult(Json result)
 
 /**
  * Report that the engine did not run the command at all.
+ *
+ * Nothing was applied, so the receipt states no execution mode at all: it carries no `dry_run` flag,
+ * so no reader can take it for a non-dry execution.
  * @param result The result document to complete.
  * @return The completed document.
  */
@@ -4258,7 +4271,7 @@ Json AdminToolCapabilities()
 			"world.project op=list_saves",
 	});
 	result["notes"] = Json::array({
-		"Actual mutations go through Command<Commands::...>::Post, the normal player command path, so the engine's own eligibility, pause and finance checks apply; results carry the actual cost and the engine error.",
+		"Actual mutations go through Command<Commands::...>::Post, the normal player command path, so the engine's own eligibility, pause and finance checks apply; results carry the actual cost and the engine error, and every command receipt states its mode explicitly (`dry_run` false and `estimated` false), while a command that never ran answers `command_not_executed`.",
 		"world.settings.get returns the setting descriptors with their current value, type, scope, allowed values or range, default and whether they can be changed now.",
 		"world.settings.set validates the name, the scope, the type and the range before it posts Commands::ChangeSetting or Commands::ChangeCompanySetting, and reports the value the engine actually applied.",
 		"world.company op=create uses Commands::CompanyControl with CompanyCtrlAction::NewAI, the only company creation the single player engine has; the created id is read back from the company pool.",

@@ -200,14 +200,20 @@ Json NotExecuted(Json result)
 
 /**
  * Mark whether a result holds an actual execution or a cost estimate.
+ *
+ * Both flags are always written, also for an actual execution: a receipt that leaves `dry_run` out
+ * cannot be told apart from one that never carried the flag, and the audit reads this boolean to
+ * decide whether a write really applied. `estimated` and `dry_run` state the same thing here, the
+ * mode of this very call.
+ *
  * @param result Tool result to complete.
- * @param dry_run True when the result is a `dry_run` estimate.
+ * @param dry_run True when the result is a `dry_run` estimate, false for an actual execution.
  * @return The completed tool result.
  */
 Json MarkExecution(Json result, bool dry_run)
 {
 	result["estimated"] = dry_run;
-	if (dry_run) result["dry_run"] = true;
+	result["dry_run"] = dry_run;
 	return result;
 }
 
@@ -2593,7 +2599,7 @@ Json OrdersSet(const Json &params, CompanyID company, bool replace)
 			if (!RunCommandAt<Commands::DeleteOrder>(false, current->tile, &AgentCommandCallback, veh_id, 0)) {
 				result["deleted"] = deleted;
 				if (!_posted.captured) return NotExecuted(std::move(result));
-				return PartialResult(std::move(result), spent, _posted);
+				return MarkExecution(PartialResult(std::move(result), spent, _posted), false);
 			}
 			spent += _posted.cost.GetCost();
 			deleted++;
@@ -2616,7 +2622,7 @@ Json OrdersSet(const Json &params, CompanyID company, bool replace)
 			result["deleted"] = deleted;
 			result["inserted"] = inserted;
 			if (!_posted.captured) return NotExecuted(std::move(result));
-			return PartialResult(std::move(result), spent, _posted);
+			return MarkExecution(PartialResult(std::move(result), spent, _posted), false);
 		}
 		spent += _posted.cost.GetCost();
 		inserted++;
@@ -2630,7 +2636,7 @@ Json OrdersSet(const Json &params, CompanyID company, bool replace)
 				result["refit_cargo_id"] = static_cast<uint8_t>(cargo);
 				result["refit_order_index"] = insert_index;
 				if (!_posted.captured) return NotExecuted(std::move(result));
-				return PartialResult(std::move(result), spent, _posted);
+				return MarkExecution(PartialResult(std::move(result), spent, _posted), false);
 			}
 			spent += _posted.cost.GetCost();
 		}
@@ -2642,7 +2648,7 @@ Json OrdersSet(const Json &params, CompanyID company, bool replace)
 	result["inserted"] = inserted;
 	result["orders"] = after != nullptr ? after->GetNumOrders() : 0;
 	result["cost"] = static_cast<int64_t>(spent);
-	return result;
+	return MarkExecution(std::move(result), false);
 }
 
 /**
@@ -2690,7 +2696,7 @@ Json OrdersShared(const Json &params, CompanyID company)
 	if (!RunCommandAt<Commands::CloneOrder>(false, v->tile, &AgentCommandCallback, CO_SHARE, v->index, source->index)) {
 		if (!_posted.captured) return NotExecuted(std::move(result));
 	}
-	return CommandResult(_posted, std::move(result));
+	return MarkExecution(CommandResult(_posted, std::move(result)), false);
 }
 
 /**
@@ -2725,10 +2731,10 @@ Json OrdersGroup(const Json &params, CompanyID company)
 	if (!RunCommand<Commands::AddVehicleToGroup>(false, &AgentAddVehicleToGroupCallback, group_id, v->index, false, VehicleListIdentifier{})) {
 		result["group_id"] = group_id.base();
 		if (!_posted.captured) return NotExecuted(std::move(result));
-		return CommandResult(_posted, std::move(result));
+		return MarkExecution(CommandResult(_posted, std::move(result)), false);
 	}
 	result["group_id"] = _posted.group.base();
-	return CommandResult(_posted, std::move(result));
+	return MarkExecution(CommandResult(_posted, std::move(result)), false);
 }
 
 /**
@@ -3229,7 +3235,7 @@ Json GameToolCapabilities()
 	result["query_aliases"] = std::move(aliases);
 	result["unimplemented_methods"] = Json::array({"world.info", "world.objects", "world.pause", "world.rename", "world.settings.get", "world.settings.set", "world.capture", "task.barrier"});
 	result["notes"] = Json::array({
-		"Actual mutations go through Command::Post, the normal player command path, so the engine's own eligibility, pause and finance checks apply; results carry the actual cost and the created ids.",
+		"Actual mutations go through Command::Post, the normal player command path, so the engine's own eligibility, pause and finance checks apply; results carry the actual cost and the created ids, and every command receipt states its mode explicitly (`dry_run` and `estimated` are always present, and false for an actual execution).",
 		"Ops and kinds this module does not implement are left to the other modules: DispatchGameTool returns nullopt instead of a gap, so nothing shadows the bridge kernel, transport or admin.",
 		"Every op declares the parameters it reads; a parameter that would not be applied is rejected with `invalid_arguments` instead of being silently dropped.",
 		"world.construct accepts `dry_run`, which only queries the cost and reports `estimated: true`.",

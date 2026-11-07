@@ -153,14 +153,20 @@ Json PartialResult(Json result, Money spent, const PostedCommand &posted)
 
 /**
  * Mark whether a result holds an actual execution or a cost estimate.
+ *
+ * Both flags are always written, also for an actual execution: a receipt that leaves `dry_run` out
+ * cannot be told apart from one that never carried the flag, and the audit reads this boolean to
+ * decide whether a write really applied. `estimated` and `dry_run` state the same thing here, the
+ * mode of this very call.
+ *
  * @param result Tool result to complete.
- * @param dry_run True when the result is a `dry_run` estimate.
+ * @param dry_run True when the result is a `dry_run` estimate, false for an actual execution.
  * @return The completed tool result.
  */
 Json MarkExecution(Json result, bool dry_run)
 {
 	result["estimated"] = dry_run;
-	if (dry_run) result["dry_run"] = true;
+	result["dry_run"] = dry_run;
 	return result;
 }
 
@@ -2180,7 +2186,7 @@ Json TransportToolCapabilities()
 	result["methods"] = std::move(methods);
 	result["unimplemented_methods"] = Json::array({"world.query", "world.vehicles", "world.orders", "world.info", "world.objects", "world.pause", "world.rename", "world.settings.get", "world.settings.set", "world.capture", "task.barrier"});
 	result["notes"] = Json::array({
-		"Actual mutations go through Command::Post, the normal player command path, so the engine's own eligibility, pause and finance checks apply; results carry the actual cost and the ids read back from the map: station_id, depot_id and waypoint_id.",
+		"Actual mutations go through Command::Post, the normal player command path, so the engine's own eligibility, pause and finance checks apply; results carry the actual cost and the ids read back from the map: station_id, depot_id and waypoint_id, and every command receipt states its mode explicitly (`dry_run` and `estimated` are always present, and false for an actual execution).",
 		"world.construct accepts `dry_run`, which only queries the cost and reports `estimated: true`.",
 		"op=rail builds or removes track on `tiles`, or along a straight `from`/`to` run; `track` defaults to the run's axis.",
 		"op=signal builds or removes one signal per tile, or along a straight `from`/`to` run at `spacing` tiles (default 4, 1 to 20) with `autofill` and `minimise_gaps`; `signal_type` is block (default), entry, exit, combo, path or path_one_way, and `signal_direction` is both (default), one_way or one_way_reverse.",

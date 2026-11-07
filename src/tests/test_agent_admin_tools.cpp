@@ -21,6 +21,7 @@
 #include "../3rdparty/catch2/catch.hpp"
 
 #include "../agent_admin_tools.h"
+#include "../company_base.h"
 #include "../fileio_func.h"
 #include "../openttd.h"
 #include "../town_growth.h"
@@ -90,6 +91,40 @@ static Json Dispatch(std::string_view method, const Json &params)
 	REQUIRE(result.has_value());
 	return *result;
 }
+
+namespace {
+
+/**
+ * A real company in the engine's own company pool, removed again when the guard goes out of scope.
+ *
+ * The command cases need a company the engine can pay and report on: a placeholder id is enough for
+ * the validation cases, but not for a command that really runs and reads the company's money.
+ */
+class AdminCompanyGuard {
+public:
+	AdminCompanyGuard()
+	{
+		/* The pool asserts that the allocation was checked, as the other agent cases do. */
+		REQUIRE(Company::CanAllocateItem());
+		this->company = Company::Create();
+		REQUIRE(this->company != nullptr);
+	}
+
+	~AdminCompanyGuard()
+	{
+		if (this->company != nullptr) delete this->company;
+	}
+
+	CompanyID Id() const { return this->company->index; }
+
+	/** The money the engine currently holds for the company. */
+	int64_t Money() const { return static_cast<int64_t>(this->company->money); }
+
+private:
+	Company *company = nullptr; ///< The company, or nullptr when it was not created.
+};
+
+} // namespace
 
 TEST_CASE("Agent admin tools: capabilities")
 {
@@ -887,8 +922,42 @@ TEST_CASE("Agent admin tools: normal command path for a boolean setting")
 	CHECK(changed["value"] == new_value);
 	CHECK(changed["cost"] == 0);
 
+	/* The receipt of the posted command states its mode explicitly: a write without an explicit
+	 * `dry_run` boolean cannot be told apart from one that never carried the flag. */
+	REQUIRE(changed.contains("dry_run"));
+	REQUIRE(changed["dry_run"].is_boolean());
+	CHECK(changed["dry_run"] == false);
+	CHECK(changed["estimated"] == false);
+
 	const Json restored = Dispatch("world.settings.set", Json::object({{"name", "construction.build_on_slopes"}, {"value", old_value}}));
 	REQUIRE(restored["ok"] == true);
 	CHECK(restored["value"] == old_value);
 }
 
+TEST_CASE("Agent admin tools: a money cheat states an actual execution")
+{
+	/* The cheat posts Commands::MoneyCheat through the normal player command path, so its receipt is
+	 * the one a funding step is audited by: it has to state the mode of that execution explicitly,
+	 * and the money has to have moved in the engine, not only in the answer. */
+	AdminCompanyGuard company;
+	const int64_t before = company.Money();
+
+	const std::optional<Json> granted = DispatchAdminTool("world.cheat",
+			Json::object({{"op", "money"}, {"amount", 20000}}), company.Id());
+	REQUIRE(granted.has_value());
+	REQUIRE((*granted)["ok"] == true);
+
+	/* A receipt without an explicit `dry_run` boolean cannot be told apart from one that never
+	 * carried the flag, which is what made the grant unreadable in the chat audit. */
+	REQUIRE(granted->contains("dry_run"));
+	REQUIRE((*granted)["dry_run"].is_boolean());
+	CHECK((*granted)["dry_run"] == false);
+	CHECK((*granted)["estimated"] == false);
+
+	/* The income is the engine's own negative cost, and the balance after it is the engine's. */
+	CHECK((*granted)["cost"] == -20000);
+	CHECK((*granted)["amount"] == 20000);
+	REQUIRE((*granted)["money_after"].is_number_integer());
+	CHECK((*granted)["money_after"] == before + 20000);
+	CHECK(company.Money() == before + 20000);
+}
