@@ -964,6 +964,9 @@ uint32_t TileObjectFingerprint(TileObjectKind kind, TileIndex tile)
 		}
 
 		case TileObjectKind::House: {
+			/* Both the stored id and its translation: a NewGRF mapping can translate two different
+			 * stored ids to the same HouseID, so the translated type alone misses the raw identity. */
+			MixFingerprint(hash, GetCleanHouseType(tile));
 			MixFingerprint(hash, GetHouseType(tile));
 			MixFingerprint(hash, GetHouseRandomBits(tile));
 			const Town *town = Town::GetIfValid(GetTownIndex(tile));
@@ -2796,7 +2799,7 @@ Json CoreContracts()
 		{"tile_types", "terrain, water, tree, rail, signal, road, tram, bridge, tunnel, mapobject, house; `tile` is the generic spelling and takes `what`"},
 		{"tile_fields", "type, what, subtype, identity, tile, owner, fingerprint"},
 		{"owner", "the owner the engine records for that category: rail, signal, bridge, tunnel, water and mapobject use the tile owner; road and tram use the owner of their own transport type, so the road and the tram on one tile can report different owners; terrain, tree and house report null; OWNER_WATER (open sea) and OWNER_NONE report null"},
-		{"house_fields", "a house adds town_id and town_generation: the identity is the tile (house type and random bits) plus the lifetime of its town, never the whole town. A house has no pool generation of its own, so a same-type reconstruction on the same tile in the same town with the same random bits is not distinguishable"},
+		{"house_fields", "a house adds town_id and town_generation: the identity is the tile (the stored house id, its translated HouseID and the random bits) plus the lifetime of its town, never the whole town. A house has no pool generation of its own, so a same-type reconstruction on the same tile in the same town with the same random bits is not distinguishable"},
 		{"mapobject_fields", "a map object adds object_id and object_generation: the pooled object behind the tile is part of the identity, so replacing it with one of the same type is a different identity"},
 		{"point_fields", "type=point, identity=point, tile; no fingerprint, so a point names a location and can never be stale"},
 		{"fingerprint", "FNV-1a over the native tile values that identify the object and its state (tile type, height, the category fields, the recorded owner and both halves of every 64 bit pool lifetime), not over map-array bytes and not over an address"},

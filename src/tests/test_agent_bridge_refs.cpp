@@ -249,10 +249,14 @@ TEST_CASE("Agent bridge refs: a house carries the lifetime of its town")
 	CHECK(mismatch["found"] == false);
 	CHECK(mismatch["reason"] == "town_lifetime_mismatch");
 
-	/* The house type is part of the tile identity. */
+	/* The stored house id is part of the tile identity, not only its NewGRF translation: the
+	 * translation of an unmapped id can still be the same HouseID, so the raw id has to be in the
+	 * fingerprint for the change below to be observable at all. */
+	REQUIRE(GetCleanHouseType(tile) == 0);
 	SetHouseType(tile, 1);
+	REQUIRE(GetCleanHouseType(tile) == 1);
 	const Json changed = ResolveObjectRef(ref, true);
-	CHECK(changed["found"] == false);
+	REQUIRE_FALSE(changed["found"].get<bool>());
 	CHECK(changed["reason"] == "tile_state_changed");
 }
 
