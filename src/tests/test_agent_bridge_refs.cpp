@@ -83,6 +83,7 @@ Json TileRef(const Json &row)
 Town *TestTown(TileIndex tile)
 {
 	for (const Town *existing : Town::Iterate()) return const_cast<Town *>(existing);
+	REQUIRE(Town::CanAllocateItem());
 	return Town::Create(tile);
 }
 
@@ -350,6 +351,7 @@ TEST_CASE("Agent bridge refs: a map object carries the lifetime of the pooled ob
 	MapFixture map;
 
 	const TileIndex tile = TileXY(44, 44);
+	REQUIRE(Object::CanAllocateItem());
 	Object *first = Object::Create(ObjectType{0}, nullptr, TileArea(tile, 1, 1), TimerGameCalendar::Date{0}, 0);
 	REQUIRE(first != nullptr);
 	MakeObject(tile, Owner{0}, first->index, WaterClass::Invalid, 0);
@@ -375,8 +377,9 @@ TEST_CASE("Agent bridge refs: a map object carries the lifetime of the pooled ob
 	/* The object is replaced by one of the same type: the pool hands out a new lifetime, so the
 	 * reference is no longer the object the caller planned for. */
 	const uint64_t first_generation = first->generation;
-	const uint32_t first_type = first->type;
+	const ObjectType first_type = first->type;
 	delete first;
+	REQUIRE(Object::CanAllocateItem());
 	Object *second = Object::Create(ObjectType{first_type}, nullptr, TileArea(tile, 1, 1), TimerGameCalendar::Date{0}, 0);
 	REQUIRE(second != nullptr);
 	MakeObject(tile, Owner{0}, second->index, WaterClass::Invalid, 0);
