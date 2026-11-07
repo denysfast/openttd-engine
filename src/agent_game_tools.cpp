@@ -2471,11 +2471,6 @@ std::optional<Json> ReadOrder(const Json &entry, Order &order)
 	return std::nullopt;
 }
 
-std::optional<Json> ReadOrderForTest(const Json &entry, Order &order)
-{
-	return ReadOrder(entry, order);
-}
-
 /**
  * Replace or extend the order list of a vehicle.
  * @param params Method parameters.
@@ -3006,6 +3001,18 @@ Json Capability(std::string_view method, std::string_view authority, std::initia
 }
 
 } // namespace
+
+/* Outside the anonymous namespace: the header declares this seam, so the test binary has to link it. */
+/**
+ * Build one order from the tool's order object, for the tests.
+ * @param entry The order object.
+ * @param order Receives the order.
+ * @return Error result, or an empty optional when the order was built.
+ */
+std::optional<Json> ReadOrderForTest(const Json &entry, Order &order)
+{
+	return ReadOrder(entry, order);
+}
 
 /**
  * The name the game itself shows for an engine.

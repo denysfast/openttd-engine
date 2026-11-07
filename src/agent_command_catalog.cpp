@@ -1105,11 +1105,6 @@ bool DecodeOrder(const Json &value, Order &out, Json &normalized, std::string &e
 	return true;
 }
 
-bool DecodeOrderForTest(const Json &value, Order &out, Json &normalized, std::string &error)
-{
-	return DecodeOrder(value, out, normalized, error);
-}
-
 /**
  * Decode a JSON value into a command argument.
  * @param value The JSON value.
@@ -2370,6 +2365,20 @@ Json DispatchWorldCommand(const Json &params, CompanyID company)
 }
 
 } // namespace
+
+/* Outside the anonymous namespace: the header declares this seam, so the test binary has to link it. */
+/**
+ * Decode one Order from its catalog JSON, for the tests.
+ * @param value The order JSON.
+ * @param out Receives the order.
+ * @param normalized Receives the order as the catalog reports it back.
+ * @param error Receives the reason when the value is rejected.
+ * @return True when the order was decoded.
+ */
+bool DecodeOrderForTest(const Json &value, Order &out, Json &normalized, std::string &error)
+{
+	return DecodeOrder(value, out, normalized, error);
+}
 
 /**
  * Capture the actual cost of the command that was just posted.
