@@ -11,10 +11,12 @@
 #define AGENT_BRIDGE_H
 
 #include "3rdparty/nlohmann/json.hpp"
+#include "company_type.h"
 #include "tile_type.h"
 
 #include <functional>
 #include <string>
+#include <string_view>
 
 /**
  * Native bridge between the running game and the in-game agent backend.
@@ -109,6 +111,78 @@ Json ResolveObjectRef(const Json &ref, bool require_identity);
  * @param callback Called with the parsed response and whether it succeeded.
  */
 void Request(std::string method, std::string path, Json body, std::function<void(Json, bool)> callback);
+
+/**
+ * The backend's acknowledgement of one delivered result.
+ *
+ * The backend applies a result and answers `{ok, applied, request_id, status}`. HTTP 2xx alone is not
+ * a confirmation that the result was applied, so a request that must only take effect after the
+ * backend accepted it (a savegame load) waits for this acknowledgement.
+ */
+struct ResultAck {
+	bool delivered = false; ///< The answer belongs to the delivered request and the backend took it.
+	bool applied = false;   ///< The backend applied the result; a duplicate delivery counts as applied.
+};
+
+/**
+ * Read the backend's acknowledgement of a result delivery.
+ * @param body The parsed answer body.
+ * @param request_id The request whose result was delivered.
+ * @return The acknowledgement.
+ */
+ResultAck ParseResultAck(const Json &body, std::string_view request_id);
+
+/**
+ * Whether an armed savegame load still belongs to the current world.
+ * @param load_world The world the load was armed in.
+ * @param load_epoch The epoch the load was armed in.
+ * @param load_company The company of the request that armed it, or CompanyID::Invalid().
+ * @param world The current world id.
+ * @param epoch The current epoch.
+ * @param local_company The current local company.
+ * @return True iff the load may still start.
+ */
+bool PendingLoadStillCurrent(std::string_view load_world, std::string_view load_epoch, CompanyID load_company,
+		std::string_view world, std::string_view epoch, CompanyID local_company);
+
+/**
+ * Whether a task barrier of a task cancels the pending load of that task.
+ * @param load_task The task that armed the load.
+ * @param barrier_task The task whose barrier was received.
+ * @return True iff the pending load is cancelled.
+ */
+bool PendingLoadCancelledByBarrier(std::string_view load_task, std::string_view barrier_task);
+
+/**
+ * Whether a second savegame load has to be refused because one is already waiting.
+ * @param method The method of the request.
+ * @param op The operation of the request.
+ * @param pending_load_armed Whether a load is already waiting for its acknowledgement.
+ * @return True iff the request must be refused before it is executed.
+ */
+bool SavegameLoadRefused(std::string_view method, std::string_view op, bool pending_load_armed);
+
+/**
+ * Whether a savegame load is waiting for the backend's acknowledgement of its result.
+ * @return True iff a load is pending.
+ */
+bool HasPendingLoad();
+
+/**
+ * Arm a pending load, for the state tests.
+ * @param request_id The request whose acknowledgement starts the load.
+ * @param file The savegame file the load reads.
+ * @param task_id The task of the request.
+ * @param actor The company the request acts for.
+ * @param player The local player at the time the load is armed.
+ */
+void ArmPendingLoadForTest(std::string request_id, std::string file, std::string task_id, CompanyID actor, CompanyID player);
+
+/**
+ * The local player captured when the pending load was armed.
+ * @return The company the load is guarded against, or CompanyID::Invalid() when nothing is armed.
+ */
+CompanyID PendingLoadPlayer();
 
 } // namespace InGameAgent
 

@@ -20,6 +20,8 @@
 #include "core/enum_type.hpp"
 #include "economy_cmd.h"
 #include "economy_type.h"
+#include "fileio_func.h"
+#include "fileio_type.h"
 #include "gfx_type.h"
 #include "industry.h"
 #include "industry_cmd.h"
@@ -30,6 +32,8 @@
 #include "newgrf_object.h"
 #include "object_cmd.h"
 #include "object_type.h"
+#include "openttd.h"
+#include "saveload/saveload_func.h"
 #include "core/random_func.hpp"
 #include "settings_cmd.h"
 #include "settings_internal.h"
@@ -43,6 +47,7 @@
 #include "station_type.h"
 #include "string_func.h"
 #include "strings_func.h"
+#include "timer/timer_game_economy.h"
 #include "town.h"
 #include "town_cmd.h"
 #include "town_districts.h"
@@ -55,7 +60,9 @@
 #include <algorithm>
 #include <array>
 #include <charconv>
+#include <chrono>
 #include <cmath>
+#include <filesystem>
 #include <optional>
 #include <string>
 #include <vector>
@@ -118,6 +125,8 @@ constexpr size_t MAX_SETTING_LIMIT = 500;
 constexpr size_t DEFAULT_LIST_LIMIT = 64;
 /** Maximum number of rows returned by one bounded list query. */
 constexpr size_t MAX_LIST_LIMIT = 512;
+/** Maximum number of bytes of one savegame name. */
+constexpr size_t MAX_SAVE_NAME_BYTES = 64;
 
 /**
  * Build an error document.
@@ -818,6 +827,98 @@ std::string PresidentName(const Company *c)
 }
 
 /**
+ * The index of the economy quarter the current delivered-cargo counter belongs to.
+ *
+ * The engine resets `Company::cur_economy` every quarter: `EconomyMonthlyLoop` moves it into
+ * `old_economy[0]` and clears it on the first day of the months 0, 3, 6 and 9 (economy.cpp, "Only run
+ * the economic statistics and update company stats every 3rd economy month (1st of quarter)"), so a
+ * counter only accumulates inside one quarter. The index changes exactly when the counter restarts.
+ * @return The quarter index, `year * 4 + quarter`, monotonic while the game runs.
+ */
+int EconomyPeriodIndex()
+{
+	return TimerGameEconomy::year.base() * 4 + static_cast<int>(TimerGameEconomy::month) / 3;
+}
+
+/**
+ * The economy period the current delivered-cargo counter belongs to.
+ *
+ * Two samples with the same `period_index` can be subtracted; when it changed, the counter restarted
+ * at zero and the delta across the two samples is not a delivery count. `delivered_cargo_history`
+ * then holds the finished quarters.
+ * @return The period descriptor.
+ */
+Json EconomyPeriodJson()
+{
+	const int year = TimerGameEconomy::year.base();
+	const int month = static_cast<int>(TimerGameEconomy::month);
+	return {
+		{"period_index", EconomyPeriodIndex()},
+		{"year", year},
+		{"month", month},
+		{"quarter", month / 3 + 1},
+		{"months_into_period", month % 3},
+		{"length_months", 3},
+		{"date", TimerGameEconomy::date.base()},
+	};
+}
+
+/**
+ * Serialise the delivered cargo of one economy period.
+ *
+ * The amounts are the engine's own counters of the cargo units the company delivered
+ * (`CompanyEconomyEntry::delivered_cargo`), per cargo type, so they are units of cargo and neither
+ * money nor cargo waiting at a station. A zero is a real "nothing delivered in this period" and is
+ * reported as 0, never as null and never as a made up value.
+ * @param delivered The per-cargo counters of one period.
+ * @param non_zero_only Leave out the cargos that delivered nothing.
+ * @return Array of {cargo_id, label, amount}, ordered by cargo id.
+ */
+Json DeliveredCargoJson(const CargoArray &delivered, bool non_zero_only)
+{
+	Json rows = Json::array();
+	for (uint i = 0; i < NUM_CARGO; i++) {
+		const CargoType cargo = static_cast<CargoType>(i);
+		const uint amount = delivered[cargo];
+		if (non_zero_only && amount == 0) continue;
+		const CargoSpec *cs = CargoSpec::Get(cargo);
+		rows.push_back({
+			{"cargo_id", static_cast<uint8_t>(cargo)},
+			{"label", cs->IsValid() ? Json(cs->label.AsString()) : Json(nullptr)},
+			{"amount", amount},
+		});
+	}
+	return rows;
+}
+
+/**
+ * The delivered cargo of the completed economy periods the company still carries.
+ *
+ * `old_economy[0]` is the quarter that just ended, `old_economy[1]` the one before it, and
+ * `num_valid_stat_ent` says how many entries are valid; the engine shifts the array by one on every
+ * quarter, so the periods are consecutive and entry `i` is `period_index - i - 1`.
+ * @param c The company.
+ * @param period_index The index of the current period.
+ * @return Array of {periods_ago, period_index, delivered_cargo, total, cargo_count}, newest first.
+ */
+Json DeliveredCargoHistoryJson(const Company *c, int period_index)
+{
+	Json rows = Json::array();
+	const uint periods = std::min<uint>(c->num_valid_stat_ent, MAX_HISTORY_QUARTERS);
+	for (uint i = 0; i < periods; i++) {
+		const CompanyEconomyEntry &entry = c->old_economy[i];
+		rows.push_back({
+			{"periods_ago", i + 1},
+			{"period_index", period_index - static_cast<int>(i) - 1},
+			{"delivered_cargo", DeliveredCargoJson(entry.delivered_cargo, true)},
+			{"total", entry.delivered_cargo.GetSum<uint64_t>()},
+			{"cargo_count", entry.delivered_cargo.GetCount()},
+		});
+	}
+	return rows;
+}
+
+/**
  * The finance and context of one company.
  * @param company The company; must be valid.
  * @return The description.
@@ -843,6 +944,14 @@ Json CompanyInfo(CompanyID company)
 	info["performance_history"] = c->cur_economy.performance_history;
 	info["months_of_bankruptcy"] = c->months_of_bankruptcy;
 	info["inaugurated_year"] = c->inaugurated_year.base();
+	/* The cargo this company really delivered, per cargo, for the current quarter and the finished
+	 * quarters the engine still keeps. The period index is what a delta has to be taken within. */
+	const int period_index = EconomyPeriodIndex();
+	info["delivered_cargo_period"] = EconomyPeriodJson();
+	info["delivered_cargo"] = DeliveredCargoJson(c->cur_economy.delivered_cargo, false);
+	info["delivered_cargo_total"] = c->cur_economy.delivered_cargo.GetSum<uint64_t>();
+	info["delivered_cargo_count"] = c->cur_economy.delivered_cargo.GetCount();
+	info["delivered_cargo_history"] = DeliveredCargoHistoryJson(c, period_index);
 	return info;
 }
 
@@ -2795,6 +2904,283 @@ Json TownsOp(const Json &params, CompanyID company)
 	return MakeGap("world.towns", op);
 }
 
+/* --- world.project: savegames --- */
+
+/**
+ * The private savegame directory of this user.
+ *
+ * The engine creates exactly this directory under the personal directory at startup (fileio.cpp, the
+ * `default_subdirs` loop), so it is the per-user save directory and nothing else. `FioFindDirectory()`
+ * is deliberately not used: it returns the first existing search path, which may be a shared or the
+ * working directory. `FileList` is not used either, because listing through it assigns the UI's
+ * `_fios_path`. No host path ever comes from the caller.
+ *
+ * @return The directory, with a trailing path separator.
+ */
+std::string _savegame_directory_for_test; ///< Directory that replaces the private save directory, for the tests.
+
+std::string PersonalSaveDirectory()
+{
+	if (!_savegame_directory_for_test.empty()) {
+		std::string dir = _savegame_directory_for_test;
+		if (dir.back() != PATHSEPCHAR) dir += PATHSEP;
+		return dir;
+	}
+	return fmt::format("{}save{}", _personal_dir, PATHSEP);
+}
+
+/**
+ * Drop the trailing path separators of a path.
+ *
+ * `weakly_canonical()` keeps a trailing separator as an empty last component, so "/x/save/" and
+ * "/x/save" name the same directory but compare unequal. Both sides of the containment check are
+ * normalised, so a directory path with a trailing separator is accepted like the same path without.
+ *
+ * @param path The path to normalise.
+ * @return The path without trailing separators.
+ */
+std::filesystem::path StripTrailingSeparators(std::filesystem::path path)
+{
+	while (path.has_relative_path() && path.filename().empty()) path = path.parent_path();
+	return path;
+}
+
+/**
+ * The extension the engine's own writer uses for a savegame of the current game mode.
+ * @return ".sav" in a normal game, ".scn" in the scenario editor.
+ */
+std::string_view SavegameExtension()
+{
+	return _game_mode == GameMode::Editor ? ".scn" : ".sav";
+}
+
+/**
+ * Read and validate the `name` parameter of a savegame operation.
+ *
+ * The name is one plain file name: it can never name a directory, a drive or another host path, and it
+ * is portable to Windows (no separator, no reserved character, no trailing space or dot, no device
+ * name), so a save written here can be read on every platform the engine supports.
+ *
+ * @param params The method parameters.
+ * @param name Receives the name.
+ * @return An error document, or nothing when the name is usable.
+ */
+std::optional<Json> ReadSavegameName(const Json &params, std::string &name)
+{
+	switch (ReadString(params, "name", name)) {
+		case ParamState::Invalid: return MakeError("invalid_arguments", "`name` must be a string");
+		case ParamState::Absent: return MakeError("invalid_arguments", "`name` is required");
+		case ParamState::Present: break;
+	}
+
+	if (name.empty() || name.size() > MAX_SAVE_NAME_BYTES) {
+		return MakeError("invalid_arguments", "`name` must be 1 to 64 bytes", {{"max_bytes", MAX_SAVE_NAME_BYTES}});
+	}
+
+	for (const char c : name) {
+		if (static_cast<uint8_t>(c) < 0x20 || c == 0x7F) {
+			return MakeError("invalid_arguments", "`name` must not contain control characters", {{"name", name}});
+		}
+		if (c == '/' || c == '\\' || c == ':' || c == '*' || c == '?' || c == '"' || c == '<' || c == '>' || c == '|') {
+			return MakeError("invalid_arguments", "`name` must be a plain file name without a path", {{"name", name}});
+		}
+	}
+
+	/* Portable on Windows: no leading or trailing space and no trailing dot, so the name is not trimmed there. */
+	if (name.front() == ' ' || name.back() == ' ' || name.back() == '.') {
+		return MakeError("invalid_arguments", "`name` must not start with a space or end with a space or a dot", {{"name", name}});
+	}
+
+	/* A Windows device name stays reserved with an extension, so `CON`, `con.foo` and `NUL.old` all name a
+	 * device and not a file; only the part before the first dot decides. */
+	static const std::string_view reserved[] = {"CON", "PRN", "AUX", "NUL", "COM1", "COM2", "COM3", "COM4", "COM5",
+			"COM6", "COM7", "COM8", "COM9", "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9"};
+	const std::string_view base = std::string_view(name).substr(0, name.find('.'));
+	for (const std::string_view device : reserved) {
+		if (StrEqualsIgnoreCase(base, device)) {
+			return MakeError("invalid_arguments", "`name` is a reserved device name", {{"name", name}});
+		}
+	}
+	return std::nullopt;
+}
+
+/**
+ * Check that a savegame file stays inside the private save directory.
+ *
+ * A symbolic link in the save directory is a way out of it, so a savegame that is one is refused: the
+ * engine would read or write the file the link names, which may be any host path.
+ *
+ * @param name The savegame name, for the diagnostics.
+ * @param file The full path of the savegame file.
+ * @return An error document, or nothing when the path is usable.
+ */
+std::optional<Json> CheckSavegamePath(const std::string &name, const std::string &file)
+{
+	std::error_code error_code;
+	const std::filesystem::path path = OTTD2FS(file);
+	if (std::filesystem::is_symlink(path, error_code)) {
+		return MakeError("invalid_path", "the savegame file is a symbolic link", {{"name", name}});
+	}
+	error_code.clear();
+
+	/* The directory the file lives in must be the private save directory, not a link to another one. */
+	const std::filesystem::path dir = StripTrailingSeparators(std::filesystem::weakly_canonical(OTTD2FS(PersonalSaveDirectory()), error_code));
+	if (error_code) return MakeError("invalid_path", "the private save directory cannot be resolved");
+	const std::filesystem::path parent = StripTrailingSeparators(std::filesystem::weakly_canonical(path.parent_path(), error_code));
+	if (error_code || parent != dir) {
+		return MakeError("invalid_path", "the savegame is not inside the private save directory", {{"name", name}});
+	}
+	return std::nullopt;
+}
+
+/**
+ * The bytes a file has, for the savegame documents.
+ * @param file The full path.
+ * @return The size, or nothing when it cannot be read.
+ */
+std::optional<uint64_t> FileBytes(const std::string &file)
+{
+	std::error_code error_code;
+	const auto size = std::filesystem::file_size(OTTD2FS(file), error_code);
+	if (error_code) return std::nullopt;
+	return static_cast<uint64_t>(size);
+}
+
+/**
+ * Save the running game under a savegame name.
+ *
+ * The engine's own writer is used synchronously, so `saved` is only reported after the file is
+ * complete; an existing savegame is only replaced when the caller asked for it.
+ *
+ * @param params The method parameters.
+ * @return The result document.
+ */
+Json SaveGameOp(const Json &params)
+{
+	std::string name;
+	if (const auto error = ReadSavegameName(params, name)) return *error;
+
+	bool overwrite = false;
+	switch (ReadBool(params, "overwrite", overwrite)) {
+		case ParamState::Invalid: return MakeError("invalid_arguments", "`overwrite` must be a boolean");
+		case ParamState::Present: break;
+		case ParamState::Absent: break;
+	}
+
+	if (_game_mode != GameMode::Normal && _game_mode != GameMode::Editor) {
+		return MakeError("world_not_ready", "there is no game to save");
+	}
+
+	const std::string dir = PersonalSaveDirectory();
+	const std::string file = fmt::format("{}{}{}", dir, name, SavegameExtension());
+	if (const auto error = CheckSavegamePath(name, file)) return *error;
+
+	if (FileExists(file) && !overwrite) {
+		return MakeError("save_exists", "a savegame with that name exists", {{"name", name}, {"overwrite", false}});
+	}
+
+	FioCreateDirectory(dir);
+	if (SaveOrLoad(file, SaveLoadOperation::Save, DetailedFileType::GameFile, Subdirectory::None, false) != SaveLoadResult::Ok) {
+		return MakeError("save_failed", "the engine could not save the game",
+				{{"name", name}, {"reason", GetSaveLoadErrorMessage().GetDecodedString()}});
+	}
+
+	Json result = Json::object();
+	result["ok"] = true;
+	result["saved"] = true;
+	result["name"] = name;
+	result["file"] = fmt::format("{}{}", name, SavegameExtension());
+	if (const std::optional<uint64_t> bytes = FileBytes(file); bytes.has_value()) result["bytes"] = *bytes;
+	return result;
+}
+
+/**
+ * List the savegames of the private save directory.
+ *
+ * Only the files of that one directory are read, never a host path and never a link out of it, and the
+ * answer is bounded like every other list query.
+ *
+ * @param params The method parameters.
+ * @return The result document.
+ */
+Json ListSavesOp(const Json &params)
+{
+	size_t offset = 0;
+	size_t limit = 0;
+	if (const auto error = ReadListWindow(params, offset, limit)) return *error;
+
+	std::vector<Json> rows;
+	std::error_code error_code;
+	for (std::filesystem::directory_iterator it(OTTD2FS(PersonalSaveDirectory()), error_code), end;
+			!error_code && it != end; it.increment(error_code)) {
+		const std::filesystem::directory_entry &entry = *it;
+		std::error_code entry_error;
+		/* A link is not a savegame of this directory: following it would read a host path. */
+		if (entry.is_symlink(entry_error) || entry_error) continue;
+		if (!entry.is_regular_file(entry_error) || entry_error) continue;
+
+		const std::string extension = entry.path().extension().string();
+		if (!StrEqualsIgnoreCase(extension, ".sav") && !StrEqualsIgnoreCase(extension, ".scn")) continue;
+
+		Json row = Json::object();
+		row["name"] = entry.path().stem().string();
+		row["file"] = entry.path().filename().string();
+		const auto bytes = entry.file_size(entry_error);
+		if (!entry_error) row["bytes"] = static_cast<uint64_t>(bytes);
+		entry_error.clear();
+		const auto written = entry.last_write_time(entry_error);
+		if (!entry_error) {
+			row["mtime"] = static_cast<int64_t>(std::chrono::duration_cast<std::chrono::seconds>(written.time_since_epoch()).count());
+		}
+		rows.push_back(std::move(row));
+	}
+
+	std::sort(rows.begin(), rows.end(), [](const Json &a, const Json &b) {
+		return a["name"].get<std::string>() < b["name"].get<std::string>();
+	});
+
+	Json saves = Json::array();
+	for (size_t i = offset; i < rows.size() && saves.size() < limit; i++) saves.push_back(rows[i]);
+
+	Json result = Json::object();
+	result["ok"] = true;
+	result["saves"] = std::move(saves);
+	result["total"] = rows.size();
+	result["offset"] = offset;
+	result["limit"] = limit;
+	return result;
+}
+
+/**
+ * Accept a savegame load.
+ *
+ * The world is not loaded here: the answer is an acceptance, and the bridge switches the world only
+ * after the backend acknowledged this very result. The name is resolved against the private save
+ * directory only, so a load can never name a host path.
+ *
+ * @param params The method parameters.
+ * @return The result document.
+ */
+Json LoadGameOp(const Json &params)
+{
+	std::string name;
+	if (const auto error = ReadSavegameName(params, name)) return *error;
+
+	const std::string file = fmt::format("{}{}{}", PersonalSaveDirectory(), name, SavegameExtension());
+	if (const auto error = CheckSavegamePath(name, file)) return *error;
+	if (!FileExists(file)) return MakeError("unknown_save", "there is no savegame with that name", {{"name", name}});
+
+	Json result = Json::object();
+	result["ok"] = true;
+	result["loading"] = true;
+	result["accepted"] = true;
+	result["name"] = name;
+	result["file"] = fmt::format("{}{}", name, SavegameExtension());
+	/* The bridge keeps the path and strips it before the result is sent, so the answer has no host path. */
+	result["pending_load"] = Json{{"file", file}, {"name", name}};
+	return result;
+}
+
 /* --- world.project --- */
 
 /**
@@ -3039,6 +3425,10 @@ Json ProjectOp(const Json &params, CompanyID company)
 		});
 		return result;
 	}
+
+	if (op == "save") return SaveGameOp(params);
+	if (op == "list_saves") return ListSavesOp(params);
+	if (op == "load") return LoadGameOp(params);
 
 	return MakeGap("world.project", op);
 }
@@ -3794,6 +4184,16 @@ void AgentAdminBuildIndustryAreaCallback([[maybe_unused]] Commands cmd, const Co
 	_posted_industry_area.count = count;
 }
 
+void SetSavegameDirectoryForTest(const std::string &directory)
+{
+	_savegame_directory_for_test = directory;
+}
+
+std::optional<Json> CheckSavegamePathForTest(const std::string &name, const std::string &file)
+{
+	return CheckSavegamePath(name, file);
+}
+
 Json AdminToolCapabilities()
 {
 	Json methods = Json::array();
@@ -3825,8 +4225,9 @@ Json AdminToolCapabilities()
 			{"money", "bank_balance"},
 			{"magic_bulldozer", "ignore_vehicle_limits", "change_date"}));
 	methods.push_back(Capability("world.project", "write",
-			{"power", "power_fuel", "station_town", "district", "catchment", "catchment_upgrade", "settings"},
-			{"save", "load"}));
+			{"power", "power_fuel", "station_town", "district", "catchment", "catchment_upgrade", "settings",
+					"save", "list_saves", "load"},
+			{}));
 
 	Json result = Json::object();
 	result["module"] = "agent_admin_tools";
@@ -3854,6 +4255,7 @@ Json AdminToolCapabilities()
 			"world.project op=district",
 			"world.project op=catchment",
 			"world.project op=settings",
+			"world.project op=list_saves",
 	});
 	result["notes"] = Json::array({
 		"Actual mutations go through Command<Commands::...>::Post, the normal player command path, so the engine's own eligibility, pause and finance checks apply; results carry the actual cost and the engine error.",
@@ -3874,7 +4276,8 @@ Json AdminToolCapabilities()
 		"world.project op=catchment is a query; op=catchment_upgrade posts Commands::UpgradeStationCatchment as the station owner and reports the level before and after.",
 		"Every list query (world.industry op=list, world.signs op=list, world.towns op=list, world.landscape op=object_types, world.project op=catchment) is bounded: `limit` defaults to 64, `limit` is at most 512 and `offset` skips rows, and the result always reports the `total` number of rows.",
 		"world.industry op=set_flags covers the closure control (the no_closure flag); op=set_production reports the production level before and after, and the engine marks the industry as externally controlled.",
-		"world.project op=save/load is not implemented: the durable save lifecycle is left to the bridge.",
+		"world.project op=save writes the running game synchronously into the private save directory and replaces an existing savegame only when `overwrite` is true; op=list_saves lists that directory, bounded like every other list query.",
+		"world.project op=load only accepts the load: the bridge switches the world through the normal SwitchMode path after the backend acknowledged the result, so the answer says `loading`, never `loaded`.",
 	});
 
 	return result;
@@ -3896,7 +4299,7 @@ bool IsAdminMutation(std::string_view method, const Json &params)
 	if (method == "world.industry") return op != "list" && op != "types" && op != "info" && op != "needs" && op != "production" && op != "cargo";
 	if (method == "world.signs") return op != "list" && op != "info";
 	if (method == "world.landscape") return op != "object_types";
-	return op != "power" && op != "district" && op != "catchment" && op != "settings";
+	return op != "power" && op != "district" && op != "catchment" && op != "settings" && op != "list_saves";
 }
 
 std::optional<Json> DispatchAdminTool(std::string_view method, const Json &params, CompanyID company)

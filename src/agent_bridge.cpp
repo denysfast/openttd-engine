@@ -29,6 +29,7 @@
 #include "depot_base.h"
 #include "depot_map.h"
 #include "engine_base.h"
+#include "fileio_type.h"
 #include "genworld.h"
 #include "group.h"
 #include "industry.h"
@@ -42,6 +43,7 @@
 #include "progress.h"
 #include "rail_map.h"
 #include "rev.h"
+#include "saveload/saveload_func.h"
 #include "road_map.h"
 #include "signs_base.h"
 #include "signs_cmd.h"
@@ -295,6 +297,24 @@ struct TimingStats {
 	uint64_t overruns = 0; ///< Executions that took longer than the budget of their class.
 };
 
+/**
+ * A savegame load that was accepted but not started yet.
+ *
+ * The world is only switched after the backend acknowledged the result of the request that asked for
+ * the load, so the acceptance cannot be lost between the bridge and the backend.
+ */
+struct PendingLoad {
+	bool armed = false;          ///< Whether a load is waiting for its acknowledgement.
+	std::string request_id;      ///< The request whose acknowledgement starts the load.
+	std::string file;            ///< The savegame file the load reads.
+	std::string name;            ///< The savegame name, for the diagnostics.
+	std::string task_id;         ///< The task of the request.
+	std::string world_id;        ///< The world the load was armed in.
+	std::string epoch;           ///< The epoch the load was armed in.
+	CompanyID actor = CompanyID::Invalid();   ///< The company the request acted for.
+	CompanyID player = CompanyID::Invalid();  ///< The local player at the time the load was armed.
+};
+
 /** All state of the bridge. */
 struct BridgeState {
 	bool initialised = false; ///< Whether the runtime configuration has been read.
@@ -323,6 +343,7 @@ struct BridgeState {
 	std::map<std::string, Receipt> receipts; ///< Results of executed requests, by request id.
 	std::deque<std::string> receipt_order; ///< Order in which receipts were stored.
 	std::set<std::string> barrier_tasks;   ///< Tasks whose barrier has been acknowledged.
+	PendingLoad pending_load;              ///< The load waiting for the backend acknowledgement.
 
 	uint32_t pause_revision_at_epoch = 0; ///< Pause revision the current epoch started with.
 	TimingStats query_timing;             ///< Inline reads answered on the game thread.
@@ -2446,6 +2467,14 @@ Json ExecuteRequestInner(const Json &request, bool &deferred)
 	 */
 	if (!IsWorldReady()) return Error("world_not_ready", "the world is being generated or loaded");
 
+	/*
+	 * Only one savegame load may wait for the backend acknowledgement of its result. A second load is
+	 * refused here, before it is executed, so it never answers `loading` that would not happen.
+	 */
+	if (SavegameLoadRefused(method, JsonString(params, "op"), _state.pending_load.armed)) {
+		return Error("pending_load", "a savegame load is already waiting for the backend acknowledgement");
+	}
+
 	/* The company the call is made for; every tool module scopes its commands to it. */
 	const CompanyID company = RequestCompanyId(request);
 	const bool mutation = IsMutation(method, params);
@@ -2455,7 +2484,14 @@ Json ExecuteRequestInner(const Json &request, bool &deferred)
 
 	/* The barrier is the last request of a task; nothing of that task may mutate the world afterwards. */
 	if (method == "task.barrier") {
-		if (!task_id.empty()) _state.barrier_tasks.insert(task_id);
+		if (!task_id.empty()) {
+			_state.barrier_tasks.insert(task_id);
+			/* The task is done, so the load it asked for must not switch the world afterwards; a later
+			 * acknowledgement of that result cannot bring the load back. */
+			if (_state.pending_load.armed && PendingLoadCancelledByBarrier(_state.pending_load.task_id, task_id)) {
+				_state.pending_load = PendingLoad{};
+			}
+		}
 		return Ok({{"barrier", true}});
 	}
 
@@ -2616,6 +2652,14 @@ Json ExecuteRequest(const Json &request, bool &deferred)
 }
 
 /**
+ * Take the pending load out of the result of a request that asked for one.
+ * @param request_id The request that was just executed.
+ * @param request The request, for the method, the task and the company of the call.
+ * @param result The result of the request; the marker is removed from it.
+ */
+void TakePendingLoad(const std::string &request_id, const Json &request, Json &result);
+
+/**
  * Handle the response to a poll: execute the requests, in order, on the main thread.
  * @param ok Whether the request succeeded.
  * @param body The parsed response.
@@ -2652,6 +2696,8 @@ void HandlePollResponse(bool ok, const Json &body)
 					/* A deferred request answers from the draw tick: no receipt and no result yet. */
 					continue;
 				}
+				/* Only a request that really ran arms a load; a replay is answered from its receipt. */
+				TakePendingLoad(request_id, request, result);
 				StoreReceipt(request_id, result);
 			}
 
@@ -2678,17 +2724,112 @@ void HandlePollResponse(bool ok, const Json &body)
 }
 
 /**
- * Handle the response to a result delivery.
- * @param ok Whether the request succeeded.
+ * Take the pending load out of the result of a request that asked for one.
+ *
+ * A tool that may only take effect after the backend acknowledged its result answers with
+ * `pending_load: {file, name}` inside its value. The bridge keeps the file, arms exactly one pending
+ * load and strips the key, so the result the backend receives carries the savegame name only and
+ * never a host path. A replayed request does not arm a second load, because a replay is answered from
+ * its receipt and never executes the tool again.
+ *
+ * @param request_id The request that was just executed.
+ * @param request The request, for the method, the task and the company of the call.
+ * @param result The result of the request; the marker is removed from it.
  */
-void HandleResultResponse(bool ok)
+void TakePendingLoad(const std::string &request_id, const Json &request, Json &result)
+{
+	/* Only the savegame load may arm a load, whatever a tool puts into its result. */
+	const std::string method = JsonString(request, "method");
+	const std::string op = request.contains("params") && request["params"].is_object() ? JsonString(request["params"], "op") : std::string();
+	if (method != "world.project" || op != "load") return;
+
+	if (!result.is_object() || !result.contains("value") || !result["value"].is_object()) return;
+	Json &value = result["value"];
+	if (!value.contains("pending_load") || !value["pending_load"].is_object()) return;
+
+	const Json pending = value["pending_load"];
+	value.erase("pending_load");
+
+	const std::string file = JsonString(pending, "file");
+	if (file.empty()) return;
+	/* A second load is refused before it is accepted, so one is all that can wait here. */
+	if (_state.pending_load.armed) return;
+
+	_state.pending_load.armed = true;
+	_state.pending_load.request_id = request_id;
+	_state.pending_load.file = file;
+	_state.pending_load.name = JsonString(pending, "name");
+	_state.pending_load.task_id = JsonString(request, "task_id");
+	_state.pending_load.world_id = _state.world_id;
+	_state.pending_load.epoch = _state.epoch;
+	_state.pending_load.actor = RequestCompanyId(request);
+	/* The player guard compares the real local player, not the company a full-control request acted for. */
+	_state.pending_load.player = _local_company;
+}
+
+/**
+ * Start the armed load, once its result was acknowledged by the backend.
+ *
+ * The switch is scheduled through the normal `SwitchMode` path, which the main loop runs on its next
+ * iteration, so the load is applied by the engine itself and the epoch starts afresh. A load whose
+ * world, epoch or player changed while it waited is dropped instead of being applied to a world it
+ * was not asked for.
+ *
+ * @param request_id The request whose result the backend acknowledged.
+ */
+void MaybeStartPendingLoad(const std::string &request_id)
+{
+	if (!_state.pending_load.armed || _state.pending_load.request_id != request_id) return;
+
+	const PendingLoad load = _state.pending_load;
+	_state.pending_load = PendingLoad{};
+
+	if (!PendingLoadStillCurrent(load.world_id, load.epoch, load.player, _state.world_id, _state.epoch, _local_company)) return;
+	if (!IsWorldReady()) return;
+
+	_file_to_saveload.SetMode(FIOS_TYPE_FILE, SaveLoadOperation::Load);
+	_file_to_saveload.name = load.file;
+	_switch_mode = SwitchMode::LoadGame;
+}
+
+/**
+ * Handle the response to a result delivery.
+ *
+ * HTTP 2xx alone is not a delivery: the answer has to name the request and report that it was
+ * applied. A malformed or mismatched answer is not a delivery either, so the result is kept and
+ * delivered again, exactly like a failed delivery.
+ *
+ * @param ok Whether the HTTP request succeeded.
+ * @param body The parsed answer body.
+ */
+void HandleResultResponse(bool ok, const Json &body)
 {
 	if (!ok) {
 		_state.next_result = Clock::now() + RESULT_RETRY;
 		if (!_state.inflight_result.is_null()) _state.results.push_front(_state.inflight_result);
-	} else if (!_state.inflight_result.is_null()) {
-		/* The backend accepted the result, so its receipt may be forgotten later on. */
-		AcknowledgeReceipt(JsonString(_state.inflight_result, "request_id"));
+		_state.inflight_result = Json();
+		return;
+	}
+
+	if (_state.inflight_result.is_null()) return;
+
+	const std::string request_id = JsonString(_state.inflight_result, "request_id");
+	const ResultAck ack = ParseResultAck(body, request_id);
+	if (!ack.delivered) {
+		/* Not an answer of this delivery: keep the result, so it is delivered again. */
+		_state.next_result = Clock::now() + RESULT_RETRY;
+		_state.results.push_front(_state.inflight_result);
+		_state.inflight_result = Json();
+		return;
+	}
+
+	/* The backend took the result, so its receipt may be forgotten later on. */
+	AcknowledgeReceipt(request_id);
+	if (ack.applied) {
+		MaybeStartPendingLoad(request_id);
+	} else if (_state.pending_load.armed && _state.pending_load.request_id == request_id) {
+		/* The backend reported the result as failed, so the load must not happen. */
+		_state.pending_load = PendingLoad{};
 	}
 	_state.inflight_result = Json();
 }
@@ -2740,7 +2881,7 @@ void ProcessCompletions()
 			case RequestKind::Result:
 				if (current) {
 					_state.result_in_flight = false;
-					HandleResultResponse(ok);
+					HandleResultResponse(ok, body);
 				}
 				break;
 
@@ -3051,6 +3192,8 @@ void ResetWorld()
 	_state.receipts.clear();
 	_state.receipt_order.clear();
 	_state.barrier_tasks.clear();
+	/* A load of the world that is gone can never be applied. */
+	_state.pending_load = PendingLoad{};
 	/* Requests waiting for the draw tick belong to the world that is gone; their callbacks find nothing and drop them. */
 	_deferred.clear();
 	/* Requests in flight are kept: their completions are ignored by epoch, and UI callbacks still get their answer. */
@@ -3214,6 +3357,82 @@ void Request(std::string method, std::string path, Json body, std::function<void
 
 	Send(RequestKind::Ui, path, std::move(payload), _state.ui_token, _state.epoch,
 			[cb = std::move(callback)](bool ok, const Json &response) { if (cb) cb(response, ok); });
+}
+
+/**
+ * Read the backend's acknowledgement of a result delivery.
+ *
+ * A duplicate delivery is answered `applied:false, status:"applied"`: the backend had applied the
+ * result before, which is still a confirmation. The answer has to carry `ok:true`, the request id,
+ * a boolean `applied` and a `status` of `applied` or `failed`; an empty or legacy body is no
+ * acknowledgement, so the result is retried and a waiting load keeps waiting instead of being
+ * discarded by an answer that never said it was applied.
+ *
+ * @param body The parsed answer body.
+ * @param request_id The request whose result was delivered.
+ * @return The acknowledgement.
+ */
+ResultAck ParseResultAck(const Json &body, std::string_view request_id)
+{
+	ResultAck ack;
+	if (!body.is_object() || request_id.empty()) return ack;
+
+	/* The answer has to be the apply_result answer of this very request. An empty or legacy body is no
+	 * acknowledgement: it is retried, so a waiting load keeps waiting instead of being discarded. */
+	if (!body.contains("ok") || !body["ok"].is_boolean() || !body["ok"].get<bool>()) return ack;
+	if (JsonString(body, "request_id") != std::string(request_id)) return ack;
+	if (!body.contains("applied") || !body["applied"].is_boolean()) return ack;
+
+	const std::string status = JsonString(body, "status");
+	if (status != "applied" && status != "failed") return ack;
+
+	ack.delivered = true;
+	/* A duplicate delivery is answered applied:false with status "applied": it was applied before. An
+	 * `applied:true` with status "failed" is a contradiction and never starts a load. */
+	ack.applied = status == "applied";
+	return ack;
+}
+
+bool PendingLoadStillCurrent(std::string_view load_world, std::string_view load_epoch, CompanyID load_company,
+		std::string_view world, std::string_view epoch, CompanyID local_company)
+{
+	if (load_world != world || load_epoch != epoch) return false;
+	/* A player switch moves the world the load was planned in; the load is not applied afterwards. */
+	if (load_company != CompanyID::Invalid() && local_company != load_company) return false;
+	return true;
+}
+
+bool PendingLoadCancelledByBarrier(std::string_view load_task, std::string_view barrier_task)
+{
+	return !load_task.empty() && load_task == barrier_task;
+}
+
+bool SavegameLoadRefused(std::string_view method, std::string_view op, bool pending_load_armed)
+{
+	return pending_load_armed && method == "world.project" && op == "load";
+}
+
+bool HasPendingLoad()
+{
+	return _state.pending_load.armed;
+}
+
+void ArmPendingLoadForTest(std::string request_id, std::string file, std::string task_id, CompanyID actor, CompanyID player)
+{
+	_state.pending_load = PendingLoad{};
+	_state.pending_load.armed = true;
+	_state.pending_load.request_id = std::move(request_id);
+	_state.pending_load.file = std::move(file);
+	_state.pending_load.task_id = std::move(task_id);
+	_state.pending_load.world_id = _state.world_id;
+	_state.pending_load.epoch = _state.epoch;
+	_state.pending_load.actor = actor;
+	_state.pending_load.player = player;
+}
+
+CompanyID PendingLoadPlayer()
+{
+	return _state.pending_load.player;
 }
 
 } // namespace InGameAgent

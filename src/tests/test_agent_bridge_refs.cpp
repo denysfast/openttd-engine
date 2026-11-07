@@ -465,3 +465,77 @@ TEST_CASE("Agent bridge refs: a map object carries the lifetime of the pooled ob
 	/* A read of the old reference still resolves, so a caller can see what the tile carries now. */
 	CHECK(ResolveObjectRef(ref, false)["found"] == true);
 }
+
+TEST_CASE("Agent bridge refs: the backend acknowledgement of a result")
+{
+	/* An applied result is delivered and applied. */
+	const Json applied = Json::object({{"ok", true}, {"applied", true}, {"request_id", "r1"}, {"status", "applied"}});
+	CHECK(ParseResultAck(applied, "r1").delivered);
+	CHECK(ParseResultAck(applied, "r1").applied);
+
+	/* A duplicate delivery is answered `applied: false, status: "applied"`: it was applied before. */
+	const Json duplicate = Json::object({{"ok", true}, {"applied", false}, {"request_id", "r1"}, {"status", "applied"}});
+	CHECK(ParseResultAck(duplicate, "r1").delivered);
+	CHECK(ParseResultAck(duplicate, "r1").applied);
+
+	/* A failed result arrived but was not applied, so it may never start a load. */
+	const Json failed = Json::object({{"ok", true}, {"applied", false}, {"request_id", "r1"}, {"status", "failed"}});
+	CHECK(ParseResultAck(failed, "r1").delivered);
+	CHECK_FALSE(ParseResultAck(failed, "r1").applied);
+
+	/* `applied: true` with `status: "failed"` contradicts itself and never starts a load. */
+	const Json contradicting = Json::object({{"ok", true}, {"applied", true}, {"request_id", "r1"}, {"status", "failed"}});
+	CHECK(ParseResultAck(contradicting, "r1").delivered);
+	CHECK_FALSE(ParseResultAck(contradicting, "r1").applied);
+
+	/* An answer of another request, a refused answer or a body that is not an object is no delivery. */
+	CHECK_FALSE(ParseResultAck(applied, "r2").delivered);
+	CHECK_FALSE(ParseResultAck(Json::object({{"ok", false}, {"applied", true}, {"request_id", "r1"}, {"status", "applied"}}), "r1").delivered);
+	CHECK_FALSE(ParseResultAck(Json::object({{"ok", true}, {"applied", true}}), "r1").delivered);
+	CHECK_FALSE(ParseResultAck(Json::array(), "r1").delivered);
+
+	/* A missing or non-boolean `applied`, and a status that is neither applied nor failed, are no delivery:
+	 * the result is retried, so a waiting load keeps waiting. */
+	CHECK_FALSE(ParseResultAck(Json::object({{"ok", true}, {"request_id", "r1"}, {"status", "applied"}}), "r1").delivered);
+	CHECK_FALSE(ParseResultAck(Json::object({{"ok", true}, {"applied", "true"}, {"request_id", "r1"}, {"status", "applied"}}), "r1").delivered);
+	CHECK_FALSE(ParseResultAck(Json::object({{"ok", true}, {"applied", true}, {"request_id", "r1"}, {"status", "unknown"}}), "r1").delivered);
+	CHECK_FALSE(ParseResultAck(Json::object({{"ok", true}, {"applied", true}, {"request_id", "r1"}}), "r1").delivered);
+
+	/* An empty or legacy body is no acknowledgement at all, so it cannot discard a waiting load. */
+	CHECK_FALSE(ParseResultAck(Json::object(), "r1").delivered);
+	CHECK_FALSE(ParseResultAck(Json::object({{"ok", true}}), "r1").delivered);
+	CHECK_FALSE(ParseResultAck(Json::object({{"ok", true}}), "r1").applied);
+}
+
+TEST_CASE("Agent bridge refs: a pending load belongs to one world, epoch and player")
+{
+	CHECK(PendingLoadStillCurrent("w1", "e1", static_cast<CompanyID>(0), "w1", "e1", static_cast<CompanyID>(0)));
+	CHECK_FALSE(PendingLoadStillCurrent("w1", "e1", static_cast<CompanyID>(0), "w2", "e1", static_cast<CompanyID>(0)));
+	CHECK_FALSE(PendingLoadStillCurrent("w1", "e1", static_cast<CompanyID>(0), "w1", "e2", static_cast<CompanyID>(0)));
+	CHECK_FALSE(PendingLoadStillCurrent("w1", "e1", static_cast<CompanyID>(0), "w1", "e1", static_cast<CompanyID>(1)));
+	/* A request that named no company is not tied to one. */
+	CHECK(PendingLoadStillCurrent("w1", "e1", CompanyID::Invalid(), "w1", "e1", static_cast<CompanyID>(3)));
+
+	/* A barrier of the task that asked for the load cancels it, a barrier of another task does not. */
+	CHECK(PendingLoadCancelledByBarrier("t1", "t1"));
+	CHECK_FALSE(PendingLoadCancelledByBarrier("t1", "t2"));
+	CHECK_FALSE(PendingLoadCancelledByBarrier("", ""));
+
+	/* The player guard uses the real local player, not the company a full-control request acted for. */
+	ArmPendingLoadForTest("r1", "/tmp/agent-bridge-pending-load.sav", "t1", static_cast<CompanyID>(2), static_cast<CompanyID>(0));
+	REQUIRE(HasPendingLoad());
+	CHECK(PendingLoadPlayer() == static_cast<CompanyID>(0));
+	CHECK(PendingLoadStillCurrent("", "", PendingLoadPlayer(), "", "", static_cast<CompanyID>(0)));
+	CHECK_FALSE(PendingLoadStillCurrent("", "", PendingLoadPlayer(), "", "", static_cast<CompanyID>(1)));
+
+	/* A second load is refused while one waits, and only a load is refused. */
+	CHECK(SavegameLoadRefused("world.project", "load", true));
+	CHECK_FALSE(SavegameLoadRefused("world.project", "load", false));
+	CHECK_FALSE(SavegameLoadRefused("world.project", "save", true));
+	CHECK_FALSE(SavegameLoadRefused("world.project", "list_saves", true));
+	CHECK_FALSE(SavegameLoadRefused("world.towns", "load", true));
+
+	/* A world reset drops the armed load, so a late acknowledgement cannot apply it. */
+	ResetWorld();
+	CHECK_FALSE(HasPendingLoad());
+}

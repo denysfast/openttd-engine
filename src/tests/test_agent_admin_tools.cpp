@@ -21,8 +21,16 @@
 #include "../3rdparty/catch2/catch.hpp"
 
 #include "../agent_admin_tools.h"
+#include "../fileio_func.h"
+#include "../openttd.h"
 #include "../town_growth.h"
 #include "../town_growth_type.h"
+
+#include "../3rdparty/fmt/format.h"
+
+#include <chrono>
+#include <filesystem>
+#include <fstream>
 
 #include "../safeguards.h"
 
@@ -115,7 +123,7 @@ TEST_CASE("Agent admin tools: capabilities")
 	REQUIRE(!project.empty());
 	CHECK(Contains(project["implemented"], "power"));
 	CHECK(Contains(project["implemented"], "station_town"));
-	CHECK(Contains(project["gaps"], "save"));
+	CHECK(Contains(project["implemented"], "save"));
 
 	/* The methods of the other modules are not claimed here. */
 	CHECK(FindCapability(capabilities, "world.pause").empty());
@@ -401,11 +409,10 @@ TEST_CASE("Agent admin tools: project validation")
 	CHECK(tile["ok"] == false);
 	CHECK(tile["error"] == "invalid_arguments");
 
-	/* The durable save lifecycle is not implemented here. */
+	/* A save without a name is an argument error, not a gap. */
 	const Json save = Dispatch("world.project", Json::object({{"op", "save"}}));
 	CHECK(save["ok"] == false);
-	CHECK(save["error"] == "unsupported_op");
-	CHECK(save["detail"]["op"] == "save");
+	CHECK(save["error"] == "invalid_arguments");
 }
 
 TEST_CASE("Agent admin tools: extended capability inventory")
@@ -477,14 +484,16 @@ TEST_CASE("Agent admin tools: extended capability inventory")
 	CHECK(Contains(company["implemented"], "rename_president"));
 	CHECK(Contains(company["implemented"], "buy"));
 
-	/* The station catchment is a project operation, and the save lifecycle stays a gap. */
+	/* The station catchment and the save lifecycle are project operations. */
 	const Json project = FindCapability(capabilities, "world.project");
 	REQUIRE(!project.empty());
 	CHECK(Contains(project["implemented"], "catchment"));
 	CHECK(Contains(project["implemented"], "catchment_upgrade"));
 	CHECK(Contains(project["implemented"], "settings"));
-	CHECK(Contains(project["gaps"], "save"));
-	CHECK(Contains(project["gaps"], "load"));
+	CHECK(Contains(project["implemented"], "save"));
+	CHECK(Contains(project["implemented"], "list_saves"));
+	CHECK(Contains(project["implemented"], "load"));
+	CHECK(project["gaps"].empty());
 }
 
 TEST_CASE("Agent admin tools: extended mutation classification")
@@ -700,6 +709,164 @@ TEST_CASE("Agent admin tools: town and company identity validation")
 	const Json settings = Dispatch("world.project", Json::object({{"op", "settings"}}));
 	REQUIRE(settings["ok"] == true);
 	CHECK(!FindSetting(settings, "station.modified_catchment").empty());
+}
+
+TEST_CASE("Agent admin tools: savegame lifecycle contract")
+{
+	/* The savegame operations are published and are no longer gaps. */
+	const Json capabilities = AdminToolCapabilities();
+	bool found = false;
+	for (const Json &entry : capabilities["methods"]) {
+		if (entry["method"] != "world.project") continue;
+		found = true;
+		for (const char *op : {"save", "list_saves", "load"}) CHECK(Contains(entry["implemented"], op));
+		CHECK(entry["gaps"].empty());
+	}
+	CHECK(found);
+
+	/* Listing saves is a read; saving and loading change the world. */
+	CHECK_FALSE(IsAdminMutation("world.project", Json::object({{"op", "list_saves"}})));
+	CHECK(IsAdminMutation("world.project", Json::object({{"op", "save"}})));
+	CHECK(IsAdminMutation("world.project", Json::object({{"op", "load"}})));
+
+	/* A savegame name is one plain, portable file name and never a host path. */
+	const Json bad_names[] = {
+		Json::object({{"op", "save"}}),
+		Json::object({{"op", "save"}, {"name", ""}}),
+		Json::object({{"op", "save"}, {"name", 7}}),
+		Json::object({{"op", "save"}, {"name", "a/b"}}),
+		Json::object({{"op", "save"}, {"name", "..\\escape"}}),
+		Json::object({{"op", "save"}, {"name", "with:colon"}}),
+		Json::object({{"op", "save"}, {"name", "star*"}}),
+		Json::object({{"op", "save"}, {"name", "trailing "}}),
+		Json::object({{"op", "save"}, {"name", " leading"}}),
+		Json::object({{"op", "save"}, {"name", "dot."}}),
+		Json::object({{"op", "save"}, {"name", "CON"}}),
+		Json::object({{"op", "save"}, {"name", "con.foo"}}),
+		Json::object({{"op", "save"}, {"name", "NUL.old"}}),
+		Json::object({{"op", "save"}, {"name", "lpt9"}}),
+		Json::object({{"op", "save"}, {"name", "LPT9.old"}}),
+		Json::object({{"op", "save"}, {"name", std::string(65, 'x')}}),
+	};
+	for (const Json &params : bad_names) {
+		CHECK(DispatchAdminTool("world.project", params, CompanyID::Invalid()).value()["error"] == "invalid_arguments");
+	}
+
+	/* A valid name passes the name rules; the test binary has no game, so there is nothing to save. The
+	 * guard excludes the editor as well, because SaveGameOp would write a scenario there. */
+	REQUIRE(_game_mode != GameMode::Normal);
+	REQUIRE(_game_mode != GameMode::Editor);
+	const Json no_game = DispatchAdminTool("world.project", Json::object({{"op", "save"}, {"name", "e13_fixture"}}), CompanyID::Invalid()).value();
+	CHECK(no_game["ok"] == false);
+	CHECK(no_game["error"] != "invalid_arguments");
+
+	/* A name that only looks like a device name is a normal name. */
+	const Json console_name = DispatchAdminTool("world.project", Json::object({{"op", "save"}, {"name", "console"}}), CompanyID::Invalid()).value();
+	CHECK(console_name["error"] != "invalid_arguments");
+	CHECK(DispatchAdminTool("world.project", Json::object({{"op", "save"}, {"name", "e13_fixture"}, {"overwrite", "yes"}}), CompanyID::Invalid()).value()["error"] == "invalid_arguments");
+
+	/* A load only names a savegame of the private save directory. */
+	CHECK(DispatchAdminTool("world.project", Json::object({{"op", "load"}, {"name", "../escape"}}), CompanyID::Invalid()).value()["error"] == "invalid_arguments");
+	CHECK(DispatchAdminTool("world.project", Json::object({{"op", "load"}, {"name", "no_such_save"}}), CompanyID::Invalid()).value()["error"] == "unknown_save");
+
+	/* The list is bounded like every other list query and carries no host path. */
+	CHECK(DispatchAdminTool("world.project", Json::object({{"op", "list_saves"}, {"limit", 0}}), CompanyID::Invalid()).value()["error"] == "invalid_arguments");
+	CHECK(DispatchAdminTool("world.project", Json::object({{"op", "list_saves"}, {"limit", 513}}), CompanyID::Invalid()).value()["error"] == "invalid_arguments");
+	CHECK(DispatchAdminTool("world.project", Json::object({{"op", "list_saves"}, {"offset", -1}}), CompanyID::Invalid()).value()["error"] == "invalid_arguments");
+
+	const Json list = DispatchAdminTool("world.project", Json::object({{"op", "list_saves"}, {"limit", 3}}), CompanyID::Invalid()).value();
+	REQUIRE(list["ok"] == true);
+	CHECK(list["saves"].is_array());
+	CHECK(list["saves"].size() <= 3);
+	CHECK(list["limit"] == 3);
+	CHECK(list["offset"] == 0);
+	CHECK(list["total"].is_number_integer());
+	for (const Json &row : list["saves"]) {
+		CHECK(row["name"].is_string());
+		CHECK(row["file"].is_string());
+		CHECK(!row.contains("path"));
+	}
+}
+
+/** An isolated temporary directory that replaces the private save directory of one test case. */
+struct SavegameDirectoryFixture {
+	std::filesystem::path root; ///< The temporary root of the case.
+
+	SavegameDirectoryFixture()
+	{
+		static unsigned counter = 0;
+		std::error_code error_code;
+		/* std::to_string is banned by safeguards.h, so the unique name is formatted with fmt. */
+		const std::string name = fmt::format("openttd-agent-saves-{}-{}",
+				std::chrono::steady_clock::now().time_since_epoch().count(), counter++);
+		this->root = std::filesystem::temp_directory_path(error_code) / name;
+		std::filesystem::create_directories(this->root / "save", error_code);
+		SetSavegameDirectoryForTest((this->root / "save").string());
+	}
+
+	~SavegameDirectoryFixture()
+	{
+		SetSavegameDirectoryForTest({});
+		std::error_code error_code;
+		std::filesystem::remove_all(this->root, error_code);
+	}
+
+	/** The private save directory of the case, with a trailing separator. */
+	std::string SavePrefix() const
+	{
+		return (this->root / "save").string() + PATHSEP;
+	}
+};
+
+TEST_CASE("Agent admin tools: savegame path containment")
+{
+	/* The extension the engine writes depends on the game mode; this case expects a normal game. */
+	REQUIRE(_game_mode != GameMode::Editor);
+
+	SavegameDirectoryFixture fixture;
+	std::error_code error_code;
+	const std::string prefix = fixture.SavePrefix();
+
+	/* A valid child of the private directory is accepted, and a trailing separator on the directory
+	 * does not change that: it is the same directory. */
+	CHECK_FALSE(CheckSavegamePathForTest("ok", prefix + "ok.sav").has_value());
+	SetSavegameDirectoryForTest(prefix);
+	CHECK_FALSE(CheckSavegamePathForTest("ok", prefix + "ok.sav").has_value());
+	SetSavegameDirectoryForTest((fixture.root / "save").string());
+
+	/* A missing savegame is a plain miss, whether the private directory exists or not. */
+	CHECK(DispatchAdminTool("world.project", Json::object({{"op", "load"}, {"name", "missing"}}), CompanyID::Invalid()).value()["error"] == "unknown_save");
+	std::filesystem::remove_all(fixture.root / "save", error_code);
+	REQUIRE(!error_code);
+	CHECK(DispatchAdminTool("world.project", Json::object({{"op", "load"}, {"name", "missing"}}), CompanyID::Invalid()).value()["error"] == "unknown_save");
+
+	/* An existing savegame is accepted, not loaded, and the answer carries no host path. */
+	std::filesystem::create_directories(fixture.root / "save", error_code);
+	REQUIRE(!error_code);
+	{ std::ofstream out(prefix + "present.sav"); out << "test"; }
+	const Json accepted = DispatchAdminTool("world.project", Json::object({{"op", "load"}, {"name", "present"}}), CompanyID::Invalid()).value();
+	REQUIRE(accepted["ok"] == true);
+	CHECK(accepted["loading"] == true);
+	CHECK(accepted["accepted"] == true);
+	CHECK(accepted["file"] == "present.sav");
+	CHECK(accepted["pending_load"]["file"] == prefix + "present.sav");
+
+	/* A symlinked savegame is a way out of the directory and is refused. */
+	std::filesystem::create_symlink(prefix + "present.sav", prefix + "link.sav", error_code);
+	if (!error_code) {
+		const std::optional<Json> link = CheckSavegamePathForTest("link", prefix + "link.sav");
+		REQUIRE(link.has_value());
+		CHECK((*link)["error"] == "invalid_path");
+		CHECK(DispatchAdminTool("world.project", Json::object({{"op", "load"}, {"name", "link"}}), CompanyID::Invalid()).value()["error"] == "invalid_path");
+	}
+
+	/* A sibling of the private directory is not inside it. */
+	const std::optional<Json> sibling = CheckSavegamePathForTest("sibling", (fixture.root / "other.sav").string());
+	REQUIRE(sibling.has_value());
+	CHECK((*sibling)["error"] == "invalid_path");
+
+	/* Traversal is refused by the name rules before a path is built. */
+	CHECK(DispatchAdminTool("world.project", Json::object({{"op", "load"}, {"name", "../escape"}}), CompanyID::Invalid()).value()["error"] == "invalid_arguments");
 }
 
 TEST_CASE("Agent admin tools: normal command path for a boolean setting")

@@ -38,6 +38,24 @@ using Json = nlohmann::json;
 Json AdminToolCapabilities();
 
 /**
+ * Point the savegame operations at another directory, for the tests.
+ *
+ * The tests use an isolated temporary directory, so a case never reads or writes the real personal
+ * save directory of the user.
+ *
+ * @param directory The directory to use; empty restores the private save directory.
+ */
+void SetSavegameDirectoryForTest(const std::string &directory);
+
+/**
+ * Validate a savegame path against the private save directory, for the tests.
+ * @param name The savegame name.
+ * @param file The full path of the savegame file.
+ * @return An error document, or nothing when the path is usable.
+ */
+std::optional<Json> CheckSavegamePathForTest(const std::string &name, const std::string &file);
+
+/**
  * Dispatch one administrative tool call onto the engine.
  *
  * The bridge validates the world, the epoch, the task and the expected references before it calls
