@@ -18,6 +18,7 @@
 
 #include "../3rdparty/catch2/catch.hpp"
 
+#include "../agent_bridge.h"
 #include "../misc_cmd.h"
 
 #include "../safeguards.h"
@@ -110,4 +111,24 @@ TEST_CASE("Pause contract: restoring does not turn another pause reason into a n
 	const PauseRequestDecision restore = Decide(false, previous_normal, std::optional<uint32_t>{20}, 20);
 	CHECK(restore.guard == PauseGuardResult::Accepted);
 	CHECK_FALSE(restore.post);
+}
+
+TEST_CASE("Pause contract: a successful pause receipt is marked as an applied write")
+{
+	/* The pause bit the tool controls is clear in this binary, so `paused: false` changes nothing:
+	 * the request is answered without posting a command, which is exactly the success path. */
+	const InGameAgent::Json answer = InGameAgent::PauseForTest({{"paused", false}});
+	/* A bridge method answers the envelope `{ok, value}` (agent_bridge.cpp: `Ok()`), so the fields of
+	 * the answer are in `value`, not at the top level. */
+	REQUIRE(answer.is_object());
+	REQUIRE(answer["ok"] == true);
+	REQUIRE(answer.contains("value"));
+	const InGameAgent::Json &response = answer["value"];
+	REQUIRE(response["changed"] == false);
+
+	/* The receipt of a real write: it is not an estimate and the operation costs nothing, so an
+	 * applied-write audit can prove the answer is a write and not a dry run. */
+	CHECK(response["dry_run"] == false);
+	CHECK(response["cost"] == 0);
+	CHECK_FALSE(response.contains("estimated"));
 }

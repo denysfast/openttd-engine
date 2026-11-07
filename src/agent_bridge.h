@@ -235,6 +235,25 @@ bool HasReceiptForTest(const std::string &request_id);
 /** Empty the receipt cache and the draw-tick reservations. */
 void ClearReceiptCacheForTest();
 
+/*
+ * Query seam. world.query is answered inside the request execution, which needs a backend and a
+ * poll; this seam answers one query directly, so the kinds the kernel iterates are testable.
+ */
+
+/**
+ * Answer one `world.query` request, exactly as the bridge answers it for the backend.
+ * @param params The parameters of the query.
+ * @return The query result.
+ */
+Json QueryWorldForTest(const Json &params);
+
+/**
+ * Answer one `world.pause` request, exactly as the bridge answers it for the backend.
+ * @param params The parameters of the request.
+ * @return The result of the request.
+ */
+Json PauseForTest(const Json &params);
+
 } // namespace InGameAgent
 
 #endif /* AGENT_BRIDGE_H */

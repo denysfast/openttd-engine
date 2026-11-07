@@ -3025,7 +3025,7 @@ Json GameToolCapabilities()
 	Json methods = Json::array();
 	methods.push_back(Capability("world.query", "read",
 			{"vehicles", "engines", "orders", "groups", "cargos"},
-			{"towns", "companies", "tiles", "stations", "industries", "settings", "waypoints", "signs", "houses", "depots", "finances"}));
+			{"towns", "companies", "tiles", "stations", "industries", "settings", "signs", "houses", "finances"}));
 	methods.push_back(Capability("world.construct", "write",
 			{"road", "tram", "station", "depot", "demolish"},
 			{"rail", "signal", "airport", "dock", "bridge", "tunnel", "canal", "terraform"}));

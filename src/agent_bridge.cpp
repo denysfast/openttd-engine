@@ -1368,6 +1368,8 @@ std::string_view CanonicalQueryKind(std::string_view kind)
 	if (kind == "towns" || kind == "town") return "towns";
 	if (kind == "companies" || kind == "company") return "companies";
 	if (kind == "stations" || kind == "station") return "stations";
+	if (kind == "waypoints" || kind == "waypoint") return "waypoints";
+	if (kind == "depots" || kind == "depot") return "depots";
 	if (kind == "industries" || kind == "industry") return "industries";
 	if (kind == "vehicles" || kind == "vehicle") return "vehicles";
 	if (kind == "engines" || kind == "engine") return "engines";
@@ -1433,7 +1435,28 @@ std::string ReadNameFilter(const Json &filters)
 }
 
 /**
- * Implement world.query for towns, companies, stations, industries, vehicles,
+ * The facilities a station has, as the engine's own flags.
+ *
+ * A station can have several facilities at once (a rail station with a bus stop, a truck stop and a
+ * dock), so this is the bitset itself and never a family guessed from the station name. `waypoint`
+ * is the engine's own flag for a station pool item that is a waypoint or a buoy.
+ * @param facilities The facilities the station has.
+ * @return Object with one boolean per facility flag.
+ */
+Json StationFacilitiesJson(const StationFacilities &facilities)
+{
+	return {
+		{"rail", facilities.Test(StationFacility::Train)},
+		{"bus_stop", facilities.Test(StationFacility::BusStop)},
+		{"truck_stop", facilities.Test(StationFacility::TruckStop)},
+		{"airport", facilities.Test(StationFacility::Airport)},
+		{"dock", facilities.Test(StationFacility::Dock)},
+		{"waypoint", facilities.Test(StationFacility::Waypoint)},
+	};
+}
+
+/**
+ * Implement world.query for towns, companies, stations, waypoints, depots, industries, vehicles,
  * signs and tiles.
  *
  * The canonical kind names are plural, as advertised by the backend registry;
@@ -1533,6 +1556,44 @@ Json WorldQuery(const Json &params)
 				{"tile", {TileX(st->xy), TileY(st->xy)}},
 				{"owner", st->owner.base()},
 				{"town_id", st->town != nullptr ? st->town->index.base() : -1},
+				{"facilities", StationFacilitiesJson(st->facilities)},
+			});
+		}
+	} else if (kind == "waypoints") {
+		/* A waypoint is a station pool item with its own lifetime, so it carries its own generation. */
+		for (const Waypoint *wp : Waypoint::Iterate()) {
+			if (id >= 0 && static_cast<int>(wp->index.base()) != id) continue;
+			if (company_id >= 0 && static_cast<int>(wp->owner.base()) != company_id) continue;
+			if (town_id >= 0 && (wp->town == nullptr || static_cast<int>(wp->town->index.base()) != town_id)) continue;
+			if (!ContainsAsciiCI(wp->GetCachedName(), name)) continue;
+			if (!range.Contains(wp->xy)) continue;
+			add_row({
+				{"id", wp->index.base()},
+				{"generation", wp->generation},
+				{"name", wp->GetCachedName()},
+				{"tile", {TileX(wp->xy), TileY(wp->xy)}},
+				{"owner", wp->owner.base()},
+				{"town_id", wp->town != nullptr ? wp->town->index.base() : -1},
+				{"facilities", StationFacilitiesJson(wp->facilities)},
+			});
+		}
+	} else if (kind == "depots") {
+		/* A depot has no owner of its own: the owner and the kind of depot are the ones the engine
+		 * records for its tile, so both are read from the tile and never guessed from a name. */
+		for (const Depot *d : Depot::Iterate()) {
+			if (id >= 0 && static_cast<int>(d->index.base()) != id) continue;
+			const bool valid_tile = IsValidTile(d->xy);
+			if (company_id >= 0 && (!valid_tile || static_cast<int>(GetTileOwner(d->xy).base()) != company_id)) continue;
+			if (!ContainsAsciiCI(d->name, name)) continue;
+			if (range.active && (!valid_tile || !range.Contains(d->xy))) continue;
+			add_row({
+				{"id", d->index.base()},
+				{"generation", d->generation},
+				{"name", d->name},
+				{"tile", valid_tile ? Json{{"x", TileX(d->xy)}, {"y", TileY(d->xy)}} : Json(nullptr)},
+				{"owner", valid_tile ? Json(GetTileOwner(d->xy).base()) : Json(nullptr)},
+				{"what", valid_tile ? Json(std::string(TileTypeName(GetTileType(d->xy)))) : Json(nullptr)},
+				{"town_id", d->town != nullptr ? d->town->index.base() : -1},
 			});
 		}
 	} else if (kind == "industries") {
@@ -1975,6 +2036,7 @@ Json ResolveRef(const Json &ref, bool require_identity)
 			row["tile"] = Json{{"x", TileX(st.xy)}, {"y", TileY(st.xy)}};
 			row["owner"] = st.owner.base();
 			row["town_id"] = st.town != nullptr ? st.town->index.base() : -1;
+			row["facilities"] = StationFacilitiesJson(st.facilities);
 		});
 	}
 	if (type == "waypoint") {
@@ -1983,6 +2045,8 @@ Json ResolveRef(const Json &ref, bool require_identity)
 			row["name"] = wp.GetCachedName();
 			row["tile"] = Json{{"x", TileX(wp.xy)}, {"y", TileY(wp.xy)}};
 			row["owner"] = wp.owner.base();
+			row["town_id"] = wp.town != nullptr ? wp.town->index.base() : -1;
+			row["facilities"] = StationFacilitiesJson(wp.facilities);
 		});
 	}
 	if (type == "industry") {
@@ -2120,12 +2184,20 @@ Json WorldPause(const Json &params)
 	 * revision only moves on a real decision and a no-op request is answered without one. */
 	if (decision.post && !Command<Commands::Pause>::Post(PauseMode::Normal, paused)) return Error("command_failed", "pause");
 
+	/*
+	 * The receipt markers of an applied write. A pause has no dry run and costs nothing, and saying
+	 * so explicitly is what lets an applied-write audit prove that this answer is a real write and
+	 * not an estimate. Only the success answer carries them; the stale and command errors above do
+	 * not, because they are not an applied write.
+	 */
 	return Ok({
 		{"paused", _pause_mode.Any()},
 		{"normal", _pause_mode.Test(PauseMode::Normal)},
 		{"revision", PauseRevision()},
 		{"changed", decision.post},
 		{"previous", {{"paused", previous_paused}, {"normal", normal_now}, {"revision", revision}}},
+		{"dry_run", false},
+		{"cost", 0},
 	});
 }
 
@@ -2212,7 +2284,9 @@ Json WorldRename(const Json &params, CompanyID request_company)
 		return Error("unsupported_rename_kind", kind);
 	}
 
-	return Ok({{"ok", true}, {"name", name}});
+	/* The receipt markers of an applied write, like world.pause: a rename has no dry run and costs
+	 * nothing, and only the success answer carries them. */
+	return Ok({{"ok", true}, {"name", name}, {"dry_run", false}, {"cost", 0}});
 }
 
 /**
@@ -3037,7 +3111,7 @@ Json CoreCapabilities()
 	methods.push_back({
 		{"method", "world.query"},
 		{"authority", "read"},
-		{"implemented", Json::array({"towns", "companies", "stations", "industries", "signs", "tiles"})},
+		{"implemented", Json::array({"towns", "companies", "stations", "waypoints", "depots", "industries", "signs", "tiles"})},
 		{"gaps", Json::array()},
 	});
 
@@ -3046,7 +3120,8 @@ Json CoreCapabilities()
 	result["methods"] = std::move(methods);
 	result["contracts"] = CoreContracts();
 	result["notes"] = Json::array({
-		"world.query kind=towns, companies, stations, industries, signs and tiles is the kernel read; the game tool module answers vehicles, engines, orders, groups and cargos, so the two documents together describe the whole query.",
+		"world.query kind=towns, companies, stations, waypoints, depots, industries, signs and tiles is the kernel read; the game tool module answers vehicles, engines, orders, groups and cargos, so the two documents together describe the whole query.",
+		"A station row and a resolved station carry `facilities` as the engine's own flags (rail, bus_stop, truck_stop, airport, dock, waypoint), so a mixed station is reported as it is and its family is never guessed from its name. A depot row reads its owner and its kind from the depot tile.",
 		"These kinds are read through the engine's own Iterate() accessors and never written, so the agent can verify a command's effect against the next read.",
 		"The pause, calendar, refs and timing contracts are in this document, because the kernel methods they describe are the ones this module answers.",
 	});
@@ -3492,6 +3567,16 @@ void ClearReceiptCacheForTest()
 	_state.receipts.clear();
 	_state.receipt_order.clear();
 	_deferred.clear();
+}
+
+Json QueryWorldForTest(const Json &params)
+{
+	return WorldQuery(params);
+}
+
+Json PauseForTest(const Json &params)
+{
+	return WorldPause(params);
 }
 
 CompanyID PendingLoadPlayer()

@@ -22,6 +22,7 @@ add_test_files(
     string_func.cpp
     test_agent_admin_tools.cpp
     test_agent_blueprint_tools.cpp
+    test_agent_bridge_query.cpp
     test_agent_bridge_refs.cpp
     test_agent_capture.cpp
     test_agent_command_catalog.cpp
