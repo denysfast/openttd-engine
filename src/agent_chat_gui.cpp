@@ -86,6 +86,7 @@ struct AgentChatEntry {
 	int64_t event_seq = 0;          ///< Highest event sequence number seen so far.
 	std::vector<AgentChatMessage> messages; ///< Cached transcript.
 	bool task_active = false;       ///< Whether a task is running for this chat.
+	bool task_finishing = false;    ///< Whether the turn of the task ended while its writes may still be settling.
 	std::string task_status;        ///< Short status of the running task, shown to the player.
 };
 
@@ -299,12 +300,41 @@ static Json AttachmentToJson(const AgentChatAttachment &attachment)
 	j["type"] = attachment.type;
 	if (attachment.id >= 0) j["id"] = attachment.id;
 	if (attachment.generation >= 0) j["generation"] = attachment.generation;
-	if (attachment.tile != INVALID_TILE) j["tile"] = Json::array({TileX(attachment.tile), TileY(attachment.tile)});
+	/* Always write the canonical object shape; the array form is only read for compatibility. */
+	if (attachment.tile != INVALID_TILE) j["tile"] = Json{{"x", TileX(attachment.tile)}, {"y", TileY(attachment.tile)}};
 	if (!attachment.name.empty()) j["name"] = attachment.name;
 	if (!attachment.what.empty()) j["what"] = attachment.what;
 	if (!attachment.world_id.empty()) j["world_id"] = attachment.world_id;
 	if (!attachment.epoch.empty()) j["epoch"] = attachment.epoch;
 	return j;
+}
+
+/**
+ * Read the tile of a reference.
+ *
+ * The canonical shape names the tile as an object `{"x": x, "y": y}`; the legacy shape is the
+ * array `[x, y]`. Both are accepted, so a reference written by an older bridge, or snapshotted
+ * by the backend before the shape changed, keeps its position instead of silently losing it.
+ * @param j The reference.
+ * @return The tile, or #INVALID_TILE when the reference carries no usable tile.
+ */
+static TileIndex ParseTileLocation(const Json &j)
+{
+	if (!j.is_object() || !j.contains("tile")) return INVALID_TILE;
+	const Json &tile = j["tile"];
+
+	int64_t x = -1;
+	int64_t y = -1;
+	if (tile.is_object()) {
+		x = JsonInt(tile, "x", -1);
+		y = JsonInt(tile, "y", -1);
+	} else if (tile.is_array() && tile.size() == 2 && tile[0].is_number() && tile[1].is_number()) {
+		x = tile[0].get<int64_t>();
+		y = tile[1].get<int64_t>();
+	}
+
+	if (x < 0 || y < 0 || x >= static_cast<int64_t>(Map::SizeX()) || y >= static_cast<int64_t>(Map::SizeY())) return INVALID_TILE;
+	return TileXY(static_cast<uint>(x), static_cast<uint>(y));
 }
 
 /**
@@ -315,7 +345,8 @@ static Json AttachmentToJson(const AgentChatAttachment &attachment)
 static AgentChatAttachment ParseAttachment(const Json &j)
 {
 	AgentChatAttachment attachment;
-	attachment.type = JsonString(j, "type", "point");
+	/* A reference without a type is not a point by default; the caller decides what it is. */
+	attachment.type = JsonString(j, "type");
 	attachment.id = static_cast<int32_t>(JsonInt(j, "id", -1));
 	attachment.generation = JsonInt(j, "generation", -1);
 	attachment.name = JsonString(j, "name");
@@ -332,12 +363,7 @@ static AgentChatAttachment ParseAttachment(const Json &j)
 		}
 	}
 
-	const Json &tile = j.is_object() && j.contains("tile") ? j["tile"] : Json();
-	if (tile.is_array() && tile.size() == 2 && tile[0].is_number() && tile[1].is_number()) {
-		const uint x = tile[0].get<uint>();
-		const uint y = tile[1].get<uint>();
-		if (x < Map::SizeX() && y < Map::SizeY()) attachment.tile = TileXY(x, y);
-	}
+	attachment.tile = ParseTileLocation(j);
 	return attachment;
 }
 
@@ -412,13 +438,46 @@ static void InvalidateAgentChatWindows()
 }
 
 /**
+ * Check whether a backend task status means the task still owns work.
+ *
+ * The backend keeps a task active while it is `running`, `stopping` or `settling`
+ * (`ACTIVE_TASK_STATUSES` in the backend store), and a queued or dispatched task is active as
+ * well. Stop has to stay available for all of them, because a settling task still holds the
+ * world gate until its writes and its barrier settled.
+ * @param status The task status reported by the backend.
+ * @return \c true when the task is still active.
+ */
+static bool IsActiveTaskStatus(const std::string &status)
+{
+	return status == "queued" || status == "dispatched" || status == "running" || status == "started" ||
+			status == "stopping" || status == "settling";
+}
+
+/**
+ * Translate a backend task status to the text shown to the player.
+ * @param status The task status reported by the backend.
+ * @return The status text, or an empty string when the status is unknown.
+ */
+static std::string GetTaskStatusText(const std::string &status)
+{
+	if (status == "queued" || status == "dispatched" || status == "running" || status == "started") return GetString(STR_AGENT_CHAT_STATUS_THINKING);
+	if (status == "stopping") return GetString(STR_AGENT_CHAT_STATUS_STOPPING);
+	if (status == "settling") return GetString(STR_AGENT_CHAT_STATUS_SETTLING);
+	if (status == "completed") return GetString(STR_AGENT_CHAT_STATUS_DONE);
+	if (status == "failed") return GetString(STR_AGENT_CHAT_STATUS_FAILED);
+	if (status == "stopped") return GetString(STR_AGENT_CHAT_STATUS_STOPPED);
+	if (status == "stale") return GetString(STR_AGENT_CHAT_STATUS_UNAVAILABLE);
+	return {};
+}
+
+/**
  * Get the status text of a chat.
  * @param chat The chat.
  * @return The status text.
  */
 static std::string GetChatStatusText(const AgentChatEntry &chat)
 {
-	if (chat.task_active) return chat.task_status.empty() ? GetString(STR_AGENT_CHAT_STATUS_THINKING) : chat.task_status;
+	if (!chat.task_status.empty()) return chat.task_status;
 	return GetString(STR_AGENT_CHAT_STATUS_IDLE);
 }
 
@@ -426,6 +485,7 @@ static std::string GetChatStatusText(const AgentChatEntry &chat)
 
 static void AgentChatLoadMessages(const std::string &chat_id);
 static void AgentChatPollEvents(const std::string &chat_id);
+static void AgentChatRefreshChat(const std::string &chat_id);
 
 /**
  * Send a request to the agent backend.
@@ -492,6 +552,10 @@ static void AgentChatSyncContext()
  * The backend reports the running task as `task_active`/`task_status`; the
  * `latest_task` object is used as a fallback for payloads that only carry the
  * last task. A chat without any of these fields is treated as idle.
+ *
+ * `task_active` is authoritative: the backend derives it from its own active statuses
+ * (`running`, `stopping`, `settling`), so a settling task keeps Stop available until its
+ * writes and its barrier settled. The fallback list has to name the same statuses.
  * @param chat The chat to update.
  * @param dto The chat DTO.
  */
@@ -499,17 +563,20 @@ static void ApplyChatTaskState(AgentChatEntry &chat, const Json &dto)
 {
 	const bool has_active = dto.is_object() && dto.contains("task_active") && !dto["task_active"].is_null();
 	chat.task_active = JsonBool(dto, "task_active", false);
-	chat.task_status = SanitiseBackendText(JsonString(dto, "task_status"));
+	std::string status = JsonString(dto, "task_status");
+	chat.task_status = GetTaskStatusText(status);
 
 	const Json &latest = dto.is_object() && dto.contains("latest_task") ? dto["latest_task"] : Json();
 	if (latest.is_object()) {
-		const std::string status = JsonString(latest, "status");
-		if (!has_active) {
-			chat.task_active = JsonBool(latest, "active", false) || status == "queued" || status == "dispatched" || status == "running" || status == "started";
-		}
-		if (chat.task_status.empty()) chat.task_status = SanitiseBackendText(status);
+		const std::string latest_status = JsonString(latest, "status");
+		if (!has_active) chat.task_active = JsonBool(latest, "active", false) || IsActiveTaskStatus(latest_status);
+		if (chat.task_status.empty()) chat.task_status = GetTaskStatusText(latest_status);
+		if (status.empty()) status = latest_status;
 	}
 
+	/* A settling or stopping task is still active, but its turn already ended; the chat DTO has
+	 * to be re-read until the backend reports the task terminal. */
+	chat.task_finishing = chat.task_active && (status == "settling" || status == "stopping");
 	if (chat.task_active && chat.task_status.empty()) chat.task_status = GetString(STR_AGENT_CHAT_STATUS_THINKING);
 }
 
@@ -649,13 +716,66 @@ static void AgentChatLoadMessages(const std::string &chat_id)
 			chat->message_seq = std::max(chat->message_seq, JsonInt(response, "next_seq", chat->message_seq));
 		}
 
-		/* Keep the transcript pinned to the bottom while new messages arrive. */
-		if (any) _agent_chat.scroll = INT32_MAX;
+		/* Keep the transcript pinned to the bottom while new messages arrive. The offset is
+		 * clamped by the scrollbar, so the window has to re-run its layout for it to take effect. */
+		if (any) {
+			_agent_chat.scroll = INT32_MAX;
+			InvalidateWindowClassesData(WindowClass::AgentChat);
+		}
 	});
 }
 
 /**
+ * Read a field of an event.
+ *
+ * The backend nests the fields of an event in `payload`; a payload that puts them at the top
+ * level is accepted as well, so both shapes are read.
+ * @param event The event.
+ * @param key The field name.
+ * @return The field value, or a null value when the event does not carry it.
+ */
+static Json EventField(const Json &event, const char *key)
+{
+	if (!event.is_object()) return Json();
+	if (event.contains("payload") && event["payload"].is_object() && event["payload"].contains(key)) return event["payload"][key];
+	const auto it = event.find(key);
+	return it != event.end() ? *it : Json();
+}
+
+/**
+ * Read a string field of an event.
+ * @param event The event.
+ * @param key The field name.
+ * @return The field value, or an empty string when the event does not carry it.
+ */
+static std::string EventString(const Json &event, const char *key)
+{
+	const Json value = EventField(event, key);
+	return value.is_string() ? value.get<std::string>() : std::string();
+}
+
+/**
+ * Read a boolean field of an event.
+ * @param event The event.
+ * @param key The field name.
+ * @param fallback Value returned when the event does not carry the field.
+ * @return The field value.
+ */
+static bool EventBool(const Json &event, const char *key, bool fallback = false)
+{
+	const Json value = EventField(event, key);
+	return value.is_boolean() ? value.get<bool>() : fallback;
+}
+
+/**
  * Apply one event of a chat to the local task state.
+ *
+ * A turn that ends does not end its task: while one of its mutations is still dispatched the
+ * backend keeps the task `settling` (active, stoppable, holding the world gate) and only
+ * `turn_settled` makes it terminal. Stop is acknowledged in two steps as well: the stop request
+ * marks the task `stopping` and the barrier acknowledgement makes it `stopped`. So an event that
+ * ends a turn keeps the task active and marks it as finishing; the chat DTO, which the tick
+ * re-reads while a task is finishing, is the authority on when it really ended.
  * @param chat The chat the event belongs to.
  * @param event The event.
  */
@@ -663,28 +783,48 @@ static void AgentChatApplyEvent(AgentChatEntry &chat, const Json &event)
 {
 	const std::string type = JsonString(event, "type");
 
-	if (type == "turn_started" || type == "task_started") {
+	if (type == "turn_started" || type == "task_started" || type == "turn_sent") {
 		chat.task_active = true;
+		chat.task_finishing = false;
 		chat.task_status = GetString(STR_AGENT_CHAT_STATUS_THINKING);
 	} else if (type == "tool_call") {
 		chat.task_active = true;
-		const std::string tool = SanitiseBackendText(JsonString(event, "tool", JsonString(event, "name")));
+		const std::string tool = SanitiseBackendText(EventString(event, "tool").empty() ? EventString(event, "name") : EventString(event, "tool"));
 		chat.task_status = tool.empty() ? GetString(STR_AGENT_CHAT_STATUS_THINKING) : GetString(STR_AGENT_CHAT_STATUS_TOOL, tool);
 	} else if (type == "tool_result") {
 		chat.task_active = true;
 		chat.task_status = GetString(STR_AGENT_CHAT_STATUS_THINKING);
-	} else if (type == "turn_completed" || type == "task_completed") {
+	} else if (type == "turn_settling") {
+		chat.task_active = true;
+		chat.task_finishing = true;
+		chat.task_status = GetString(STR_AGENT_CHAT_STATUS_SETTLING);
+	} else if (type == "turn_completed" || type == "task_completed" || type == "turn_failed" || type == "task_failed" ||
+			type == "turn_timeout" || type == "sub_unavailable" || type == "backend_unavailable") {
+		/* The turn ended, but its writes may still be settling: keep the task active and let the
+		 * chat DTO decide, so Stop stays available until the barrier settled. */
+		chat.task_active = true;
+		chat.task_finishing = true;
+		chat.task_status = GetString(STR_AGENT_CHAT_STATUS_SETTLING);
+	} else if (type == "turn_settled") {
 		chat.task_active = false;
-		chat.task_status = GetString(STR_AGENT_CHAT_STATUS_DONE);
-	} else if (type == "turn_failed" || type == "task_failed") {
-		chat.task_active = false;
-		chat.task_status = GetString(STR_AGENT_CHAT_STATUS_FAILED);
-	} else if (type == "turn_stopped" || type == "task_stopped" || type == "stopped") {
-		chat.task_active = false;
-		chat.task_status = GetString(STR_AGENT_CHAT_STATUS_STOPPED);
-	} else if (type == "sub_unavailable" || type == "backend_unavailable") {
-		chat.task_active = false;
-		chat.task_status = GetString(STR_AGENT_CHAT_STATUS_UNAVAILABLE);
+		chat.task_finishing = false;
+		chat.task_status = EventString(event, "status") == "failed" ? GetString(STR_AGENT_CHAT_STATUS_FAILED) : GetString(STR_AGENT_CHAT_STATUS_DONE);
+	} else if (type == "turn_cancelled") {
+		/* The SUB turn was cancelled; the task is stopping until its barrier is acknowledged. */
+		chat.task_active = true;
+		chat.task_finishing = true;
+		chat.task_status = GetString(STR_AGENT_CHAT_STATUS_STOPPING);
+	} else if (type == "stopped" || type == "turn_stopped" || type == "task_stopped") {
+		/* The stop request marks the task stopping; only the acknowledged barrier ends it. */
+		const bool acknowledged = EventBool(event, "acknowledged", true);
+		chat.task_active = !acknowledged;
+		chat.task_finishing = !acknowledged;
+		chat.task_status = acknowledged ? GetString(STR_AGENT_CHAT_STATUS_STOPPED) : GetString(STR_AGENT_CHAT_STATUS_STOPPING);
+	} else if (type == "turn_degraded") {
+		/* The turn was requeued after a SUB failure, so the task is still active. */
+		chat.task_active = true;
+		chat.task_finishing = false;
+		chat.task_status = GetString(STR_AGENT_CHAT_STATUS_THINKING);
 	} else if (type == "epoch_changed" || type == "world_changed") {
 		_agent_chat.chats_loaded = false;
 	}
@@ -720,6 +860,31 @@ static void AgentChatPollEvents(const std::string &chat_id)
 	});
 }
 
+/**
+ * Re-read the task state of one chat from the backend.
+ *
+ * The event stream reports that a turn ended, but not whether its task is still settling or
+ * stopping; the chat DTO carries the authoritative `task_active`/`task_status`, so it is read
+ * while a task is finishing and Stop stays available until the backend reports it terminal.
+ * @param chat_id The chat id.
+ */
+static void AgentChatRefreshChat(const std::string &chat_id)
+{
+	const std::string world_id = _agent_chat.world_id;
+	const std::string epoch = _agent_chat.epoch;
+
+	AgentChatRequest("GET", "/v1/chats/" + chat_id, Json(), [chat_id, world_id, epoch](const Json &response) {
+		/* Ignore the answer when the world changed while the request was in flight. */
+		if (world_id != _agent_chat.world_id || epoch != _agent_chat.epoch) return;
+
+		AgentChatEntry *chat = FindChatById(chat_id);
+		if (chat == nullptr) return;
+
+		const Json &dto = response.is_object() && response.contains("chat") ? response["chat"] : response;
+		ApplyChatTaskState(*chat, dto);
+	});
+}
+
 /** Send the composed message to the selected chat. */
 static void AgentChatSend()
 {
@@ -742,19 +907,25 @@ static void AgentChatSend()
 		body["attachments"] = attachments;
 		body["client_message_id"] = fmt::format("{}", std::chrono::steady_clock::now().time_since_epoch().count());
 
-		AgentChatRequest("POST", "/v1/chats/" + chat_id + "/messages", body, [chat_id, world_id, epoch](const Json &) {
+		AgentChatRequest("POST", "/v1/chats/" + chat_id + "/messages", body, [chat_id, world_id, epoch](const Json &response) {
 			/* Ignore the answer when the world changed while the request was in flight. */
 			if (world_id != _agent_chat.world_id || epoch != _agent_chat.epoch) return;
 
 			AgentChatEntry *chat = FindChatById(chat_id);
 			if (chat != nullptr) {
+				/* The answer carries the task of the message; a queued task is active as well, so
+				 * the player sees that the turn is waiting and Stop is available. */
+				const Json &task = response.is_object() && response.contains("task") ? response["task"] : Json();
 				chat->task_active = true;
-				chat->task_status = GetString(STR_AGENT_CHAT_STATUS_THINKING);
+				chat->task_finishing = false;
+				chat->task_status = GetTaskStatusText(JsonString(task, "status"));
+				if (chat->task_status.empty()) chat->task_status = GetString(STR_AGENT_CHAT_STATUS_THINKING);
 			}
 			_agent_chat.input.clear();
 			_agent_chat.caret = 0;
 			_agent_chat.tray.clear();
 			_agent_chat.scroll = INT32_MAX;
+			InvalidateWindowClassesData(WindowClass::AgentChat);
 			AgentChatLoadMessages(chat_id);
 			AgentChatPollEvents(chat_id);
 		});
@@ -779,13 +950,20 @@ static void AgentChatStop(const std::string &chat_id)
 		}
 	}
 
-	AgentChatRequest("POST", "/v1/chats/" + id + "/stop", Json::object(), [id](const Json &) {
+	AgentChatRequest("POST", "/v1/chats/" + id + "/stop", Json::object(), [id](const Json &response) {
 		AgentChatEntry *chat = FindChatById(id);
 		if (chat != nullptr) {
-			chat->task_active = false;
-			chat->task_status = GetString(STR_AGENT_CHAT_STATUS_STOPPED);
+			/* The stop request only marks the task stopping; it stays active (and stoppable) until
+			 * its barrier is acknowledged, so the answer decides whether Stop is still needed. */
+			const Json &task = response.is_object() && response.contains("task") ? response["task"] : Json();
+			const std::string status = JsonString(task, "status");
+			chat->task_active = IsActiveTaskStatus(status);
+			chat->task_finishing = chat->task_active;
+			chat->task_status = chat->task_active ? GetTaskStatusText(status) : GetString(STR_AGENT_CHAT_STATUS_STOPPED);
+			if (chat->task_active && chat->task_status.empty()) chat->task_status = GetString(STR_AGENT_CHAT_STATUS_STOPPING);
 		}
 		AgentChatPollEvents(id);
+		AgentChatRefreshChat(id);
 	});
 }
 
@@ -1139,7 +1317,7 @@ struct AgentChatWindow : Window {
 			size_t line_begin = 0;
 			for (size_t i = 0; i < caret_line; i++) line_begin += lines[i].size() + 1;
 			const size_t offset = _agent_chat.caret > line_begin ? std::min(_agent_chat.caret - line_begin, line.size()) : 0;
-			const int caret_x = area.left + GetStringBoundingBox(std::string_view(line).substr(0, offset)).width;
+			const int caret_x = std::min(area.right, area.left + static_cast<int>(GetStringBoundingBox(std::string_view(line).substr(0, offset)).width));
 			const int caret_y = area.top + static_cast<int>(caret_line - first_line) * line_height;
 			GfxFillRect(Rect{caret_x, caret_y, caret_x + 1, caret_y + line_height - 1}, PC_BLACK);
 		}
@@ -1398,6 +1576,8 @@ struct AgentChatWindow : Window {
 	{
 		if (!IsValidTile(tile)) return;
 
+		/* A point stays a point, also when the tile is occupied: the object picker is a separate
+		 * button, so picking a point never turns into an object reference. */
 		AgentChatAttachment attachment;
 		attachment.type = "point";
 		attachment.tile = tile;
@@ -1592,14 +1772,6 @@ struct AgentChatWindow : Window {
 			_agent_chat.caret = pos;
 		}
 		this->SetWidgetDirty(WID_AC_INPUT);
-	}
-
-	void OnMouseWheel(int wheel, WidgetID widget) override
-	{
-		if (widget != WID_AC_TRANSCRIPT && widget != WID_AC_TRANSCRIPT_SCROLL) return;
-		this->transcript_scroll->UpdatePosition(wheel);
-		_agent_chat.scroll = this->transcript_scroll->GetPosition();
-		this->SetWidgetDirty(WID_AC_TRANSCRIPT);
 	}
 
 	void OnScrollbarScroll(WidgetID widget) override
@@ -1811,6 +1983,14 @@ void AgentChatGuiTick()
 	}
 	for (const std::string &id : busy_ids) AgentChatPollEvents(id);
 
+	/* A task whose turn ended may still be settling or stopping; only the chat DTO knows when its
+	 * writes and its barrier settled, so Stop stays available until then. */
+	std::vector<std::string> finishing_ids;
+	for (const AgentChatEntry &chat : _agent_chat.chats) {
+		if (chat.task_active && chat.task_finishing) finishing_ids.push_back(chat.id);
+	}
+	for (const std::string &id : finishing_ids) AgentChatRefreshChat(id);
+
 	AgentChatUpdateStatusWindow();
 }
 
@@ -1911,6 +2091,8 @@ nlohmann::json DescribeAgentChatUi()
 
 		Json widgets = Json::object();
 		const std::pair<const char *, WidgetID> widget_names[] = {
+			/* The caption is a real widget with its own id, so a test can drag the window by it. */
+			{"caption", WID_AC_CAPTION},
 			{"chat_list", WID_AC_CHAT_LIST},
 			{"chat_scroll", WID_AC_CHAT_SCROLL},
 			{"new_chat", WID_AC_NEW_CHAT},

@@ -45,17 +45,22 @@ void AgentChatGuiTick();
  * - "active_chat": string id of the selected chat, empty when there is none.
  * - "input": current text of the message input.
  * - "widgets": object mapping widget names to rectangles, only present when the window is open.
- *   Names are chat_list, chat_scroll, new_chat, transcript, transcript_scroll, tray, add_point,
- *   add_object, input, status, send, stop and closebox (the close box has no widget id of its
- *   own, so it is looked up in the nested tree; Esc closes the window as well).
- * - "chats": array of {id, title, selected, task_active, status}.
+ *   Names are caption, chat_list, chat_scroll, new_chat, transcript, transcript_scroll, tray,
+ *   add_point, add_object, input, status, send, stop and closebox (the close box has no widget
+ *   id of its own, so it is looked up in the nested tree; Esc closes the window as well). The
+ *   caption is the title bar, i.e. the area a real input test can drag the window by.
+ * - "chats": array of {id, title, selected, task_active, status}. "task_active" stays true while
+ *   the task of the chat is queued, running, stopping or settling, i.e. exactly while Stop is
+ *   available; "status" is the translated status text of that task.
  * - "messages": array of {seq, role, text, status, attachments}.
  * - "tray": array of {type, id, generation, tile, name, world_id, epoch, stale, generation_known,
  *   rect, remove_rect}.
  * - "candidates": array of {type, id, generation, name, world_id, epoch, rect}.
  *
  * An attachment is {type, id, generation, name, tile, world_id, epoch, stale, generation_known}:
- * the identity of a typed reference is kept as the backend reported it. "stale" marks a reference
+ * the identity of a typed reference is kept as the backend reported it. "tile" is the array
+ * [x, y] in this description; the payload sent to the backend names the tile as the canonical
+ * object {"x": x, "y": y}, and both shapes are accepted when a reference is read. "stale" marks a reference
  * that belongs to another world or epoch than the current one, and "generation_known" is false
  * for a pooled object (town, station, industry, vehicle, sign) whose generation the backend did
  * not report, because such an id may already belong to another object. Both cases are labelled
