@@ -36,6 +36,7 @@
 #include <fstream>
 #include <iterator>
 #include <random>
+#include <vector>
 
 #include "safeguards.h"
 
@@ -188,8 +189,135 @@ static Json Failure(std::string_view error)
 	return result;
 }
 
+/**
+ * One agent window that was moved off screen, with the position it has to be returned to.
+ */
+struct HiddenAgentWindow {
+	WindowClass window_class; ///< Class of the window.
+	WindowNumber window_number; ///< Number of the window within its class.
+	Window *window; ///< The window that was moved.
+	int left; ///< Position before the move.
+	int top; ///< Position before the move.
+};
+
+/** Nesting depth of agent UI hides; only the outermost scope moves the windows. */
+static int _agent_ui_hide_depth = 0;
+/** How many agent windows the outermost hide scope currently keeps off screen. */
+static int _agent_ui_hidden_windows = 0;
+
+/**
+ * Temporarily move the in-game agent windows off screen, and put them back however the scope is
+ * left.
+ *
+ * This is the idiom of SetScreenshotWindowVisibility(): the area a window covers is marked dirty
+ * first, so the next DrawDirtyBlocks() redraws the world that was behind it, and the window is
+ * then moved out of the frame. Only WindowClass::AgentChat and WindowClass::AgentChatStatus are
+ * touched, and only their position: nothing is closed, resized or otherwise changed, so the chat
+ * keeps its state, its scroll position and its focus. The screenshot window keeps its own, separate
+ * handling in SetScreenshotWindowVisibility(), which this scope neither uses nor changes.
+ *
+ * The windows are put back as soon as the pixels exist and, because the restore also runs from
+ * the destructor, an encoder failure or an exception cannot leave the chat off screen either. It
+ * happens before the caller's video buffer lock is released. Nesting is safe: an inner scope
+ * finds the windows already hidden, does not move them a second time and reports the windows that
+ * were off screen for its own copy.
+ */
+class AgentUiHider {
+public:
+	/**
+	 * Hide the agent windows, unless an outer scope already did.
+	 * @param hide Whether the capture asked for the agent UI to be hidden.
+	 */
+	explicit AgentUiHider(bool hide)
+	{
+		if (!hide) return;
+
+		/* Reserve before any state changes: with the capacity in place the loop below cannot
+		 * reallocate, so nothing after this line throws and a scope that moved a window always
+		 * runs its destructor and puts it back. */
+		this->windows.reserve(2);
+
+		this->counted = true;
+		if (_agent_ui_hide_depth++ > 0) {
+			/* An outer scope already moved the windows; they are off screen for this copy as well. */
+			this->hidden_windows = _agent_ui_hidden_windows;
+			return;
+		}
+		this->owns = true;
+
+		for (const WindowClass window_class : {WindowClass::AgentChat, WindowClass::AgentChatStatus}) {
+			Window *w = FindWindowById(window_class, 0);
+			if (w == nullptr) continue;
+			/* Record the position before moving, so a restore can never guess it. */
+			this->windows.push_back({window_class, w->window_number, w, w->left, w->top});
+			w->SetDirty(); // the world behind the window has to be redrawn
+			w->left += 2 * _screen.width; // off screen, like SetScreenshotWindowVisibility()
+		}
+		this->hidden_windows = static_cast<int>(this->windows.size());
+		_agent_ui_hidden_windows = this->hidden_windows;
+	}
+
+	~AgentUiHider()
+	{
+		if (this->counted) _agent_ui_hide_depth--;
+		this->Restore();
+	}
+
+	AgentUiHider(const AgentUiHider &) = delete;
+	AgentUiHider &operator=(const AgentUiHider &) = delete;
+
+	/**
+	 * Return every window this scope moved to where it was, and mark the restored area dirty.
+	 *
+	 * Called explicitly once the pixels exist, and again from the destructor, which is then a
+	 * no-op: the restore happens exactly once, on every path out of the capture.
+	 */
+	void Restore()
+	{
+		if (!this->owns) return;
+		this->owns = false;
+
+		for (const HiddenAgentWindow &hidden : this->windows) {
+			/* The window could have been closed meanwhile; only move the window that is still there. */
+			Window *w = FindWindowById(hidden.window_class, hidden.window_number);
+			if (w != hidden.window) {
+				this->restored = false;
+				continue;
+			}
+			w->left = hidden.left;
+			w->top = hidden.top;
+			w->SetDirty();
+		}
+		this->windows.clear();
+		_agent_ui_hidden_windows = 0;
+	}
+
+	/**
+	 * How many agent windows were off screen for this capture.
+	 *
+	 * That is the number this scope moved, or the number an outer scope kept hidden for it. The
+	 * count is taken when the windows move and survives Restore(), so the caller can report what
+	 * the pixels show after the windows are already back.
+	 */
+	int HiddenWindowCount() const { return this->hidden_windows; }
+
+	/** Whether every window this scope moved was returned to its exact position. */
+	bool Restored() const { return this->restored; }
+
+private:
+	std::vector<HiddenAgentWindow> windows; ///< The windows this scope moved.
+	int hidden_windows = 0; ///< Agent windows off screen for this capture.
+	bool counted = false; ///< Whether this scope is part of the nesting depth.
+	bool owns = false; ///< Whether this scope is the one that moved the windows.
+	bool restored = true; ///< Whether the restore returned every window exactly.
+};
+
 Json CaptureGameFrame(const Json &params)
 {
+	/* A field of the wrong type is a caller error, never something to ignore silently. */
+	bool hide_agent_ui = false;
+	if (!ReadHideAgentUi(params, hide_agent_ui)) return Failure("invalid_params");
+
 	/* Without a video driver, blitter or frame buffer there is nothing to capture; say so. */
 	Blitter *blitter = BlitterFactory::GetCurrentBlitter();
 	if (blitter == nullptr || VideoDriver::GetInstance() == nullptr || _screen.dst_ptr == nullptr || _screen.width <= 0 || _screen.height <= 0) {
@@ -263,10 +391,15 @@ Json CaptureGameFrame(const Json &params)
 	 * does, so the pixels belong to the state whose tick we report. */
 	const uint64_t frame_tick = TimerGameTick::counter;
 	bool written = false;
+	int hidden_window_count = 0;
+	bool agent_ui_restored = true;
 	{
 		/* Lock the video buffer like the crashlog screenshot does, so the frame is stable while it is copied. */
 		VideoDriver::VideoBufferLocker video_buffer_lock;
 
+		/* The agent UI is hidden inside the lock and put back before the lock is released, so the
+		 * windows never stay off screen and the pixels are the world the chat was covering. */
+		AgentUiHider hider(hide_agent_ui);
 		SetScreenshotWindowVisibility(true);
 		UndrawMouseCursor();
 		DrawDirtyBlocks();
@@ -275,6 +408,12 @@ Json CaptureGameFrame(const Json &params)
 		written = provider->MakeImage(path.string(), [&rect](void *buf, uint y, uint pitch, uint n) {
 			CaptureFrameCallback(rect, buf, y, pitch, n);
 		}, rect.width, rect.height, blitter->GetScreenDepth(), _cur_palette.palette);
+
+		/* Put the windows back right away, so the reported state is the state after the capture.
+		 * The hidden count was taken when they moved, so it still describes the captured pixels. */
+		hider.Restore();
+		hidden_window_count = hider.HiddenWindowCount();
+		agent_ui_restored = hider.Restored();
 	}
 
 	/* If the game advanced while the frame was copied, the pixels are older than the state we would
@@ -286,6 +425,9 @@ Json CaptureGameFrame(const Json &params)
 		result["error"] = "stale_frame";
 		result["tick"] = frame_tick;
 		result["tick_now"] = tick_after_copy;
+		result["hide_agent_ui"] = hidden_window_count > 0;
+		result["hidden_window_count"] = hidden_window_count;
+		result["agent_ui_restored"] = agent_ui_restored;
 		return result;
 	}
 
@@ -330,6 +472,10 @@ Json CaptureGameFrame(const Json &params)
 	result["hash"] = hash_hex;
 	result["hash_algorithm"] = "md5";
 	result["parent_hash"] = _last_capture_hash.empty() ? Json(nullptr) : Json(_last_capture_hash);
+	/* True only when agent windows were really hidden; the request alone is not evidence. */
+	result["hide_agent_ui"] = hidden_window_count > 0;
+	result["hidden_window_count"] = hidden_window_count;
+	result["agent_ui_restored"] = agent_ui_restored;
 	result["png_bytes"] = png.size();
 	if (include_png) result["png_base64"] = Base64Encode(png);
 
