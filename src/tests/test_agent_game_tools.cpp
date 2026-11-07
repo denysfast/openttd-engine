@@ -1194,3 +1194,58 @@ TEST_CASE("agent_game_tools: a vehicle row reports the engine's display name")
 	CHECK(plain["engine_name"] == "MPS Regal Bus");
 	CHECK(plain["engine_custom_name"].is_null());
 }
+
+TEST_CASE("agent_game_tools: an order's refit is a separate OrderRefit, not part of the insert")
+{
+	/* Commands::InsertOrder only accepts an order whose refit is the default, so the tool inserts the
+	 * order without one and applies the refit with Commands::OrderRefit for the inserted index. */
+	const Json plan = OrdersPlanForTest(Json::array({
+		Json{{"type", "station"}, {"id", 0}, {"refit_cargo_id", 1}},
+		Json{{"type", "station"}, {"id", 1}},
+		Json{{"type", "depot"}, {"id", 0}, {"refit_cargo_id", 2}},
+	}));
+	REQUIRE(plan["ok"] == true);
+	REQUIRE(plan["orders"].size() == 3);
+
+	/* The inserted order carries no refit at all; the refit cargo waits for the second command. */
+	CHECK(plan["orders"][0]["type"] == "goto_station");
+	CHECK(plan["orders"][0]["insert_refit_cargo_id"].is_null());
+	CHECK(plan["orders"][0]["order_refit_cargo_id"] == 1);
+
+	/* An order without a refit needs no second command. */
+	CHECK(plan["orders"][1]["insert_refit_cargo_id"].is_null());
+	CHECK(plan["orders"][1]["order_refit_cargo_id"].is_null());
+
+	/* A depot order can carry a refit too. */
+	CHECK(plan["orders"][2]["type"] == "goto_depot");
+	CHECK(plan["orders"][2]["insert_refit_cargo_id"].is_null());
+	CHECK(plan["orders"][2]["order_refit_cargo_id"] == 2);
+}
+
+TEST_CASE("agent_game_tools: an unsupported refit is refused before the order list is touched")
+{
+	/* Commands::OrderRefit only refits station and depot orders, so a waypoint order that asks for a
+	 * refit is rejected up front: `set` must not delete the old list for a request it cannot finish. */
+	const Json waypoint = OrdersPlanForTest(Json::array({Json{{"type", "waypoint"}, {"id", 0}, {"refit_cargo_id", 1}}}));
+	CHECK(waypoint["ok"] == false);
+	CHECK(waypoint["order_index"] == 0);
+	CHECK(waypoint["error"]["error"] == "invalid_arguments");
+	CHECK(waypoint["error"]["detail"]["order_index"] == 0);
+	CHECK(waypoint["error"]["detail"]["reason"] == "only station and depot orders can carry a refit");
+
+	/* An order that does not load cannot be refitted either, exactly as Commands::OrderRefit says. */
+	const Json no_load = OrdersPlanForTest(Json::array({Json{{"type", "station"}, {"id", 0}, {"refit_cargo_id", 1}, {"load", "none"}}}));
+	CHECK(no_load["ok"] == false);
+	CHECK(no_load["error"]["error"] == "invalid_arguments");
+	CHECK(no_load["error"]["detail"]["reason"] == "an order that does not load cannot be refitted");
+
+	/* The order that is fine on its own still passes, so the check rejects the refit and not the order. */
+	const Json loading = OrdersPlanForTest(Json::array({Json{{"type", "station"}, {"id", 0}, {"refit_cargo_id", 1}, {"load", "full"}}}));
+	REQUIRE(loading["ok"] == true);
+	CHECK(loading["orders"][0]["order_refit_cargo_id"] == 1);
+
+	/* A parameter error keeps its own error, before any refit check. */
+	const Json no_id = OrdersPlanForTest(Json::array({Json{{"type", "station"}, {"refit_cargo_id", 1}}}));
+	CHECK(no_id["ok"] == false);
+	CHECK(no_id["error"]["error"] == "invalid_arguments");
+}

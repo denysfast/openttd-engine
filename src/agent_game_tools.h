@@ -189,6 +189,20 @@ Json VehicleEngineNameFieldsForTest(const Vehicle *v);
  */
 std::optional<Json> ReadOrderForTest(const Json &entry, Order &order);
 
+/**
+ * The order-list plan of `world.orders` for the tests.
+ *
+ * For every order of the request it reports the refit that would be encoded on the inserted order
+ * (always null, because Commands::InsertOrder only takes the default) and the refit cargo that a
+ * following Commands::OrderRefit would apply, or the error that rejects the request before the order
+ * list is touched.
+ *
+ * @param orders The `orders` array of a `world.orders` call.
+ * @return `{"ok": true, "orders": [{index, type, load, insert_refit_cargo_id, order_refit_cargo_id}]}`,
+ *         or `{"ok": false, "order_index": N, "error": {...}}` when the request is rejected.
+ */
+Json OrdersPlanForTest(const Json &orders);
+
 } // namespace InGameAgent
 
 #endif /* AGENT_GAME_TOOLS_H */

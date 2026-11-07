@@ -2472,7 +2472,72 @@ std::optional<Json> ReadOrder(const Json &entry, Order &order)
 }
 
 /**
+ * Check one order's refit request against the rules Commands::OrderRefit applies.
+ *
+ * The refit is a second command after the insert, so a request the engine will refuse has to be
+ * rejected before the order list is touched: otherwise `set` deletes the old list and then cannot
+ * build the new one.
+ *
+ * @param order The order as the tool built it.
+ * @param index Position of the order in the requested list.
+ * @return Error result, or an empty optional when Commands::OrderRefit will accept the refit.
+ */
+std::optional<Json> CheckOrderRefit(const Order &order, size_t index)
+{
+	if (!order.IsRefit()) return std::nullopt;
+
+	const CargoType cargo = order.GetRefitCargo();
+	std::string reason;
+	if (!order.IsType(OT_GOTO_DEPOT) && !order.IsType(OT_GOTO_STATION)) {
+		reason = "only station and depot orders can carry a refit";
+	} else if (cargo == CARGO_AUTO_REFIT && !order.IsType(OT_GOTO_STATION)) {
+		reason = "an automatic refit is only possible on a station order";
+	} else if (order.GetLoadType() == OrderLoadType::NoLoad) {
+		reason = "an order that does not load cannot be refitted";
+	}
+	if (reason.empty()) return std::nullopt;
+
+	Json detail = Json::object();
+	detail["order_index"] = index;
+	detail["reason"] = reason;
+	return MakeError("invalid_arguments", "the refit of order " + std::to_string(index) + " cannot be applied: " + reason, std::move(detail));
+}
+
+/**
+ * What has to be done for one built order: the order to insert, and the refit that follows it.
+ *
+ * Commands::InsertOrder only accepts an order whose refit cargo, wait time, travel time and max speed
+ * are the defaults - those are set by other commands - so the refit travels in a Commands::OrderRefit
+ * for the inserted index instead of in the order.
+ */
+struct OrderInsertPlan {
+	Order order;                    ///< The order to insert, with the refit cleared.
+	std::optional<CargoType> refit; ///< Cargo of the refit that follows the insert, if the order asks for one.
+};
+
+/**
+ * Split a built order into the insert payload and the refit that follows it.
+ * @param built The order the tool built.
+ * @return The insert payload and the refit cargo, if any.
+ */
+OrderInsertPlan PlanOrderInsert(const Order &built)
+{
+	OrderInsertPlan plan;
+	plan.order = built;
+	if (built.IsRefit()) {
+		plan.refit = built.GetRefitCargo();
+		plan.order.SetRefit(CARGO_NO_REFIT);
+	}
+	return plan;
+}
+
+/**
  * Replace or extend the order list of a vehicle.
+ *
+ * Every order is inserted through Commands::InsertOrder with its refit cleared, and an order that asks
+ * for a refit is followed by a Commands::OrderRefit for the index it was inserted at. The two commands
+ * are not atomic: when the refit fails, the order is in the list without it and the result says so.
+ *
  * @param params Method parameters.
  * @param company Company the vehicle belongs to.
  * @param replace True to replace the list, false to append.
@@ -2495,6 +2560,11 @@ Json OrdersSet(const Json &params, CompanyID company, bool replace)
 		Order order;
 		if (const std::optional<Json> error = ReadOrder(entry, order); error.has_value()) return *error;
 		orders.push_back(order);
+	}
+
+	/* Check every refit before the first command, so an unsupported one cannot destroy the list. */
+	for (size_t index = 0; index < orders.size(); index++) {
+		if (const std::optional<Json> error = CheckOrderRefit(orders[index], index); error.has_value()) return *error;
 	}
 
 	if (const std::optional<Json> error = CheckWriteContext(company, false); error.has_value()) return *error;
@@ -2531,14 +2601,18 @@ Json OrdersSet(const Json &params, CompanyID company, bool replace)
 	}
 
 	uint inserted = 0;
-	for (const Order &order : orders) {
+	for (const Order &built : orders) {
 		const Vehicle *current = Vehicle::GetIfValid(veh_id);
 		if (current == nullptr) {
 			Json detail = Json::object();
 			detail["vehicle_id"] = vehicle_id.base();
 			return MakeError("not_found", "vehicle disappeared while its orders were set", std::move(detail));
 		}
-		if (!RunCommandAt<Commands::InsertOrder>(false, current->tile, &AgentCommandCallback, veh_id, current->GetNumOrders(), order)) {
+
+		/* Orders are appended one by one, so the index the order gets is the current count. */
+		const VehicleOrderID insert_index = current->GetNumOrders();
+		const OrderInsertPlan plan = PlanOrderInsert(built);
+		if (!RunCommandAt<Commands::InsertOrder>(false, current->tile, &AgentCommandCallback, veh_id, insert_index, plan.order)) {
 			result["deleted"] = deleted;
 			result["inserted"] = inserted;
 			if (!_posted.captured) return NotExecuted(std::move(result));
@@ -2546,6 +2620,20 @@ Json OrdersSet(const Json &params, CompanyID company, bool replace)
 		}
 		spent += _posted.cost.GetCost();
 		inserted++;
+
+		if (plan.refit.has_value()) {
+			const CargoType cargo = *plan.refit;
+			if (!RunCommandAt<Commands::OrderRefit>(false, current->tile, &AgentCommandCallback, veh_id, insert_index, cargo)) {
+				/* The order is in the list but its refit is not: report exactly that. */
+				result["deleted"] = deleted;
+				result["inserted"] = inserted;
+				result["refit_cargo_id"] = static_cast<uint8_t>(cargo);
+				result["refit_order_index"] = insert_index;
+				if (!_posted.captured) return NotExecuted(std::move(result));
+				return PartialResult(std::move(result), spent, _posted);
+			}
+			spent += _posted.cost.GetCost();
+		}
 	}
 
 	const Vehicle *after = Vehicle::GetIfValid(veh_id);
@@ -3012,6 +3100,39 @@ Json Capability(std::string_view method, std::string_view authority, std::initia
 std::optional<Json> ReadOrderForTest(const Json &entry, Order &order)
 {
 	return ReadOrder(entry, order);
+}
+
+Json OrdersPlanForTest(const Json &orders)
+{
+	Json result = Json::object();
+	Json rows = Json::array();
+	for (size_t index = 0; index < orders.size(); index++) {
+		Order built;
+		if (const std::optional<Json> error = ReadOrder(orders[index], built); error.has_value()) {
+			result["ok"] = false;
+			result["order_index"] = index;
+			result["error"] = *error;
+			return result;
+		}
+		if (const std::optional<Json> error = CheckOrderRefit(built, index); error.has_value()) {
+			result["ok"] = false;
+			result["order_index"] = index;
+			result["error"] = *error;
+			return result;
+		}
+
+		const OrderInsertPlan plan = PlanOrderInsert(built);
+		Json row = Json::object();
+		row["index"] = index;
+		row["type"] = std::string(OrderTypeName(built.GetType()));
+		row["load"] = std::string(LoadTypeName(built.GetLoadType()));
+		row["insert_refit_cargo_id"] = plan.order.IsRefit() ? Json(static_cast<uint8_t>(plan.order.GetRefitCargo())) : Json(nullptr);
+		row["order_refit_cargo_id"] = plan.refit.has_value() ? Json(static_cast<uint8_t>(*plan.refit)) : Json(nullptr);
+		rows.push_back(std::move(row));
+	}
+	result["ok"] = true;
+	result["orders"] = std::move(rows);
+	return result;
 }
 
 /**
