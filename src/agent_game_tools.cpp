@@ -395,6 +395,71 @@ bool ReadOptionalBool(const Json &params, const char *key, bool &value)
 }
 
 /**
+ * Read a pool id value without narrowing it to a type smaller than the pool uses.
+ *
+ * A plain cast would wrap: `0xFF000` would become another valid vehicle, a negative or a
+ * fractional value would become some other object, and a JSON boolean would become 0 or 1. Every
+ * id goes through here, so an unusable id is an error and never a different object of the same
+ * pool.
+ *
+ * @tparam Tpool The pool id type.
+ * @param value JSON value holding the id.
+ * @param key Parameter name, used in the error message.
+ * @param id Receives the id.
+ * @param code Error code to reject with.
+ * @return Error result, or an empty optional when the value is an id of that pool.
+ */
+template <typename Tpool>
+std::optional<Json> ReadPoolIdValue(const Json &value, std::string_view key, Tpool &id, std::string_view code)
+{
+	using Tbase = typename Tpool::BaseType;
+	if (!value.is_number_integer()) return MakeError(code, std::string(key) + " must be an integer");
+	const int64_t raw = value.get<int64_t>();
+	if (raw < 0 || raw >= static_cast<int64_t>(Tpool::End().base())) {
+		Json detail = Json::object();
+		detail[std::string(key)] = raw;
+		detail["max"] = static_cast<int64_t>(Tpool::End().base()) - 1;
+		return MakeError(code, std::string(key) + " is outside its pool", std::move(detail));
+	}
+	id = Tpool(static_cast<Tbase>(raw));
+	return std::nullopt;
+}
+
+/**
+ * Read a pool id of a query filter. A filter that names no object is an invalid argument.
+ * @tparam Tpool The pool id type.
+ * @param value JSON value holding the id.
+ * @param key Filter name, used in the error message.
+ * @param id Receives the id.
+ * @return Error result, or an empty optional when the value is an id of that pool.
+ */
+template <typename Tpool>
+std::optional<Json> ReadPoolId(const Json &value, std::string_view key, Tpool &id)
+{
+	return ReadPoolIdValue(value, key, id, "invalid_arguments");
+}
+
+/**
+ * Read a pool id parameter of a write op, when it is present, and check it before the cast.
+ *
+ * An id that cannot name an object is `invalid_params`, the code the parent bridge uses for its
+ * own id checks; it is never wrapped onto another object of the pool.
+ *
+ * @tparam Tpool The pool id type.
+ * @param params Method parameters.
+ * @param key Parameter name.
+ * @param id Receives the id.
+ * @return Error result, or an empty optional when the parameter is absent or a valid id.
+ */
+template <typename Tpool>
+std::optional<Json> ReadPoolIdParam(const Json &params, const char *key, Tpool &id)
+{
+	const auto it = params.find(key);
+	if (it == params.end()) return std::nullopt;
+	return ReadPoolIdValue(*it, key, id, "invalid_params");
+}
+
+/**
  * Read a cargo id parameter and check it against the cargo types of the game.
  * @param params Method parameters.
  * @param key Parameter name.
@@ -405,12 +470,12 @@ std::optional<Json> ReadCargoId(const Json &params, const char *key, CargoType &
 {
 	if (!params.contains(key)) return std::nullopt;
 	int64_t cargo_id = 0;
-	if (!ReadOptionalInt(params, key, cargo_id)) return MakeError("invalid_arguments", std::string(key) + " must be an integer");
+	if (!ReadOptionalInt(params, key, cargo_id)) return MakeError("invalid_params", std::string(key) + " must be an integer");
 	if (cargo_id < 0 || cargo_id >= static_cast<int64_t>(NUM_CARGO)) {
 		Json detail = Json::object();
-		detail["cargo_id"] = cargo_id;
+		detail[std::string(key)] = cargo_id;
 		detail["max"] = NUM_CARGO - 1;
-		return MakeError("invalid_arguments", "cargo_id is not a cargo", std::move(detail));
+		return MakeError("invalid_params", std::string(key) + " is not a cargo", std::move(detail));
 	}
 	cargo = static_cast<CargoType>(static_cast<uint8_t>(cargo_id));
 	return std::nullopt;
@@ -1052,31 +1117,6 @@ struct QueryFilters {
 	std::optional<bool> replace_protection; ///< Restrict to groups with or without replace protection.
 	std::optional<bool> is_freight; ///< Restrict to freight or non-freight cargoes.
 };
-
-/**
- * Read a pool id value without narrowing it to a type smaller than the pool uses.
- *
- * @tparam Tpool The pool id type.
- * @param value JSON value holding the id.
- * @param key Parameter name, used in the error message.
- * @param id Receives the id.
- * @return Error result, or an empty optional when the value is an id of that pool.
- */
-template <typename Tpool>
-std::optional<Json> ReadPoolId(const Json &value, std::string_view key, Tpool &id)
-{
-	using Tbase = typename Tpool::BaseType;
-	if (!value.is_number_integer()) return MakeError("invalid_arguments", std::string(key) + " must be an integer");
-	const int64_t raw = value.get<int64_t>();
-	if (raw < 0 || raw >= static_cast<int64_t>(Tpool::End().base())) {
-		Json detail = Json::object();
-		detail[std::string(key)] = raw;
-		detail["max"] = static_cast<int64_t>(Tpool::End().base()) - 1;
-		return MakeError("invalid_arguments", std::string(key) + " is outside its pool", std::move(detail));
-	}
-	id = Tpool(static_cast<Tbase>(raw));
-	return std::nullopt;
-}
 
 /**
  * Read a company id value without truncating it to the width of a company id.
@@ -1806,8 +1846,9 @@ Json DemolishTiles(const Json &params, CompanyID company, bool dry_run)
  */
 Json VehicleBuild(const Json &params, CompanyID company)
 {
-	int64_t engine_id = 0;
-	if (!ReadInt(params, "engine_id", engine_id)) return MakeError("invalid_arguments", "build needs engine_id");
+	EngineID engine_id = EngineID::Invalid();
+	if (!params.contains("engine_id")) return MakeError("invalid_arguments", "build needs engine_id");
+	if (const std::optional<Json> error = ReadPoolIdParam(params, "engine_id", engine_id); error.has_value()) return *error;
 
 	int64_t count = 1;
 	if (!ReadOptionalInt(params, "count", count)) return MakeError("invalid_arguments", "count must be an integer");
@@ -1820,17 +1861,7 @@ Json VehicleBuild(const Json &params, CompanyID company)
 	}
 
 	CargoType cargo = INVALID_CARGO;
-	int64_t cargo_id = 0;
-	if (params.contains("cargo_id")) {
-		if (!ReadOptionalInt(params, "cargo_id", cargo_id)) return MakeError("invalid_arguments", "cargo_id must be an integer");
-		if (cargo_id < 0 || cargo_id >= static_cast<int64_t>(NUM_CARGO)) {
-			Json detail = Json::object();
-			detail["cargo_id"] = cargo_id;
-			detail["max"] = NUM_CARGO - 1;
-			return MakeError("invalid_arguments", "cargo_id is not a cargo", std::move(detail));
-		}
-		cargo = static_cast<CargoType>(static_cast<uint8_t>(cargo_id));
-	}
+	if (const std::optional<Json> error = ReadCargoId(params, "cargo_id", cargo); error.has_value()) return *error;
 
 	std::string name;
 	const bool rename = params.contains("name");
@@ -1844,32 +1875,32 @@ Json VehicleBuild(const Json &params, CompanyID company)
 		}
 	}
 
-	int64_t share_from = 0;
 	const bool share = params.contains("share_orders_from");
-	if (share && !ReadOptionalInt(params, "share_orders_from", share_from)) {
-		return MakeError("invalid_arguments", "share_orders_from must be an integer");
-	}
+	VehicleID share_from = VehicleID::Invalid();
+	if (const std::optional<Json> error = ReadPoolIdParam(params, "share_orders_from", share_from); error.has_value()) return *error;
+
+	DepotID depot_id = DepotID::Invalid();
+	const bool has_depot = params.contains("depot_id");
+	if (const std::optional<Json> error = ReadPoolIdParam(params, "depot_id", depot_id); error.has_value()) return *error;
 
 	bool dry_run = false;
 	if (!ReadOptionalBool(params, "dry_run", dry_run)) return MakeError("invalid_arguments", "dry_run must be a boolean");
 
 	if (const std::optional<Json> error = CheckWriteContext(company, dry_run); error.has_value()) return *error;
 
-	const Engine *e = Engine::GetIfValid(EngineID(static_cast<uint16_t>(engine_id)));
+	const Engine *e = Engine::GetIfValid(engine_id);
 	if (e == nullptr) {
 		Json detail = Json::object();
-		detail["engine_id"] = engine_id;
+		detail["engine_id"] = engine_id.base();
 		return MakeError("not_found", "engine does not exist", std::move(detail));
 	}
 
 	TileIndex tile = INVALID_TILE;
-	int64_t depot_id = 0;
-	if (params.contains("depot_id")) {
-		if (!ReadOptionalInt(params, "depot_id", depot_id)) return MakeError("invalid_arguments", "depot_id must be an integer");
-		const Depot *d = Depot::GetIfValid(DepotID(static_cast<uint16_t>(depot_id)));
+	if (has_depot) {
+		const Depot *d = Depot::GetIfValid(depot_id);
 		if (d == nullptr) {
 			Json detail = Json::object();
-			detail["depot_id"] = depot_id;
+			detail["depot_id"] = depot_id.base();
 			return MakeError("not_found", "depot does not exist", std::move(detail));
 		}
 		tile = d->xy;
@@ -1883,27 +1914,27 @@ Json VehicleBuild(const Json &params, CompanyID company)
 
 	VehicleID source_id = VehicleID::Invalid();
 	if (share) {
-		const Vehicle *source = Vehicle::GetIfValid(VehicleID(static_cast<uint32_t>(share_from)));
+		const Vehicle *source = Vehicle::GetIfValid(share_from);
 		if (source == nullptr) {
 			Json detail = Json::object();
-			detail["share_orders_from"] = share_from;
+			detail["share_orders_from"] = share_from.base();
 			return MakeError("not_found", "share_orders_from vehicle does not exist", std::move(detail));
 		}
 		if (source->owner != company) {
 			Json detail = Json::object();
-			detail["share_orders_from"] = share_from;
+			detail["share_orders_from"] = share_from.base();
 			detail["owner"] = source->owner.base();
 			return MakeError("invalid_arguments", "share_orders_from vehicle belongs to another company", std::move(detail));
 		}
 		if (source->type != e->type) {
 			Json detail = Json::object();
-			detail["share_orders_from"] = share_from;
+			detail["share_orders_from"] = share_from.base();
 			detail["type"] = std::string(VehicleTypeName(source->type));
 			return MakeError("invalid_arguments", "share_orders_from vehicle has another type", std::move(detail));
 		}
 		if (!source->IsPrimaryVehicle()) {
 			Json detail = Json::object();
-			detail["share_orders_from"] = share_from;
+			detail["share_orders_from"] = share_from.base();
 			return MakeError("invalid_arguments", "share_orders_from vehicle is not a primary vehicle", std::move(detail));
 		}
 		source_id = source->index;
@@ -1969,18 +2000,19 @@ Json VehicleBuild(const Json &params, CompanyID company)
  */
 Json VehicleStartStop(const Json &params, CompanyID company, bool start)
 {
-	int64_t vehicle_id = 0;
-	if (!ReadInt(params, "vehicle_id", vehicle_id)) return MakeError("invalid_arguments", "start/stop needs vehicle_id");
+	VehicleID vehicle_id = VehicleID::Invalid();
+	if (!params.contains("vehicle_id")) return MakeError("invalid_arguments", "start/stop needs vehicle_id");
+	if (const std::optional<Json> error = ReadPoolIdParam(params, "vehicle_id", vehicle_id); error.has_value()) return *error;
 
 	bool dry_run = false;
 	if (!ReadOptionalBool(params, "dry_run", dry_run)) return MakeError("invalid_arguments", "dry_run must be a boolean");
 
 	if (const std::optional<Json> error = CheckWriteContext(company, dry_run); error.has_value()) return *error;
 
-	Vehicle *v = Vehicle::GetIfValid(VehicleID(static_cast<uint32_t>(vehicle_id)));
+	Vehicle *v = Vehicle::GetIfValid(vehicle_id);
 	if (v == nullptr) {
 		Json detail = Json::object();
-		detail["vehicle_id"] = vehicle_id;
+		detail["vehicle_id"] = vehicle_id.base();
 		return MakeError("not_found", "vehicle does not exist", std::move(detail));
 	}
 
@@ -2020,35 +2052,38 @@ Json VehicleStartStop(const Json &params, CompanyID company, bool start)
  */
 Json VehicleSell(const Json &params, CompanyID company)
 {
-	int64_t vehicle_id = 0;
-	if (!ReadInt(params, "vehicle_id", vehicle_id)) return MakeError("invalid_arguments", "sell needs vehicle_id");
+	VehicleID vehicle_id = VehicleID::Invalid();
+	if (!params.contains("vehicle_id")) return MakeError("invalid_arguments", "sell needs vehicle_id");
+	if (const std::optional<Json> error = ReadPoolIdParam(params, "vehicle_id", vehicle_id); error.has_value()) return *error;
+
+	DepotID depot_id = DepotID::Invalid();
+	const bool has_depot = params.contains("depot_id");
+	if (const std::optional<Json> error = ReadPoolIdParam(params, "depot_id", depot_id); error.has_value()) return *error;
 
 	bool dry_run = false;
 	if (!ReadOptionalBool(params, "dry_run", dry_run)) return MakeError("invalid_arguments", "dry_run must be a boolean");
 
 	if (const std::optional<Json> error = CheckWriteContext(company, dry_run); error.has_value()) return *error;
 
-	Vehicle *v = Vehicle::GetIfValid(VehicleID(static_cast<uint32_t>(vehicle_id)));
+	Vehicle *v = Vehicle::GetIfValid(vehicle_id);
 	if (v == nullptr) {
 		Json detail = Json::object();
-		detail["vehicle_id"] = vehicle_id;
+		detail["vehicle_id"] = vehicle_id.base();
 		return MakeError("not_found", "vehicle does not exist", std::move(detail));
 	}
 
 	/* `depot_id` is documented for sell as well; when it is given the vehicle has to be there. */
-	if (params.contains("depot_id")) {
-		int64_t depot_id = 0;
-		if (!ReadOptionalInt(params, "depot_id", depot_id)) return MakeError("invalid_arguments", "depot_id must be an integer");
-		const Depot *d = Depot::GetIfValid(DepotID(static_cast<uint16_t>(depot_id)));
+	if (has_depot) {
+		const Depot *d = Depot::GetIfValid(depot_id);
 		if (d == nullptr) {
 			Json detail = Json::object();
-			detail["depot_id"] = depot_id;
+			detail["depot_id"] = depot_id.base();
 			return MakeError("not_found", "depot does not exist", std::move(detail));
 		}
 		if (v->tile != d->xy) {
 			Json detail = Json::object();
-			detail["vehicle_id"] = vehicle_id;
-			detail["depot_id"] = depot_id;
+			detail["vehicle_id"] = vehicle_id.base();
+			detail["depot_id"] = depot_id.base();
 			detail["tile"] = TileJson(v->tile);
 			return MakeError("invalid_arguments", "the vehicle is not in that depot", std::move(detail));
 		}
@@ -2078,8 +2113,9 @@ Json VehicleSell(const Json &params, CompanyID company)
  */
 Json VehicleRefit(const Json &params, CompanyID company)
 {
-	int64_t vehicle_id = 0;
-	if (!ReadInt(params, "vehicle_id", vehicle_id)) return MakeError("invalid_arguments", "refit needs vehicle_id");
+	VehicleID vehicle_id = VehicleID::Invalid();
+	if (!params.contains("vehicle_id")) return MakeError("invalid_arguments", "refit needs vehicle_id");
+	if (const std::optional<Json> error = ReadPoolIdParam(params, "vehicle_id", vehicle_id); error.has_value()) return *error;
 
 	CargoType cargo = INVALID_CARGO;
 	if (const std::optional<Json> error = ReadCargoId(params, "cargo_id", cargo); error.has_value()) return *error;
@@ -2093,21 +2129,21 @@ Json VehicleRefit(const Json &params, CompanyID company)
 
 	if (const std::optional<Json> error = CheckWriteContext(company, dry_run); error.has_value()) return *error;
 
-	Vehicle *v = Vehicle::GetIfValid(VehicleID(static_cast<uint32_t>(vehicle_id)));
+	Vehicle *v = Vehicle::GetIfValid(vehicle_id);
 	if (v == nullptr) {
 		Json detail = Json::object();
-		detail["vehicle_id"] = vehicle_id;
+		detail["vehicle_id"] = vehicle_id.base();
 		return MakeError("not_found", "vehicle does not exist", std::move(detail));
 	}
 	if (v->owner != company) {
 		Json detail = Json::object();
-		detail["vehicle_id"] = vehicle_id;
+		detail["vehicle_id"] = vehicle_id.base();
 		detail["owner"] = v->owner.base();
 		return MakeError("not_owned", "vehicle belongs to another company", std::move(detail));
 	}
 	if (!IsCompanyBuildableVehicleType(v)) {
 		Json detail = Json::object();
-		detail["vehicle_id"] = vehicle_id;
+		detail["vehicle_id"] = vehicle_id.base();
 		detail["type"] = std::string(VehicleTypeName(v->type));
 		return MakeError("invalid_arguments", "this vehicle type cannot be refitted", std::move(detail));
 	}
@@ -2117,12 +2153,12 @@ Json VehicleRefit(const Json &params, CompanyID company)
 	Vehicle *front = v->First();
 	if (front->vehstatus.Test(VehState::Crashed)) {
 		Json detail = Json::object();
-		detail["vehicle_id"] = vehicle_id;
+		detail["vehicle_id"] = vehicle_id.base();
 		return MakeError("invalid_arguments", "a crashed vehicle cannot be refitted", std::move(detail));
 	}
 	if (!only_this && !front->IsStoppedInDepot()) {
 		Json detail = Json::object();
-		detail["vehicle_id"] = vehicle_id;
+		detail["vehicle_id"] = vehicle_id.base();
 		detail["tile"] = TileJson(front->tile);
 		return MakeError("invalid_arguments", "the vehicle must be stopped in a depot to be refitted", std::move(detail));
 	}
@@ -2131,7 +2167,7 @@ Json VehicleRefit(const Json &params, CompanyID company)
 	const CargoTypes refittable = only_this ? GetUnionOfArticulatedRefitMasks(v->engine_type, true) : ConsistRefitMasks(v);
 	if (!refittable.Test(cargo)) {
 		Json detail = Json::object();
-		detail["vehicle_id"] = vehicle_id;
+		detail["vehicle_id"] = vehicle_id.base();
 		detail["engine_id"] = v->engine_type.base();
 		detail["cargo_id"] = static_cast<uint8_t>(cargo);
 		detail["refit_cargo_ids"] = Json::array();
@@ -2178,8 +2214,13 @@ Json VehicleRefit(const Json &params, CompanyID company)
  */
 Json VehicleClone(const Json &params, CompanyID company)
 {
-	int64_t vehicle_id = 0;
-	if (!ReadInt(params, "vehicle_id", vehicle_id)) return MakeError("invalid_arguments", "clone needs vehicle_id");
+	VehicleID vehicle_id = VehicleID::Invalid();
+	if (!params.contains("vehicle_id")) return MakeError("invalid_arguments", "clone needs vehicle_id");
+	if (const std::optional<Json> error = ReadPoolIdParam(params, "vehicle_id", vehicle_id); error.has_value()) return *error;
+
+	DepotID depot_id = DepotID::Invalid();
+	const bool has_depot = params.contains("depot_id");
+	if (const std::optional<Json> error = ReadPoolIdParam(params, "depot_id", depot_id); error.has_value()) return *error;
 
 	int64_t count = 1;
 	if (!ReadOptionalInt(params, "count", count)) return MakeError("invalid_arguments", "count must be an integer");
@@ -2199,21 +2240,21 @@ Json VehicleClone(const Json &params, CompanyID company)
 
 	if (const std::optional<Json> error = CheckWriteContext(company, dry_run); error.has_value()) return *error;
 
-	Vehicle *v = Vehicle::GetIfValid(VehicleID(static_cast<uint32_t>(vehicle_id)));
+	Vehicle *v = Vehicle::GetIfValid(vehicle_id);
 	if (v == nullptr) {
 		Json detail = Json::object();
-		detail["vehicle_id"] = vehicle_id;
+		detail["vehicle_id"] = vehicle_id.base();
 		return MakeError("not_found", "vehicle does not exist", std::move(detail));
 	}
 	if (v->owner != company) {
 		Json detail = Json::object();
-		detail["vehicle_id"] = vehicle_id;
+		detail["vehicle_id"] = vehicle_id.base();
 		detail["owner"] = v->owner.base();
 		return MakeError("not_owned", "vehicle belongs to another company", std::move(detail));
 	}
 	if (!IsCompanyBuildableVehicleType(v) || !v->IsPrimaryVehicle()) {
 		Json detail = Json::object();
-		detail["vehicle_id"] = vehicle_id;
+		detail["vehicle_id"] = vehicle_id.base();
 		detail["type"] = std::string(VehicleTypeName(v->type));
 		return MakeError("invalid_arguments", "clone needs a primary vehicle of a buildable type", std::move(detail));
 	}
@@ -2221,13 +2262,11 @@ Json VehicleClone(const Json &params, CompanyID company)
 	/* The clone is built in a depot of the company; the tile of the source vehicle is used when
 	 * the caller names neither a depot nor a tile, which is what the depot window does. */
 	TileIndex tile = v->tile;
-	if (params.contains("depot_id")) {
-		int64_t depot_id = 0;
-		if (!ReadOptionalInt(params, "depot_id", depot_id)) return MakeError("invalid_arguments", "depot_id must be an integer");
-		const Depot *d = Depot::GetIfValid(DepotID(static_cast<uint16_t>(depot_id)));
+	if (has_depot) {
+		const Depot *d = Depot::GetIfValid(depot_id);
 		if (d == nullptr) {
 			Json detail = Json::object();
-			detail["depot_id"] = depot_id;
+			detail["depot_id"] = depot_id.base();
 			return MakeError("not_found", "depot does not exist", std::move(detail));
 		}
 		tile = d->xy;
@@ -2295,47 +2334,41 @@ Json VehicleClone(const Json &params, CompanyID company)
 
 /**
  * Build one order from the tool's order object.
+ *
+ * The id of a goto order is checked against the pool it names before the cast, so an id that does
+ * not fit is `invalid_params` instead of silently naming another station, waypoint or depot.
+ *
  * @param entry The order object.
  * @param order Receives the order.
- * @param error Receives the reason when the order is unusable.
- * @return True when the order was built.
+ * @return Error result, or an empty optional when the order was built.
  */
-bool ReadOrder(const Json &entry, Order &order, std::string &error)
+std::optional<Json> ReadOrder(const Json &entry, Order &order)
 {
-	if (!entry.is_object()) {
-		error = "order must be an object";
-		return false;
-	}
+	if (!entry.is_object()) return MakeError("invalid_arguments", "order must be an object");
 
 	std::string type;
-	if (!ReadOptionalString(entry, "type", type)) {
-		error = "order type must be a string";
-		return false;
-	}
+	if (!ReadOptionalString(entry, "type", type)) return MakeError("invalid_arguments", "order type must be a string");
 	if (type.empty()) type = "station";
 
-	int64_t id = 0;
-	if (!ReadInt(entry, "id", id)) {
-		error = "order needs an id";
-		return false;
-	}
-
-	if (type == "station") {
-		order.MakeGoToStation(StationID(static_cast<uint16_t>(id)));
-	} else if (type == "waypoint") {
-		order.MakeGoToWaypoint(StationID(static_cast<uint16_t>(id)));
+	if (!entry.contains("id")) return MakeError("invalid_arguments", "order needs an id");
+	if (type == "station" || type == "waypoint") {
+		StationID station = StationID::Invalid();
+		if (const std::optional<Json> error = ReadPoolIdParam(entry, "id", station); error.has_value()) return error;
+		if (type == "station") {
+			order.MakeGoToStation(station);
+		} else {
+			order.MakeGoToWaypoint(station);
+		}
 	} else if (type == "depot") {
-		order.MakeGoToDepot(DepotID(static_cast<uint16_t>(id)), OrderDepotTypeFlag::PartOfOrders);
+		DepotID depot = DepotID::Invalid();
+		if (const std::optional<Json> error = ReadPoolIdParam(entry, "id", depot); error.has_value()) return error;
+		order.MakeGoToDepot(depot, OrderDepotTypeFlag::PartOfOrders);
 	} else {
-		error = "unsupported order type `" + type + "`";
-		return false;
+		return MakeError("invalid_arguments", "unsupported order type `" + type + "`");
 	}
 
 	std::string load;
-	if (!ReadOptionalString(entry, "load", load)) {
-		error = "order load behaviour must be a string";
-		return false;
-	}
+	if (!ReadOptionalString(entry, "load", load)) return MakeError("invalid_arguments", "order load behaviour must be a string");
 	if (!load.empty()) {
 		if (load == "full") {
 			order.SetLoadType(OrderLoadType::FullLoad);
@@ -2346,16 +2379,12 @@ bool ReadOrder(const Json &entry, Order &order, std::string &error)
 		} else if (load == "if_possible") {
 			order.SetLoadType(OrderLoadType::LoadIfPossible);
 		} else {
-			error = "unsupported load behaviour `" + load + "`";
-			return false;
+			return MakeError("invalid_arguments", "unsupported load behaviour `" + load + "`");
 		}
 	}
 
 	std::string unload;
-	if (!ReadOptionalString(entry, "unload", unload)) {
-		error = "order unload behaviour must be a string";
-		return false;
-	}
+	if (!ReadOptionalString(entry, "unload", unload)) return MakeError("invalid_arguments", "order unload behaviour must be a string");
 	if (!unload.empty()) {
 		if (unload == "all") {
 			order.SetUnloadType(OrderUnloadType::Unload);
@@ -2366,25 +2395,15 @@ bool ReadOrder(const Json &entry, Order &order, std::string &error)
 		} else if (unload == "if_possible") {
 			order.SetUnloadType(OrderUnloadType::UnloadIfPossible);
 		} else {
-			error = "unsupported unload behaviour `" + unload + "`";
-			return false;
+			return MakeError("invalid_arguments", "unsupported unload behaviour `" + unload + "`");
 		}
 	}
 
-	int64_t refit_cargo_id = 0;
-	if (entry.contains("refit_cargo_id")) {
-		if (!ReadOptionalInt(entry, "refit_cargo_id", refit_cargo_id)) {
-			error = "refit_cargo_id must be an integer";
-			return false;
-		}
-		if (refit_cargo_id < 0 || refit_cargo_id >= static_cast<int64_t>(NUM_CARGO)) {
-			error = "refit_cargo_id is not a cargo";
-			return false;
-		}
-		order.SetRefit(static_cast<CargoType>(static_cast<uint8_t>(refit_cargo_id)));
-	}
+	CargoType refit_cargo = INVALID_CARGO;
+	if (const std::optional<Json> error = ReadCargoId(entry, "refit_cargo_id", refit_cargo); error.has_value()) return error;
+	if (refit_cargo != INVALID_CARGO) order.SetRefit(refit_cargo);
 
-	return true;
+	return std::nullopt;
 }
 
 /**
@@ -2396,8 +2415,9 @@ bool ReadOrder(const Json &entry, Order &order, std::string &error)
  */
 Json OrdersSet(const Json &params, CompanyID company, bool replace)
 {
-	int64_t vehicle_id = 0;
-	if (!ReadInt(params, "vehicle_id", vehicle_id)) return MakeError("invalid_arguments", "orders need vehicle_id");
+	VehicleID vehicle_id = VehicleID::Invalid();
+	if (!params.contains("vehicle_id")) return MakeError("invalid_arguments", "orders need vehicle_id");
+	if (const std::optional<Json> error = ReadPoolIdParam(params, "vehicle_id", vehicle_id); error.has_value()) return *error;
 
 	const auto entries = params.find("orders");
 	if (entries == params.end() || !entries->is_array() || entries->empty()) {
@@ -2408,17 +2428,16 @@ Json OrdersSet(const Json &params, CompanyID company, bool replace)
 	std::vector<Order> orders;
 	for (const Json &entry : *entries) {
 		Order order;
-		std::string error;
-		if (!ReadOrder(entry, order, error)) return MakeError("invalid_arguments", error);
+		if (const std::optional<Json> error = ReadOrder(entry, order); error.has_value()) return *error;
 		orders.push_back(order);
 	}
 
 	if (const std::optional<Json> error = CheckWriteContext(company, false); error.has_value()) return *error;
 
-	Vehicle *v = Vehicle::GetIfValid(VehicleID(static_cast<uint32_t>(vehicle_id)));
+	Vehicle *v = Vehicle::GetIfValid(vehicle_id);
 	if (v == nullptr) {
 		Json detail = Json::object();
-		detail["vehicle_id"] = vehicle_id;
+		detail["vehicle_id"] = vehicle_id.base();
 		return MakeError("not_found", "vehicle does not exist", std::move(detail));
 	}
 
@@ -2451,7 +2470,7 @@ Json OrdersSet(const Json &params, CompanyID company, bool replace)
 		const Vehicle *current = Vehicle::GetIfValid(veh_id);
 		if (current == nullptr) {
 			Json detail = Json::object();
-			detail["vehicle_id"] = vehicle_id;
+			detail["vehicle_id"] = vehicle_id.base();
 			return MakeError("not_found", "vehicle disappeared while its orders were set", std::move(detail));
 		}
 		if (!RunCommandAt<Commands::InsertOrder>(false, current->tile, &AgentCommandCallback, veh_id, current->GetNumOrders(), order)) {
@@ -2481,23 +2500,25 @@ Json OrdersSet(const Json &params, CompanyID company, bool replace)
  */
 Json OrdersShared(const Json &params, CompanyID company)
 {
-	int64_t vehicle_id = 0;
-	int64_t source_id = 0;
-	if (!ReadInt(params, "vehicle_id", vehicle_id)) return MakeError("invalid_arguments", "shared needs vehicle_id");
-	if (!ReadInt(params, "share_orders_from", source_id)) return MakeError("invalid_arguments", "shared needs share_orders_from");
+	VehicleID vehicle_id = VehicleID::Invalid();
+	VehicleID source_id = VehicleID::Invalid();
+	if (!params.contains("vehicle_id")) return MakeError("invalid_arguments", "shared needs vehicle_id");
+	if (!params.contains("share_orders_from")) return MakeError("invalid_arguments", "shared needs share_orders_from");
+	if (const std::optional<Json> error = ReadPoolIdParam(params, "vehicle_id", vehicle_id); error.has_value()) return *error;
+	if (const std::optional<Json> error = ReadPoolIdParam(params, "share_orders_from", source_id); error.has_value()) return *error;
 
 	if (const std::optional<Json> error = CheckWriteContext(company, false); error.has_value()) return *error;
 
-	Vehicle *v = Vehicle::GetIfValid(VehicleID(static_cast<uint32_t>(vehicle_id)));
+	Vehicle *v = Vehicle::GetIfValid(vehicle_id);
 	if (v == nullptr) {
 		Json detail = Json::object();
-		detail["vehicle_id"] = vehicle_id;
+		detail["vehicle_id"] = vehicle_id.base();
 		return MakeError("not_found", "vehicle does not exist", std::move(detail));
 	}
-	Vehicle *source = Vehicle::GetIfValid(VehicleID(static_cast<uint32_t>(source_id)));
+	Vehicle *source = Vehicle::GetIfValid(source_id);
 	if (source == nullptr) {
 		Json detail = Json::object();
-		detail["share_orders_from"] = source_id;
+		detail["share_orders_from"] = source_id.base();
 		return MakeError("not_found", "source vehicle does not exist", std::move(detail));
 	}
 
@@ -2527,17 +2548,19 @@ Json OrdersShared(const Json &params, CompanyID company)
  */
 Json OrdersGroup(const Json &params, CompanyID company)
 {
-	int64_t vehicle_id = 0;
-	int64_t group_id = 0;
-	if (!ReadInt(params, "vehicle_id", vehicle_id)) return MakeError("invalid_arguments", "group needs vehicle_id");
-	if (!ReadInt(params, "group_id", group_id)) return MakeError("invalid_arguments", "group needs group_id");
+	VehicleID vehicle_id = VehicleID::Invalid();
+	GroupID group_id = GroupID::Invalid();
+	if (!params.contains("vehicle_id")) return MakeError("invalid_arguments", "group needs vehicle_id");
+	if (!params.contains("group_id")) return MakeError("invalid_arguments", "group needs group_id");
+	if (const std::optional<Json> error = ReadPoolIdParam(params, "vehicle_id", vehicle_id); error.has_value()) return *error;
+	if (const std::optional<Json> error = ReadPoolIdParam(params, "group_id", group_id); error.has_value()) return *error;
 
 	if (const std::optional<Json> error = CheckWriteContext(company, false); error.has_value()) return *error;
 
-	Vehicle *v = Vehicle::GetIfValid(VehicleID(static_cast<uint32_t>(vehicle_id)));
+	Vehicle *v = Vehicle::GetIfValid(vehicle_id);
 	if (v == nullptr) {
 		Json detail = Json::object();
-		detail["vehicle_id"] = vehicle_id;
+		detail["vehicle_id"] = vehicle_id.base();
 		return MakeError("not_found", "vehicle does not exist", std::move(detail));
 	}
 
@@ -2546,8 +2569,8 @@ Json OrdersGroup(const Json &params, CompanyID company)
 	Json result = Json::object();
 	result["op"] = "group";
 	result["vehicle_id"] = v->index.base();
-	if (!RunCommand<Commands::AddVehicleToGroup>(false, &AgentAddVehicleToGroupCallback, GroupID(static_cast<uint16_t>(group_id)), v->index, false, VehicleListIdentifier{})) {
-		result["group_id"] = group_id;
+	if (!RunCommand<Commands::AddVehicleToGroup>(false, &AgentAddVehicleToGroupCallback, group_id, v->index, false, VehicleListIdentifier{})) {
+		result["group_id"] = group_id.base();
 		if (!_posted.captured) return NotExecuted(std::move(result));
 		return CommandResult(_posted, std::move(result));
 	}
@@ -2583,8 +2606,9 @@ std::string_view TimetableFieldName(ModifyTimetableFlags field)
  */
 Json OrdersTimetable(const Json &params, CompanyID company)
 {
-	int64_t vehicle_id = 0;
-	if (!ReadInt(params, "vehicle_id", vehicle_id)) return MakeError("invalid_arguments", "timetable needs vehicle_id");
+	VehicleID vehicle_id = VehicleID::Invalid();
+	if (!params.contains("vehicle_id")) return MakeError("invalid_arguments", "timetable needs vehicle_id");
+	if (const std::optional<Json> error = ReadPoolIdParam(params, "vehicle_id", vehicle_id); error.has_value()) return *error;
 
 	const auto entries = params.find("timetable");
 	if (entries == params.end() || !entries->is_array() || entries->empty()) {
@@ -2610,11 +2634,12 @@ Json OrdersTimetable(const Json &params, CompanyID company)
 
 		int64_t index = 0;
 		if (!ReadInt(entry, "index", index)) return MakeError("invalid_arguments", "timetable entry needs an order index");
-		if (index < 0 || index > UINT16_MAX) {
+		/* An order index is a VehicleOrderID; 0xFF is the invalid marker, so the last index is 0xFE. */
+		if (index < 0 || index > MAX_VEH_ORDER_ID) {
 			Json detail = Json::object();
 			detail["index"] = index;
-			detail["max"] = UINT16_MAX;
-			return MakeError("invalid_arguments", "timetable entry index must fit in 16 bits", std::move(detail));
+			detail["max"] = MAX_VEH_ORDER_ID;
+			return MakeError("invalid_params", "timetable entry index must be an order index", std::move(detail));
 		}
 
 		const bool has_wait = entry.contains("wait_time");
@@ -2644,21 +2669,21 @@ Json OrdersTimetable(const Json &params, CompanyID company)
 
 	if (const std::optional<Json> error = CheckWriteContext(company, dry_run); error.has_value()) return *error;
 
-	Vehicle *v = Vehicle::GetIfValid(VehicleID(static_cast<uint32_t>(vehicle_id)));
+	Vehicle *v = Vehicle::GetIfValid(vehicle_id);
 	if (v == nullptr) {
 		Json detail = Json::object();
-		detail["vehicle_id"] = vehicle_id;
+		detail["vehicle_id"] = vehicle_id.base();
 		return MakeError("not_found", "vehicle does not exist", std::move(detail));
 	}
 	if (v->owner != company) {
 		Json detail = Json::object();
-		detail["vehicle_id"] = vehicle_id;
+		detail["vehicle_id"] = vehicle_id.base();
 		detail["owner"] = v->owner.base();
 		return MakeError("not_owned", "vehicle belongs to another company", std::move(detail));
 	}
 	if (!IsCompanyBuildableVehicleType(v) || !v->IsPrimaryVehicle()) {
 		Json detail = Json::object();
-		detail["vehicle_id"] = vehicle_id;
+		detail["vehicle_id"] = vehicle_id.base();
 		detail["type"] = std::string(VehicleTypeName(v->type));
 		return MakeError("invalid_arguments", "timetable needs a primary vehicle of a buildable type", std::move(detail));
 	}

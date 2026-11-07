@@ -335,7 +335,7 @@ TEST_CASE("agent_game_tools: vehicle build parameters are validated before anyth
 
 	const std::optional<Json> cargo = DispatchGameTool("world.vehicles", {{"op", "build"}, {"engine_id", 0}, {"depot_id", 0}, {"cargo_id", 99}}, CompanyID(3));
 	REQUIRE(cargo.has_value());
-	CHECK((*cargo)["error"] == "invalid_arguments");
+	CHECK((*cargo)["error"] == "invalid_params");
 	CHECK((*cargo)["detail"]["cargo_id"] == 99);
 
 	const std::optional<Json> name = DispatchGameTool("world.vehicles", {{"op", "build"}, {"engine_id", 0}, {"depot_id", 0}, {"name", std::string(129, 'x')}}, CompanyID(3));
@@ -346,7 +346,7 @@ TEST_CASE("agent_game_tools: vehicle build parameters are validated before anyth
 	/* `share_orders_from` is read, so a wrong type is an error and not an ignored parameter. */
 	const std::optional<Json> share = DispatchGameTool("world.vehicles", {{"op", "build"}, {"engine_id", 0}, {"depot_id", 0}, {"share_orders_from", "x"}}, CompanyID(3));
 	REQUIRE(share.has_value());
-	CHECK((*share)["error"] == "invalid_arguments");
+	CHECK((*share)["error"] == "invalid_params");
 }
 
 TEST_CASE("agent_game_tools: order lists are validated before the vehicle is touched")
@@ -369,7 +369,7 @@ TEST_CASE("agent_game_tools: order lists are validated before the vehicle is tou
 
 	const std::optional<Json> refit = DispatchGameTool("world.orders", {{"op", "append"}, {"vehicle_id", 0}, {"orders", Json::array({Json{{"type", "station"}, {"id", 1}, {"refit_cargo_id", 99}}})}}, CompanyID(3));
 	REQUIRE(refit.has_value());
-	CHECK((*refit)["error"] == "invalid_arguments");
+	CHECK((*refit)["error"] == "invalid_params");
 
 	const std::optional<Json> shared = DispatchGameTool("world.orders", {{"op", "shared"}, {"vehicle_id", 0}}, CompanyID(3));
 	REQUIRE(shared.has_value());
@@ -392,7 +392,7 @@ TEST_CASE("agent_game_tools: refit parameters are validated before anything is m
 
 	const std::optional<Json> bad_cargo = DispatchGameTool("world.vehicles", {{"op", "refit"}, {"vehicle_id", 0}, {"cargo_id", 99}}, CompanyID(3));
 	REQUIRE(bad_cargo.has_value());
-	CHECK((*bad_cargo)["error"] == "invalid_arguments");
+	CHECK((*bad_cargo)["error"] == "invalid_params");
 	CHECK((*bad_cargo)["detail"]["cargo_id"] == 99);
 	CHECK((*bad_cargo)["detail"]["max"] == 63);
 
@@ -684,4 +684,139 @@ TEST_CASE("agent_game_tools: the cargo inventory reads the real cargo table when
 	REQUIRE((*by_label)["total"] == 1);
 	CHECK((*by_label)["rows"].front()["label"] == label);
 	CHECK((*by_label)["rows"].front()["name"] == first["name"]);
+}
+
+/**
+ * Dispatch a write op with one replaced parameter value and return the result.
+ * @param method Engine method name.
+ * @param op Op of the method.
+ * @param base Parameters of a usable request.
+ * @param key Parameter to replace.
+ * @param value Value to use.
+ * @return The tool result.
+ */
+static Json WriteWith(const char *method, const char *op, Json base, const char *key, Json value)
+{
+	base["op"] = op;
+	base[key] = std::move(value);
+	const std::optional<Json> result = DispatchGameTool(method, base, CompanyID(3));
+	REQUIRE(result.has_value());
+	return *result;
+}
+
+TEST_CASE("agent_game_tools: a write id is checked against its pool before the cast")
+{
+	/* The largest valid vehicle id is accepted and reaches the company check. */
+	const Json max_vehicle = WriteWith("world.vehicles", "start", {{"vehicle_id", 0}}, "vehicle_id", 0xFEFFF);
+	CHECK(max_vehicle["error"] == "invalid_company");
+
+	/* One past the last vehicle id would wrap onto another vehicle. */
+	const Json over_vehicle = WriteWith("world.vehicles", "start", {{"vehicle_id", 0}}, "vehicle_id", 0xFF000);
+	CHECK(over_vehicle["error"] == "invalid_params");
+	CHECK(over_vehicle["detail"]["vehicle_id"] == 0xFF000);
+	CHECK(over_vehicle["detail"]["max"] == 0xFEFFF);
+
+	/* 2^32 + a real id used to become that real id after a 32 bit cast. */
+	const Json wide_vehicle = WriteWith("world.vehicles", "start", {{"vehicle_id", 0}}, "vehicle_id", int64_t{4294967296} + 3);
+	CHECK(wide_vehicle["error"] == "invalid_params");
+	CHECK(wide_vehicle["detail"]["vehicle_id"] == int64_t{4294967296} + 3);
+
+	const Json negative_vehicle = WriteWith("world.vehicles", "start", {{"vehicle_id", 0}}, "vehicle_id", -1);
+	CHECK(negative_vehicle["error"] == "invalid_params");
+	CHECK(negative_vehicle["detail"]["max"] == 0xFEFFF);
+
+	/* A float and a boolean are not ids, they must not become 1 or 0. */
+	const Json float_vehicle = WriteWith("world.vehicles", "start", {{"vehicle_id", 0}}, "vehicle_id", 1.5);
+	CHECK(float_vehicle["error"] == "invalid_params");
+
+	const Json bool_vehicle = WriteWith("world.vehicles", "start", {{"vehicle_id", 0}}, "vehicle_id", true);
+	CHECK(bool_vehicle["error"] == "invalid_params");
+
+	/* The same rule for every other pool a write op names. */
+	const Json max_engine = WriteWith("world.vehicles", "build", {{"engine_id", 0}, {"depot_id", 0}}, "engine_id", 63999);
+	CHECK(max_engine["error"] == "invalid_company");
+
+	const Json over_engine = WriteWith("world.vehicles", "build", {{"engine_id", 0}, {"depot_id", 0}}, "engine_id", 64000);
+	CHECK(over_engine["error"] == "invalid_params");
+	CHECK(over_engine["detail"]["max"] == 63999);
+
+	const Json over_depot = WriteWith("world.vehicles", "build", {{"engine_id", 0}, {"depot_id", 0}}, "depot_id", 64000);
+	CHECK(over_depot["error"] == "invalid_params");
+	CHECK(over_depot["detail"]["max"] == 63999);
+
+	const Json over_share = WriteWith("world.vehicles", "build", {{"engine_id", 0}, {"depot_id", 0}}, "share_orders_from", 0xFF000);
+	CHECK(over_share["error"] == "invalid_params");
+
+	const Json over_sell_depot = WriteWith("world.vehicles", "sell", {{"vehicle_id", 0}}, "depot_id", 64000);
+	CHECK(over_sell_depot["error"] == "invalid_params");
+
+	const Json over_clone_depot = WriteWith("world.vehicles", "clone", {{"vehicle_id", 0}}, "depot_id", 64000);
+	CHECK(over_clone_depot["error"] == "invalid_params");
+
+	const Json max_group = WriteWith("world.orders", "group", {{"vehicle_id", 0}}, "group_id", 63999);
+	CHECK(max_group["error"] == "invalid_company");
+
+	const Json over_group = WriteWith("world.orders", "group", {{"vehicle_id", 0}}, "group_id", 64000);
+	CHECK(over_group["error"] == "invalid_params");
+	CHECK(over_group["detail"]["max"] == 63999);
+
+	const Json over_source = WriteWith("world.orders", "shared", {{"vehicle_id", 0}, {"share_orders_from", 0}}, "share_orders_from", 0xFF000);
+	CHECK(over_source["error"] == "invalid_params");
+	CHECK(over_source["detail"]["max"] == 0xFEFFF);
+}
+
+TEST_CASE("agent_game_tools: order ids and subtypes are checked against their pools before the cast")
+{
+	/* A station id and a depot id share the 16 bit station pool; 0xFA00 used to become station 0. */
+	const Json over_station = WriteWith("world.orders", "set", {{"vehicle_id", 0}, {"orders", Json::array()}}, "orders",
+			Json::array({Json{{"type", "station"}, {"id", 64000}}}));
+	CHECK(over_station["error"] == "invalid_params");
+	CHECK(over_station["detail"]["max"] == 63999);
+
+	const Json over_waypoint = WriteWith("world.orders", "set", {{"vehicle_id", 0}, {"orders", Json::array()}}, "orders",
+			Json::array({Json{{"type", "waypoint"}, {"id", 64000}}}));
+	CHECK(over_waypoint["error"] == "invalid_params");
+
+	const Json over_order_depot = WriteWith("world.orders", "set", {{"vehicle_id", 0}, {"orders", Json::array()}}, "orders",
+			Json::array({Json{{"type", "depot"}, {"id", 64000}}}));
+	CHECK(over_order_depot["error"] == "invalid_params");
+
+	const Json negative_station = WriteWith("world.orders", "set", {{"vehicle_id", 0}, {"orders", Json::array()}}, "orders",
+			Json::array({Json{{"type", "station"}, {"id", -1}}}));
+	CHECK(negative_station["error"] == "invalid_params");
+
+	const Json float_station = WriteWith("world.orders", "set", {{"vehicle_id", 0}, {"orders", Json::array()}}, "orders",
+			Json::array({Json{{"type", "station"}, {"id", 1.5}}}));
+	CHECK(float_station["error"] == "invalid_params");
+
+	const Json bool_station = WriteWith("world.orders", "set", {{"vehicle_id", 0}, {"orders", Json::array()}}, "orders",
+			Json::array({Json{{"type", "station"}, {"id", true}}}));
+	CHECK(bool_station["error"] == "invalid_params");
+
+	/* The last valid station id is accepted and reaches the company check. */
+	const Json max_station = WriteWith("world.orders", "set", {{"vehicle_id", 0}, {"orders", Json::array()}}, "orders",
+			Json::array({Json{{"type", "station"}, {"id", 63999}}}));
+	CHECK(max_station["error"] == "invalid_company");
+
+	/* The cargo subtype of an order is bounded by the cargo table, not by 8 bits. */
+	const Json over_order_cargo = WriteWith("world.orders", "set", {{"vehicle_id", 0}, {"orders", Json::array()}}, "orders",
+			Json::array({Json{{"type", "station"}, {"id", 0}, {"refit_cargo_id", 64}}}));
+	CHECK(over_order_cargo["error"] == "invalid_params");
+	CHECK(over_order_cargo["detail"]["max"] == 63);
+
+	/* A timetable index is a VehicleOrderID: 0xFF is the invalid marker, so 0xFE is the last one. */
+	const Json max_index = WriteWith("world.orders", "timetable", {{"vehicle_id", 0}, {"timetable", Json::array()}}, "timetable",
+			Json::array({Json{{"index", 0xFE}, {"wait_time", 10}}}));
+	CHECK(max_index["error"] == "invalid_company");
+
+	const Json over_index = WriteWith("world.orders", "timetable", {{"vehicle_id", 0}, {"timetable", Json::array()}}, "timetable",
+			Json::array({Json{{"index", 0xFF}, {"wait_time", 10}}}));
+	CHECK(over_index["error"] == "invalid_params");
+	CHECK(over_index["detail"]["max"] == 0xFE);
+
+	/* A value that used to be truncated to 16 bits is rejected, not wrapped. */
+	const Json over_wait = WriteWith("world.orders", "timetable", {{"vehicle_id", 0}, {"timetable", Json::array()}}, "timetable",
+			Json::array({Json{{"index", 0}, {"wait_time", 65536}}}));
+	CHECK(over_wait["error"] == "invalid_arguments");
+	CHECK(over_wait["detail"]["max"] == 65535);
 }
