@@ -21,6 +21,7 @@ enum AgentChatWidgets : WidgetID {
 	WID_AC_TRAY,              ///< Attachment tray of the message being composed.
 	WID_AC_ADD_POINT,         ///< Button to add a map point attachment.
 	WID_AC_ADD_OBJECT,        ///< Button to add a game object attachment.
+	WID_AC_ADD_COMPANY,       ///< Button to add a company attachment.
 	WID_AC_INPUT,             ///< Multiline message input.
 	WID_AC_STATUS,            ///< Status line of the selected chat.
 	WID_AC_SEND,              ///< Button to send the composed message.

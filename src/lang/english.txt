@@ -6397,3 +6397,23 @@ STR_AGENT_CHAT_STATUS_WINDOW                                    :{RAW_STRING} - 
 STR_AGENT_CHAT_STATUS_TOOLTIP                                   :Open the agent chat window
 STR_AGENT_CHAT_ERROR                                            :{RED}Error: {RAW_STRING}
 STR_AGENT_CHAT_ERROR_UNKNOWN                                    :request failed
+STR_AGENT_CHAT_TYPE_DEPOT                                       :Depot
+STR_AGENT_CHAT_TYPE_WAYPOINT                                    :Waypoint
+STR_AGENT_CHAT_TYPE_BUOY                                        :Buoy
+STR_AGENT_CHAT_TYPE_HOUSE                                       :House
+STR_AGENT_CHAT_TYPE_GROUP                                       :Group
+STR_AGENT_CHAT_TYPE_ENGINE                                      :Engine
+STR_AGENT_CHAT_TYPE_CARGO                                       :Cargo
+STR_AGENT_CHAT_TYPE_OBJECT                                      :Object
+STR_AGENT_CHAT_KIND_TERRAIN                                     :Open landscape
+STR_AGENT_CHAT_KIND_RAIL                                        :Rail
+STR_AGENT_CHAT_KIND_ROAD                                        :Road
+STR_AGENT_CHAT_KIND_TRAM                                        :Tram
+STR_AGENT_CHAT_KIND_SIGNAL                                      :Signal
+STR_AGENT_CHAT_KIND_TREES                                       :Trees
+STR_AGENT_CHAT_KIND_WATER                                       :Water
+STR_AGENT_CHAT_KIND_BRIDGE                                      :Bridge
+STR_AGENT_CHAT_KIND_TUNNEL                                      :Tunnel
+STR_AGENT_CHAT_ATTACHMENT_TILE_WHAT                             :{RAW_STRING} tile {NUM}, {NUM}
+STR_AGENT_CHAT_ADD_COMPANY                                      :Add company
+STR_AGENT_CHAT_ADD_COMPANY_TOOLTIP                              :Pick a company to attach to the message

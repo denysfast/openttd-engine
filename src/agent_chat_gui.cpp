@@ -12,6 +12,7 @@
 #include "agent_chat_gui.h"
 #include "agent_bridge.h"
 
+#include "company_base.h"
 #include "company_func.h"
 #include "core/backup_type.hpp"
 #include "core/enum_type.hpp"
@@ -97,6 +98,7 @@ struct AgentChatUiState {
 	std::vector<AgentChatAttachment> tray;  ///< Attachments of the message being composed.
 	std::string input;                      ///< Text of the message being composed, UTF-8 encoded.
 	size_t caret = 0;                       ///< Caret position in the input, in bytes.
+	size_t composed_length = 0;             ///< Bytes of IME text still being composed, replaced by the next update.
 	int scroll = 0;                         ///< Scroll offset of the transcript, in pixels.
 	int content_height = 0;                 ///< Height of the transcript content, in pixels.
 	bool picking_point = false;             ///< Waiting for a map click to add a point.
@@ -205,6 +207,52 @@ static std::string SanitiseBackendText(std::string_view text)
 }
 
 /**
+ * Get the lifetime generation of a pooled object.
+ *
+ * Pool items track the identity of their lifetime so a reference to a recreated object can be
+ * told apart from the original one. Not every pool in every build has that counter, so it is only
+ * read when the type has it: a reference without a generation is reported as such, never invented.
+ * @param object The pooled object.
+ * @return The generation, or -1 when the pool of this build does not track one.
+ */
+template <typename T>
+static int64_t GetPoolGeneration(const T &object)
+{
+	if constexpr (requires { object.generation; }) {
+		return static_cast<int64_t>(object.generation);
+	} else {
+		return -1;
+	}
+}
+
+/**
+ * Get the human readable name of the kind of thing a reference points at.
+ *
+ * The bridge names the kind of a tile reference in `what` (and, for objects with a pool of their
+ * own, the kind of that object), using the protocol names. A kind this UI does not know is
+ * reported as an empty string, so the caller shows the plain reference instead of a wrong label.
+ * @param what The kind, as reported by the bridge.
+ * @return The name of the kind, or an empty string when it is unknown.
+ */
+static std::string GetAttachmentKindName(const std::string &what)
+{
+	if (what == "clear" || what == "terrain") return GetString(STR_AGENT_CHAT_KIND_TERRAIN);
+	if (what == "rail") return GetString(STR_AGENT_CHAT_KIND_RAIL);
+	if (what == "road") return GetString(STR_AGENT_CHAT_KIND_ROAD);
+	if (what == "tram") return GetString(STR_AGENT_CHAT_KIND_TRAM);
+	if (what == "signal") return GetString(STR_AGENT_CHAT_KIND_SIGNAL);
+	if (what == "trees") return GetString(STR_AGENT_CHAT_KIND_TREES);
+	if (what == "water") return GetString(STR_AGENT_CHAT_KIND_WATER);
+	if (what == "bridge" || what == "tunnelbridge") return GetString(STR_AGENT_CHAT_KIND_BRIDGE);
+	if (what == "tunnel") return GetString(STR_AGENT_CHAT_KIND_TUNNEL);
+	if (what == "station") return GetString(STR_AGENT_CHAT_TYPE_STATION);
+	if (what == "industry") return GetString(STR_AGENT_CHAT_TYPE_INDUSTRY);
+	if (what == "house") return GetString(STR_AGENT_CHAT_TYPE_HOUSE);
+	if (what == "object" || what == "mapobject") return GetString(STR_AGENT_CHAT_TYPE_OBJECT);
+	return {};
+}
+
+/**
  * Get the human readable name of an attachment type.
  * @param type The attachment type.
  * @return The name of the type.
@@ -219,6 +267,18 @@ static std::string GetAttachmentTypeName(const std::string &type)
 	if (type == "vehicle") return GetString(STR_AGENT_CHAT_TYPE_VEHICLE);
 	if (type == "sign") return GetString(STR_AGENT_CHAT_TYPE_SIGN);
 	if (type == "company") return GetString(STR_AGENT_CHAT_TYPE_COMPANY);
+	if (type == "depot") return GetString(STR_AGENT_CHAT_TYPE_DEPOT);
+	if (type == "waypoint") return GetString(STR_AGENT_CHAT_TYPE_WAYPOINT);
+	if (type == "buoy") return GetString(STR_AGENT_CHAT_TYPE_BUOY);
+	if (type == "house") return GetString(STR_AGENT_CHAT_TYPE_HOUSE);
+	if (type == "group") return GetString(STR_AGENT_CHAT_TYPE_GROUP);
+	if (type == "engine") return GetString(STR_AGENT_CHAT_TYPE_ENGINE);
+	if (type == "cargo") return GetString(STR_AGENT_CHAT_TYPE_CARGO);
+	if (type == "object" || type == "mapobject") return GetString(STR_AGENT_CHAT_TYPE_OBJECT);
+
+	/* A bridge may name the kind of tile in the type itself instead of in "what". */
+	const std::string kind = GetAttachmentKindName(type);
+	if (!kind.empty()) return kind;
 	return GetString(STR_AGENT_CHAT_TYPE_UNKNOWN);
 }
 
@@ -230,7 +290,12 @@ static std::string GetAttachmentTypeName(const std::string &type)
 static std::string GetAttachmentLabel(const AgentChatAttachment &attachment)
 {
 	if (!attachment.name.empty()) return SanitiseBackendText(attachment.name);
-	if (attachment.tile != INVALID_TILE) return GetString(STR_AGENT_CHAT_ATTACHMENT_POINT, TileX(attachment.tile), TileY(attachment.tile));
+	if (attachment.tile != INVALID_TILE) {
+		if (attachment.type == "point") return GetString(STR_AGENT_CHAT_ATTACHMENT_POINT, TileX(attachment.tile), TileY(attachment.tile));
+		const std::string kind = GetAttachmentKindName(attachment.what);
+		if (!kind.empty()) return GetString(STR_AGENT_CHAT_ATTACHMENT_TILE_WHAT, kind, TileX(attachment.tile), TileY(attachment.tile));
+		return GetString(STR_AGENT_CHAT_ATTACHMENT_TILE, TileX(attachment.tile), TileY(attachment.tile));
+	}
 	if (attachment.id >= 0) return GetString(STR_AGENT_CHAT_ATTACHMENT_OBJECT, GetAttachmentTypeName(attachment.type), attachment.id);
 	return GetAttachmentTypeName(attachment.type);
 }
@@ -248,17 +313,34 @@ static bool IsAttachmentStale(const AgentChatAttachment &attachment)
 }
 
 /**
+ * Check whether a reference type names an object of a pool whose ids are reused.
+ *
+ * Every pooled object in the game (ComponentBase) has a lifetime generation, so a reference to
+ * one without a generation cannot be proven to be the object that was picked. Everything else the
+ * bridge can return is addressed by something that has no lifetime of its own: a point or a typed
+ * tile reference is a map coordinate, and cargo is a static specification.
+ * @param type The reference type.
+ * @return \c true when the type is a pooled object.
+ */
+static bool IsPooledAttachmentType(const std::string &type)
+{
+	return type == "town" || type == "station" || type == "industry" || type == "vehicle" ||
+			type == "sign" || type == "depot" || type == "waypoint" || type == "company" ||
+			type == "group" || type == "engine";
+}
+
+/**
  * Check whether an attachment refers to a pooled object without a lifetime generation.
- * Ids of pooled objects (towns, stations, industries, vehicles, signs) are reused after the
- * object is deleted, so without a generation the reference cannot be proven to be the object
- * that was picked. Points and tiles are plain map coordinates and are never pooled.
+ * Ids of pooled objects (towns, stations, industries, vehicles, signs, depots, waypoints) are
+ * reused after the object is deleted, so without a generation the reference cannot be proven to
+ * be the object that was picked.
  * @param attachment The attachment.
  * @return \c true when the reference is a pooled object whose generation is unknown.
  */
 static bool IsAttachmentGenerationUnknown(const AgentChatAttachment &attachment)
 {
 	if (attachment.generation >= 0) return false;
-	return attachment.type != "point" && attachment.type != "tile";
+	return IsPooledAttachmentType(attachment.type);
 }
 
 /**
@@ -1088,6 +1170,7 @@ struct AgentChatWindow : Window {
 		this->chat_scroll = this->GetScrollbar(WID_AC_CHAT_SCROLL);
 		this->transcript_scroll = this->GetScrollbar(WID_AC_TRANSCRIPT_SCROLL);
 		this->FinishInitNested(0);
+		this->SetFocusedWidget(WID_AC_INPUT);
 		this->UpdateWidgetStates();
 		this->UpdateScrollbars();
 	}
@@ -1285,42 +1368,81 @@ struct AgentChatWindow : Window {
 	{
 		const Rect area = r.Shrink(WidgetDimensions::scaled.framerect);
 		const int line_height = GetCharacterHeight(FontSize::Normal);
-		const int visible_lines = std::max(1, area.Height() / line_height);
-
-		/* Split the input into lines and find the line the caret is on. */
-		std::vector<std::string> lines;
-		size_t caret_line = 0;
-		size_t line_start = 0;
-		while (true) {
-			const size_t end = _agent_chat.input.find('\n', line_start);
-			if (end == std::string::npos) {
-				lines.push_back(_agent_chat.input.substr(line_start));
-				if (_agent_chat.caret >= line_start) caret_line = lines.size() - 1;
-				break;
-			}
-			lines.push_back(_agent_chat.input.substr(line_start, end - line_start));
-			if (_agent_chat.caret >= line_start && _agent_chat.caret <= end) caret_line = lines.size() - 1;
-			line_start = end + 1;
-		}
-
-		const size_t first_line = caret_line + 1 > static_cast<size_t>(visible_lines) ? caret_line + 1 - visible_lines : 0;
+		const InputLayout layout = this->LayoutInput(area);
 
 		int y = area.top;
-		for (size_t i = first_line; i < lines.size() && y + line_height - 1 <= area.bottom; i++) {
-			DrawString(area.left, area.right, y, lines[i], TextColour::Black);
+		for (size_t i = layout.first_line; i < layout.lines.size() && y + line_height - 1 <= area.bottom; i++) {
+			DrawString(area.left, area.right, y, layout.lines[i], TextColour::Black);
 			y += line_height;
 		}
 
 		/* Draw the caret. */
-		if (caret_line >= first_line && caret_line - first_line < static_cast<size_t>(visible_lines)) {
-			const std::string &line = lines[caret_line];
-			size_t line_begin = 0;
-			for (size_t i = 0; i < caret_line; i++) line_begin += lines[i].size() + 1;
-			const size_t offset = _agent_chat.caret > line_begin ? std::min(_agent_chat.caret - line_begin, line.size()) : 0;
-			const int caret_x = std::min(area.right, area.left + static_cast<int>(GetStringBoundingBox(std::string_view(line).substr(0, offset)).width));
-			const int caret_y = area.top + static_cast<int>(caret_line - first_line) * line_height;
-			GfxFillRect(Rect{caret_x, caret_y, caret_x + 1, caret_y + line_height - 1}, PC_BLACK);
+		if (layout.caret_line >= layout.first_line && layout.caret_line - layout.first_line < static_cast<size_t>(layout.visible_lines)) {
+			const Point caret = this->GetInputCaretPoint(area, layout);
+			GfxFillRect(Rect{caret.x, caret.y, caret.x + 1, caret.y + line_height - 1}, PC_BLACK);
 		}
+	}
+
+	/** The message input split into the lines that are shown, and where the caret is in them. */
+	struct InputLayout {
+		std::vector<std::string> lines; ///< The input split into lines.
+		size_t caret_line = 0;          ///< Line the caret is on.
+		size_t first_line = 0;          ///< First visible line.
+		int visible_lines = 1;          ///< Number of visible lines.
+	};
+
+	/**
+	 * Split the message input into lines and find the line the caret is on.
+	 * @param area The area inside the frame of the input widget.
+	 * @return The layout of the input.
+	 */
+	InputLayout LayoutInput(const Rect &area) const
+	{
+		InputLayout layout;
+		layout.visible_lines = std::max(1, area.Height() / GetCharacterHeight(FontSize::Normal));
+
+		size_t line_start = 0;
+		while (true) {
+			const size_t end = _agent_chat.input.find('\n', line_start);
+			if (end == std::string::npos) {
+				layout.lines.push_back(_agent_chat.input.substr(line_start));
+				if (_agent_chat.caret >= line_start) layout.caret_line = layout.lines.size() - 1;
+				break;
+			}
+			layout.lines.push_back(_agent_chat.input.substr(line_start, end - line_start));
+			if (_agent_chat.caret >= line_start && _agent_chat.caret <= end) layout.caret_line = layout.lines.size() - 1;
+			line_start = end + 1;
+		}
+
+		layout.first_line = layout.caret_line + 1 > static_cast<size_t>(layout.visible_lines) ? layout.caret_line + 1 - layout.visible_lines : 0;
+		return layout;
+	}
+
+	/**
+	 * Get the position of the caret in the message input.
+	 * @param area The area inside the frame of the input widget.
+	 * @param layout The layout of the input, computed from the same area.
+	 * @return The caret position, relative to the window.
+	 */
+	Point GetInputCaretPoint(const Rect &area, const InputLayout &layout) const
+	{
+		const std::string &line = layout.lines[layout.caret_line];
+		size_t line_begin = 0;
+		for (size_t i = 0; i < layout.caret_line; i++) line_begin += layout.lines[i].size() + 1;
+		const size_t offset = _agent_chat.caret > line_begin ? std::min(_agent_chat.caret - line_begin, line.size()) : 0;
+		const int caret_x = std::min(area.right, area.left + static_cast<int>(GetStringBoundingBox(std::string_view(line).substr(0, offset)).width));
+		const int caret_y = area.top + static_cast<int>(layout.caret_line - layout.first_line) * GetCharacterHeight(FontSize::Normal);
+		return {caret_x, caret_y};
+	}
+
+	/**
+	 * Get the position of the caret in the message input.
+	 * @param area The area inside the frame of the input widget.
+	 * @return The caret position, relative to the window.
+	 */
+	Point GetInputCaretPoint(const Rect &area) const
+	{
+		return this->GetInputCaretPoint(area, this->LayoutInput(area));
 	}
 
 	/**
@@ -1365,6 +1487,10 @@ struct AgentChatWindow : Window {
 
 			case WID_AC_ADD_OBJECT:
 				this->StartPicking(false);
+				break;
+
+			case WID_AC_ADD_COMPANY:
+				this->ShowCompanyCandidates();
 				break;
 
 			case WID_AC_CHAT_LIST:
@@ -1485,6 +1611,9 @@ struct AgentChatWindow : Window {
 		const Rect area = this->GetInnerRect(WID_AC_INPUT);
 		if (!area.Contains(pt)) return;
 
+		/* The window has to own the edit box focus for the backend to deliver text input. */
+		this->SetFocusedWidget(WID_AC_INPUT);
+
 		const int line_height = GetCharacterHeight(FontSize::Normal);
 		const int visible_lines = std::max(1, area.Height() / line_height);
 
@@ -1586,6 +1715,34 @@ struct AgentChatWindow : Window {
 		attachment.name = GetString(STR_AGENT_CHAT_ATTACHMENT_POINT, TileX(tile), TileY(tile));
 		_agent_chat.tray.push_back(std::move(attachment));
 		this->UpdateWidgetStates();
+		this->SetDirty();
+	}
+
+	/**
+	 * Offer every company of the game as an attachment, using the same candidate list as a map
+	 * click with several objects. The lifetime generation of the company is sent along when the
+	 * game tracks one, so a company that was recreated with the same id does not silently take the
+	 * place of the picked one.
+	 */
+	void ShowCompanyCandidates()
+	{
+		Json candidates = Json::array();
+		for (const Company *company : Company::Iterate()) {
+			const std::string name = SanitiseBackendText(company->name.empty() ? GetString(STR_COMPANY_NAME, company->index) : company->name);
+			/* Companies are pooled: the id of a company that was removed can be handed out again,
+			 * so the lifetime generation has to travel with the reference. It is left out when the
+			 * pool of this build does not track a generation, which the bridge reports as unverified
+			 * rather than as a verified identity. */
+			Json candidate = {{"type", "company"}, {"id", company->index.base()}, {"name", name},
+					{"world_id", _agent_chat.world_id}, {"epoch", _agent_chat.epoch}};
+			const int64_t generation = GetPoolGeneration(*company);
+			if (generation >= 0) candidate["generation"] = generation;
+			candidates.push_back(std::move(candidate));
+		}
+		if (candidates.empty()) return;
+
+		_agent_chat.candidates = std::move(candidates);
+		_agent_chat.candidates_open = true;
 		this->SetDirty();
 	}
 
@@ -1710,12 +1867,73 @@ struct AgentChatWindow : Window {
 		}
 
 		if (key != 0 && IsPrintable(key)) {
-			auto [buf, len] = EncodeUtf8(key);
-			this->InsertInput(std::string_view(buf, len));
+			/* While the input owns the edit box focus the backend delivers printable characters as
+			 * text input (InsertTextString), so inserting them here as well would duplicate every
+			 * one of them. This path stays for backends that do not do that. */
+			if (!EditBoxInGlobalFocus()) {
+				auto [buf, len] = EncodeUtf8(key);
+				this->InsertInput(std::string_view(buf, len));
+			}
 			return EventState::Handled;
 		}
 
 		return EventState::NotHandled;
+	}
+
+	/**
+	 * Insert text the backend delivered for the message box.
+	 *
+	 * Everything the keyboard layout produces arrives here: plain characters, characters that need
+	 * a composition step (Cyrillic with a dead key, accented input) and the preedit of an IME. The
+	 * message box is its own multiline buffer rather than a Textbuf, so the insertion happens here.
+	 * @param wid The widget the text is for.
+	 * @param str The text to insert, UTF-8 encoded.
+	 * @param marked Whether the text is IME text that is still being composed.
+	 */
+	void InsertTextString(WidgetID wid, std::string_view str, bool marked, std::optional<size_t> caret, std::optional<size_t> insert_location, std::optional<size_t> replacement_end) override
+	{
+		if (wid != WID_AC_INPUT) {
+			Window::InsertTextString(wid, str, marked, caret, insert_location, replacement_end);
+			return;
+		}
+
+		/* The next update of a composition replaces the text of the previous one. */
+		if (_agent_chat.composed_length != 0) {
+			const size_t begin = _agent_chat.caret >= _agent_chat.composed_length ? _agent_chat.caret - _agent_chat.composed_length : 0;
+			_agent_chat.input.erase(begin, _agent_chat.caret - begin);
+			_agent_chat.caret = begin;
+			_agent_chat.composed_length = 0;
+		}
+
+		/* Only printable text: a backend may send control characters as text as well (backspace and
+		 * delete are sent this way by some backends), and a newline is inserted by the key handler,
+		 * not by typing. The bytes of a UTF-8 sequence are all >= 0x80 and are kept as they are. */
+		std::string text;
+		for (const char c : str) {
+			const unsigned char byte = static_cast<unsigned char>(c);
+			if (IsPrintable(byte) && byte != 0x7F) text.push_back(c);
+		}
+
+		if (!text.empty()) {
+			this->InsertInput(text);
+			if (marked) _agent_chat.composed_length = text.size();
+		}
+		this->SetWidgetDirty(WID_AC_INPUT);
+	}
+
+	/**
+	 * The message box is not backed by a Textbuf, so there is no focused text buffer to report.
+	 * @return Always \c nullptr.
+	 */
+	const struct Textbuf *GetFocusedTextbuf() const override { return nullptr; }
+
+	/**
+	 * Get the position of the caret, so a backend can put an IME composition window next to it.
+	 * @return The caret position, relative to the window.
+	 */
+	Point GetCaretPosition() const override
+	{
+		return this->GetInputCaretPoint(this->GetInnerRect(WID_AC_INPUT));
 	}
 
 	/**
@@ -1835,8 +2053,11 @@ static constexpr std::initializer_list<NWidgetPart> _nested_agent_chat_widgets =
 			NWidget(NWID_HORIZONTAL),
 				NWidget(WWT_PUSHTXTBTN, Colours::Grey, WID_AC_ADD_POINT), SetFill(1, 0), SetResize(1, 0), SetStringTip(STR_AGENT_CHAT_ADD_POINT, STR_AGENT_CHAT_ADD_POINT_TOOLTIP),
 				NWidget(WWT_PUSHTXTBTN, Colours::Grey, WID_AC_ADD_OBJECT), SetFill(1, 0), SetResize(1, 0), SetStringTip(STR_AGENT_CHAT_ADD_OBJECT, STR_AGENT_CHAT_ADD_OBJECT_TOOLTIP),
+				NWidget(WWT_PUSHTXTBTN, Colours::Grey, WID_AC_ADD_COMPANY), SetFill(1, 0), SetResize(1, 0), SetStringTip(STR_AGENT_CHAT_ADD_COMPANY, STR_AGENT_CHAT_ADD_COMPANY_TOOLTIP),
 			EndContainer(),
-			NWidget(WWT_PANEL, Colours::Grey, WID_AC_INPUT), SetMinimalSize(0, 48), SetFill(1, 0), SetResize(1, 0), SetToolTip(STR_AGENT_CHAT_INPUT_TOOLTIP),
+			/* An edit box so the window can take the global edit box focus: the backends deliver
+			 * typed text (and only typed text) through HandleTextInput() to a focused edit box. */
+			NWidget(WWT_EDITBOX, Colours::Grey, WID_AC_INPUT), SetMinimalSize(0, 48), SetFill(1, 0), SetResize(1, 0), SetToolTip(STR_AGENT_CHAT_INPUT_TOOLTIP),
 			EndContainer(),
 			NWidget(NWID_HORIZONTAL),
 				NWidget(WWT_PANEL, Colours::Grey, WID_AC_STATUS), SetMinimalSize(0, 14), SetFill(1, 0), SetResize(1, 0),
@@ -2101,6 +2322,7 @@ nlohmann::json DescribeAgentChatUi()
 			{"tray", WID_AC_TRAY},
 			{"add_point", WID_AC_ADD_POINT},
 			{"add_object", WID_AC_ADD_OBJECT},
+			{"add_company", WID_AC_ADD_COMPANY},
 			{"input", WID_AC_INPUT},
 			{"status", WID_AC_STATUS},
 			{"send", WID_AC_SEND},

@@ -6658,3 +6658,23 @@ STR_AGENT_CHAT_STATUS_WINDOW                                    :{RAW_STRING} - 
 STR_AGENT_CHAT_STATUS_TOOLTIP                                   :Открыть окно чата с агентом
 STR_AGENT_CHAT_ERROR                                            :{RED}Ошибка: {RAW_STRING}
 STR_AGENT_CHAT_ERROR_UNKNOWN                                    :запрос не выполнен
+STR_AGENT_CHAT_TYPE_DEPOT                                       :Депо
+STR_AGENT_CHAT_TYPE_WAYPOINT                                    :Путевая точка
+STR_AGENT_CHAT_TYPE_BUOY                                        :Буй
+STR_AGENT_CHAT_TYPE_HOUSE                                       :Дом
+STR_AGENT_CHAT_TYPE_GROUP                                       :Группа
+STR_AGENT_CHAT_TYPE_ENGINE                                      :Двигатель
+STR_AGENT_CHAT_TYPE_CARGO                                       :Груз
+STR_AGENT_CHAT_TYPE_OBJECT                                      :Объект
+STR_AGENT_CHAT_KIND_TERRAIN                                     :Открытая местность
+STR_AGENT_CHAT_KIND_RAIL                                        :Ж/д путь
+STR_AGENT_CHAT_KIND_ROAD                                        :Дорога
+STR_AGENT_CHAT_KIND_TRAM                                        :Трамвайный путь
+STR_AGENT_CHAT_KIND_SIGNAL                                      :Сигнал
+STR_AGENT_CHAT_KIND_TREES                                       :Деревья
+STR_AGENT_CHAT_KIND_WATER                                       :Вода
+STR_AGENT_CHAT_KIND_BRIDGE                                      :Мост
+STR_AGENT_CHAT_KIND_TUNNEL                                      :Тоннель
+STR_AGENT_CHAT_ATTACHMENT_TILE_WHAT                             :{RAW_STRING} (тайл {NUM}, {NUM})
+STR_AGENT_CHAT_ADD_COMPANY                                      :Добавить компанию
+STR_AGENT_CHAT_ADD_COMPANY_TOOLTIP                              :Выбрать компанию для вложения
