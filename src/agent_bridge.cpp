@@ -11,6 +11,7 @@
 #include "agent_bridge.h"
 
 #include "agent_admin_tools.h"
+#include "agent_blueprint_tools.h"
 #include "agent_capture.h"
 #include "agent_chat_gui.h"
 #include "agent_command_catalog.h"
@@ -1185,6 +1186,8 @@ bool IsMutation(std::string_view method, const Json &params)
 	}
 	/* A projection through world.project is a read of the camera; the administrative ops keep their own answer. */
 	if (method == "world.project" && IsProjectionRequest(params)) return false;
+	/* The rail blueprint module knows which of its own ops are read-only (status, list, inspect). */
+	if (IsBlueprintMutation(method, params)) return true;
 	return IsAdminMutation(method, params);
 }
 
@@ -1196,6 +1199,28 @@ Json WorldBinding()
 {
 	ResolveWorldId();
 	return {{"world_id", _state.world_id}, {"epoch", _state.epoch}};
+}
+
+/**
+ * The parameters of a rail blueprint or trunk line call, with the bridge's own binding forced in.
+ *
+ * The module refuses a plan of another task, world or epoch, so the binding it reads has to be the
+ * one the bridge checked and never what the model echoed back in its parameters: `task_id` is the
+ * outer request's task, `world_id` and `epoch` are this load's identity as the bridge reports it.
+ * The three values are always strings, so an echoed number cannot turn a valid call into an
+ * `invalid_arguments` answer.
+ * @param request The request, as received from the backend.
+ * @param params The parameters of the request.
+ * @return The parameters with the authoritative binding injected.
+ */
+Json BlueprintModuleParams(const Json &request, const Json &params)
+{
+	ResolveWorldId();
+	Json module_params = params.is_object() ? params : Json::object();
+	module_params["task_id"] = JsonString(request, "task_id");
+	module_params["world_id"] = _state.world_id;
+	module_params["epoch"] = _state.epoch;
+	return module_params;
 }
 
 /**
@@ -2522,6 +2547,19 @@ Json ExecuteRequestInner(const Json &request, bool &deferred)
 		return FromModule(std::move(*result));
 	}
 
+	/*
+	 * The rail blueprint and trunk line module owns world.blueprint and world.rail_route. The world,
+	 * the epoch, the task barrier and the expected references were checked above; the binding of
+	 * this request is forced into the parameters, so a plan can never be read or built for another
+	 * task, world or epoch through a model supplied echo.
+	 */
+	if (method == "world.blueprint" || method == "world.rail_route") {
+		if (std::optional<Json> result = DispatchBlueprintTool(method, BlueprintModuleParams(request, params), company); result.has_value()) {
+			return FromModule(std::move(*result));
+		}
+		return Error("unsupported_method", method);
+	}
+
 	return Error("unsupported_method", method);
 }
 
@@ -2871,7 +2909,7 @@ Json Capabilities()
 			"world.command", "task.barrier", "ui.inspect"};
 	Json modules = Json::array();
 
-	for (const Json &module : {CoreCapabilities(), GameToolCapabilities(), TransportToolCapabilities(), AdminToolCapabilities(), CameraCapabilities(), CommandCatalogCapabilities()}) {
+	for (const Json &module : {CoreCapabilities(), BlueprintToolCapabilities(), GameToolCapabilities(), TransportToolCapabilities(), AdminToolCapabilities(), CameraCapabilities(), CommandCatalogCapabilities()}) {
 		modules.push_back(module);
 		const auto entries = module.find("methods");
 		if (entries == module.end() || !entries->is_array()) continue;

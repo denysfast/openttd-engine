@@ -58,6 +58,8 @@ add_files(
 add_files(
     agent_admin_tools.cpp
     agent_admin_tools.h
+    agent_blueprint_tools.cpp
+    agent_blueprint_tools.h
     agent_bridge.cpp
     agent_bridge.h
     agent_capture.cpp
