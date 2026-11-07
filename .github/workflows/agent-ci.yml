@@ -21,7 +21,8 @@ name: Agent CI (engine)
 # Deliberately absent: actions/cache (the cache service is hosted by GitHub and every self-hosted
 # job would pull a tarball over WAN), actions/upload-artifact (quota), any apt/global install (the
 # pool host already has cmake, ninja, a C++ toolchain and the OpenTTD build dependencies), any
-# deploy step, and any HOME override. Evidence goes to local storage through store-artifact.
+# deploy step, and any HOME override. No artifact bundle is published either: the build and CTest
+# output is tee-ed to stdout, so the logs are ordinary job output and need no upload step.
 
 on:
   push:
@@ -155,14 +156,3 @@ jobs:
           systemd-run --user --scope -q -p "MemoryMax=${MEMORY_MAX}" -p MemorySwapMax=0 -- \
             ctest --test-dir "$BUILD_DIR" --output-on-failure -j1 \
             2>&1 | tee "$GITHUB_WORKSPACE/ci-logs/ctest.log"
-
-      - name: Keep logs
-        # Failure logs are the reason this step exists, so it runs even when a step above failed.
-        if: always()
-        continue-on-error: true
-        uses: denysfast/ci-workflows/.github/actions/store-artifact@main
-        with:
-          name: engine-logs
-          path: ci-logs/*.log
-          retention-days: 3
-          if-no-files-found: warn
