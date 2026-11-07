@@ -13,7 +13,10 @@
 #include "3rdparty/nlohmann/json.hpp"
 #include "command_type.h"
 #include "company_type.h"
+#include "economy_type.h"
+#include "signs_type.h"
 #include "tile_type.h"
+#include "town_type.h"
 
 #include <optional>
 #include <string_view>
@@ -52,9 +55,11 @@ std::optional<Json> DispatchAdminTool(std::string_view method, const Json &param
 /**
  * Does this call change the world?
  *
- * The bridge needs this to decide whether a call needs a task and expected references. Read-only
- * operations of the administrative methods (world.company op=info, world.towns op=needs,
- * world.project op=power/district) are not mutations.
+ * The bridge needs this to decide whether a call needs a task and expected references. The query
+ * operations of the administrative methods are not mutations: world.settings.get, world.company
+ * op=info/livery, world.towns op=needs/growth/settings/power/list, world.industry
+ * op=list/info/needs/production/cargo, world.signs op=list/info, world.landscape op=object_types
+ * and world.project op=power/district/catchment/settings.
  *
  * @param method The method name.
  * @param params The method parameters.
@@ -63,7 +68,7 @@ std::optional<Json> DispatchAdminTool(std::string_view method, const Json &param
 bool IsAdminMutation(std::string_view method, const Json &params);
 
 /**
- * Callback of every command this module posts.
+ * Callback of every command this module posts that returns only a cost.
  *
  * The command path is synchronous in single player, so the result is available right after Post
  * returns. The callback is registered in the network command callback table.
@@ -73,6 +78,41 @@ bool IsAdminMutation(std::string_view method, const Json &params);
  * @param tile The tile the command ran on.
  */
 void AgentAdminCommandCallback(Commands cmd, const CommandCost &result, TileIndex tile);
+
+/**
+ * Callback of Commands::FoundTown, which also returns the cost of the town and the new town id.
+ *
+ * The parent registers this in the network command callback table next to AgentAdminCommandCallback;
+ * the module cannot register it itself without touching the network command file.
+ *
+ * @param cmd The command that ran.
+ * @param result The result the engine reported.
+ * @param cost The price of the founded town.
+ * @param town_id The id of the new town, or an invalid id when the command failed.
+ */
+void AgentAdminFoundTownCallback(Commands cmd, const CommandCost &result, Money cost, TownID town_id);
+
+/**
+ * Callback of Commands::PlaceSign, which also returns the id of the new sign.
+ *
+ * The parent registers this in the network command callback table next to AgentAdminCommandCallback.
+ *
+ * @param cmd The command that ran.
+ * @param result The result the engine reported.
+ * @param sign_id The id of the new sign, or an invalid id when the command failed.
+ */
+void AgentAdminPlaceSignCallback(Commands cmd, const CommandCost &result, SignID sign_id);
+
+/**
+ * Callback of Commands::BuildIndustryArea, which also returns the number of industries it built.
+ *
+ * The parent registers this in the network command callback table next to AgentAdminCommandCallback.
+ *
+ * @param cmd The command that ran.
+ * @param result The result the engine reported.
+ * @param count The number of industries the command built.
+ */
+void AgentAdminBuildIndustryAreaCallback(Commands cmd, const CommandCost &result, uint32_t count);
 
 } // namespace InGameAgent
 
