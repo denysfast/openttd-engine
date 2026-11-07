@@ -24,6 +24,7 @@
 
 #include "../agent_blueprint_tools.h"
 #include "../blueprint.h"
+#include "../company_base.h"
 #include "../core/backup_type.hpp"
 #include "../fileio_func.h"
 #include "../map_func.h"
@@ -121,15 +122,16 @@ static BlueprintChunkData TrackChunk()
 /**
  * Build a small plan with a number of synthetic chunks.
  * @param chunks The number of chunks.
+ * @param company The company the plan is made for.
  * @return The plan.
  */
-static BlueprintToolPlan MakePlan(size_t chunks)
+static BlueprintToolPlan MakePlan(size_t chunks, CompanyID company = static_cast<CompanyID>(0))
 {
 	BlueprintToolPlan plan;
 	plan.route = false;
 	plan.name = "synthetic";
 	plan.origin = TileXY(0, 0);
-	plan.company = static_cast<CompanyID>(0);
+	plan.company = company;
 	plan.task_id = std::string(TASK_ID);
 	plan.world_id = std::string(WORLD_ID);
 	plan.epoch = std::string(EPOCH);
@@ -137,6 +139,42 @@ static BlueprintToolPlan MakePlan(size_t chunks)
 	for (size_t i = 0; i < chunks; i++) plan.chunks.push_back(TrackChunk());
 	return plan;
 }
+
+/**
+ * A real company in the engine's own company pool, removed again when the guard goes out of scope.
+ *
+ * The cases work on the engine's own company objects, so the lifetime generation they use is the real
+ * one the pool assigns, not a number the test made up. #Remove deletes the company without ending the
+ * guard, which is how a case reaches the deletion and the reuse of a company id.
+ */
+class CompanyGuard {
+public:
+	CompanyGuard()
+	{
+		/* The pool asserts that the allocation was checked, exactly as the bridge's own test does. */
+		REQUIRE(Company::CanAllocateItem());
+		this->company = Company::Create();
+		REQUIRE(this->company != nullptr);
+	}
+
+	~CompanyGuard()
+	{
+		if (this->company != nullptr) delete this->company;
+	}
+
+	CompanyID Id() const { return this->company->index; }
+	uint64_t Generation() const { return this->company->generation; }
+
+	/** Delete the company now, so the engine can reuse its id. */
+	void Remove()
+	{
+		delete this->company;
+		this->company = nullptr;
+	}
+
+private:
+	Company *company = nullptr; ///< The company, or nullptr after it was removed.
+};
 
 /**
  * A scratch personal directory that belongs to one test invocation only.
@@ -457,7 +495,10 @@ TEST_CASE("Agent blueprint tools: bounded plan store")
 
 TEST_CASE("Agent blueprint tools: chunk execution accounting")
 {
-	const std::optional<uint32_t> stored = StoreBlueprintToolPlan(MakePlan(2));
+	/* A real company, so the chunk is posted for a company that exists and the plan carries its
+	 * lifetime generation. */
+	const CompanyGuard company;
+	const std::optional<uint32_t> stored = StoreBlueprintToolPlan(MakePlan(2, company.Id()));
 	REQUIRE(stored.has_value());
 	const uint32_t plan_id = *stored;
 
@@ -547,6 +588,79 @@ TEST_CASE("Agent blueprint tools: chunk execution accounting")
 			{"task_id", OTHER_TASK_ID}, {"world_id", WORLD_ID}, {"epoch", EPOCH}}))["error"] == "plan_binding_mismatch");
 	CHECK(Dispatch("world.blueprint", Json::object({{"op", "drop"}, {"plan_id", *owned},
 			{"task_id", TASK_ID}, {"world_id", WORLD_ID}, {"epoch", EPOCH}}))["ok"] == true);
+}
+
+TEST_CASE("Agent blueprint tools: plan company lifetime")
+{
+	/* A real company in the engine's pool: the case uses the generation the pool assigns, so a
+	 * deleted and reused company id is the real thing and not a made up number. */
+	CompanyGuard company;
+	const CompanyID company_id = company.Id();
+	const uint64_t generation = company.Generation();
+	REQUIRE(generation != 0);
+
+	const std::optional<uint32_t> stored = StoreBlueprintToolPlan(MakePlan(1, company_id));
+	REQUIRE(stored.has_value());
+	const uint32_t plan_id = *stored;
+
+	/* The plan reports the company and the lifetime it was made for. */
+	Json status_params = Binding(plan_id);
+	status_params["op"] = "status";
+	const Json status = Dispatch("world.blueprint", status_params);
+	REQUIRE(status["ok"] == true);
+	CHECK(status["company_id"] == company_id.base());
+	CHECK(status["company_generation"] == generation);
+	CHECK(status["company_current"] == true);
+	CHECK(status["binding"]["company_generation"] == generation);
+
+	Json chunk_params = Binding(plan_id);
+	chunk_params["op"] = "execute_chunk";
+	chunk_params["chunk_index"] = 0;
+
+	/* Another company of the same task cannot execute the plan of this one. */
+	CompanyGuard other;
+	REQUIRE(other.Id() != company_id);
+	const Json other_actor = *DispatchBlueprintTool("world.blueprint", chunk_params, other.Id());
+	CHECK(other_actor["ok"] == false);
+	CHECK(other_actor["error"] == "plan_actor_mismatch");
+	CHECK(other_actor["detail"]["actor_id"] == other.Id().base());
+	CHECK(other_actor["detail"]["company_id"] == company_id.base());
+
+	/* The company is deleted: its id is free and the plan of that lifetime cannot be executed. */
+	company.Remove();
+	CHECK_FALSE(Company::IsValidID(company_id));
+	const Json deleted = Dispatch("world.blueprint", chunk_params);
+	CHECK(deleted["ok"] == false);
+	CHECK(deleted["error"] == "company_lifetime_mismatch");
+	CHECK(deleted["detail"]["company_generation"] == generation);
+	CHECK(deleted["detail"]["generation_now"] == 0);
+
+	/* The engine really reuses the id: the new company is another lifetime at the same index. */
+	CompanyGuard again;
+	REQUIRE(again.Id() == company_id);
+	REQUIRE(again.Generation() != generation);
+	const Json reused = Dispatch("world.blueprint", chunk_params);
+	CHECK(reused["ok"] == false);
+	CHECK(reused["error"] == "company_lifetime_mismatch");
+	CHECK(reused["detail"]["generation_now"] == again.Generation());
+
+	/* The status of the stored plan is honest about the lifetime that is gone. */
+	const Json stale = Dispatch("world.blueprint", status_params);
+	REQUIRE(stale["ok"] == true);
+	CHECK(stale["company_current"] == false);
+
+	/* The parameters may name the actor of the request but never override it: here the request actor is
+	 * the other company and the parameters name the plan's (reused) id, so the two really differ. */
+	Json named_actor = chunk_params;
+	named_actor["company_id"] = company_id.base();
+	const Json overridden = *DispatchBlueprintTool("world.blueprint", named_actor, other.Id());
+	CHECK(overridden["ok"] == false);
+	CHECK(overridden["error"] == "invalid_arguments");
+	CHECK(overridden["detail"]["actor_id"] == other.Id().base());
+	CHECK(overridden["detail"]["company_id"] == company_id.base());
+
+	/* Clean up: the store does not keep a plan of a company that is gone. */
+	Dispatch("world.blueprint", Json::object({{"op", "drop"}, {"plan_id", plan_id}, {"task_id", TASK_ID}, {"world_id", WORLD_ID}, {"epoch", EPOCH}}));
 }
 
 TEST_CASE("Agent blueprint tools: capture validation")

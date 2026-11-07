@@ -381,6 +381,48 @@ std::optional<Json> ReadCompany(const Json &params, CompanyID default_company, C
 }
 
 /**
+ * The lifetime generation of a company.
+ *
+ * The generation is the engine's own identity of one lifetime of a pooled object: it is assigned when
+ * the company is created and never repeats within the process, so a company that was deleted and whose
+ * id was reused by a new company has another generation. It is runtime only, like the world epoch.
+ *
+ * @param company The company.
+ * @return The generation of the company at that index, or 0 when no company exists there.
+ */
+uint64_t CompanyLifetime(CompanyID company)
+{
+	if (!Company::IsValidID(company)) return 0;
+	return Company::Get(company)->generation;
+}
+
+/**
+ * Check that a call does not name another company than the one the request was made for.
+ *
+ * The bridge pins the actor of a request and passes it here; a `company_id` in the parameters is only
+ * a copy of it, never an override, so a plan is always made for the company the request was made for.
+ *
+ * @param params The method parameters.
+ * @param actor The company of the request, or CompanyID::Invalid() when the request names none.
+ * @return An error document, or nothing when the parameters agree with the request.
+ */
+std::optional<Json> CheckRequestCompany(const Json &params, CompanyID actor)
+{
+	int64_t id = 0;
+	switch (ReadInt(params, "company_id", id)) {
+		case ParamState::Invalid: return MakeError("invalid_arguments", "`company_id` must be an integer");
+		case ParamState::Absent: return std::nullopt;
+		case ParamState::Present: break;
+	}
+	if (id < 0 || id > UINT8_MAX) return MakeError("invalid_arguments", "`company_id` is out of range");
+	if (actor != CompanyID::Invalid() && static_cast<CompanyID>(id) != actor) {
+		return MakeError("invalid_arguments", "`company_id` must be the company of the request",
+				{{"actor_id", actor.base()}, {"company_id", id}});
+	}
+	return std::nullopt;
+}
+
+/**
  * Document of one tile.
  * @param tile The tile.
  * @return The `{x, y}` document.
@@ -477,6 +519,7 @@ Json BindingDocument(const BlueprintToolPlan &plan)
 			{"world_id", plan.world_id},
 			{"epoch", plan.epoch},
 			{"company_id", plan.company.base()},
+			{"company_generation", plan.company_generation},
 	};
 }
 
@@ -497,6 +540,9 @@ Json PlanDocument(const BlueprintToolPlan &plan)
 	result["name"] = plan.name;
 	result["origin"] = TileDocument(plan.origin);
 	result["company_id"] = plan.company.base();
+	result["company_generation"] = plan.company_generation;
+	/* Generation 0 is "there was no company at that index", so it is never a current company. */
+	result["company_current"] = plan.company_generation != 0 && CompanyLifetime(plan.company) == plan.company_generation;
 	result["binding"] = BindingDocument(plan);
 	result["chunks"] = Json{
 			{"total", plan.chunks.size()},
@@ -705,6 +751,35 @@ std::optional<Json> FindBoundPlan(const Json &params, BlueprintToolPlan *&plan, 
 
 	if (plan->task_id != task_id || plan->world_id != world_id || plan->epoch != epoch) {
 		return MakeError("plan_binding_mismatch", "the plan belongs to another task, world or epoch", BindingDocument(*plan));
+	}
+	return std::nullopt;
+}
+
+/**
+ * Check that a plan may still be executed for the company of the call.
+ *
+ * A plan belongs to the company it was made for and to that one lifetime of the company: another
+ * company of the same task cannot build it, and neither can the id of a company that was deleted and
+ * reused by a new company. The check reads the engine's own company pool, so it is the real lifetime
+ * and not a copy of the id.
+ *
+ * @param plan The plan.
+ * @param actor The company of the call, or CompanyID::Invalid() when the call names none.
+ * @return An error document, or nothing when the plan may be executed.
+ */
+std::optional<Json> CheckPlanCompany(const BlueprintToolPlan &plan, CompanyID actor)
+{
+	if (actor != CompanyID::Invalid() && actor != plan.company) {
+		return MakeError("plan_actor_mismatch", "the plan was made for another company than the request actor",
+				{{"plan_id", plan.plan_id}, {"company_id", plan.company.base()}, {"actor_id", actor.base()}});
+	}
+
+	const uint64_t generation = CompanyLifetime(plan.company);
+	/* A plan stored for a company that did not exist has generation 0 and is never executable. */
+	if (plan.company_generation == 0 || generation != plan.company_generation) {
+		return MakeError("company_lifetime_mismatch", "the company of the plan was deleted or its id was reused",
+				{{"plan_id", plan.plan_id}, {"company_id", plan.company.base()},
+				 {"company_generation", plan.company_generation}, {"generation_now", generation}});
 	}
 	return std::nullopt;
 }
@@ -1093,15 +1168,17 @@ Json RailRoutePlanOp(const Json &params, CompanyID company)
 /**
  * Execute the next chunk of a plan.
  * @param params The method parameters.
+ * @param actor The company of the call.
  * @return The result document.
  */
-Json PlanExecuteChunkOp(const Json &params)
+Json PlanExecuteChunkOp(const Json &params, CompanyID actor)
 {
 	BlueprintToolPlan *plan = nullptr;
 	std::string task_id;
 	std::string world_id;
 	std::string epoch;
 	if (const auto error = FindBoundPlan(params, plan, task_id, world_id, epoch)) return *error;
+	if (const auto error = CheckPlanCompany(*plan, actor)) return *error;
 
 	int64_t index = 0;
 	switch (ReadInt(params, "chunk_index", index)) {
@@ -1267,7 +1344,7 @@ Json DispatchBlueprint(const Json &params, CompanyID company)
 	if (op == "capture") return BlueprintCaptureOp(params, company);
 	if (op == "plan") return BlueprintPlanOp(params, company);
 	if (op == "status") return PlanStatusOp(params);
-	if (op == "execute_chunk") return PlanExecuteChunkOp(params);
+	if (op == "execute_chunk") return PlanExecuteChunkOp(params, company);
 	if (op == "stop") return PlanStopOp(params);
 	if (op == "drop") return PlanDropOp(params);
 
@@ -1288,7 +1365,7 @@ Json DispatchRailRoute(const Json &params, CompanyID company)
 
 	if (op == "plan") return RailRoutePlanOp(params, company);
 	if (op == "status") return PlanStatusOp(params);
-	if (op == "execute_chunk") return PlanExecuteChunkOp(params);
+	if (op == "execute_chunk") return PlanExecuteChunkOp(params, company);
 	if (op == "stop") return PlanStopOp(params);
 	if (op == "drop") return PlanDropOp(params);
 
@@ -1357,9 +1434,10 @@ Json BlueprintToolCapabilities()
 			"A plan is a bounded record of one blueprint paste or one trunk line: the module hands out the plan id from a 32 bit counter that never hands out the same id twice and refuses new plans when the id space is used up, keeps at most a fixed number of plans, chunks and bytes, and refuses a plan that does not fit instead of truncating it.",
 			"Every chunk is one normal Commands::PasteBlueprint or Commands::PrepareRailRoute command posted for the plan's company, so the engine's own eligibility, pause and finance checks apply and the reported cost is the engine's cost.",
 			"One chunk per call: execute_chunk executes exactly the next chunk of the plan and reports the engine's result for it; nothing runs in the background, so nothing keeps building after the bridge stops calling and the player's own paste job is not touched.",
-			"A plan is bound to the request binding the bridge uses: task_id, world_id and epoch (the bridge's UUID string of the current load of the world), plus the company the chunks are posted for. plan, status, execute_chunk, stop and drop all require that binding and refuse a plan of another task, world or epoch, so a read can never disclose the plan of another chat; the bridge checks the world, the epoch and the task barrier before every call and injects the three fields from the request, never from the model's parameters.",
+			"A plan is bound to the request binding the bridge uses: task_id, world_id and epoch (the bridge's UUID string of the current load of the world), plus the company the chunks are posted for and the lifetime generation of that company taken from the engine's own company pool when the plan was made. plan, status, execute_chunk, stop and drop all require that binding and refuse a plan of another task, world or epoch, so a read can never disclose the plan of another chat; the bridge checks the world, the epoch and the task barrier before every call and injects the three fields from the request, never from the model's parameters.",
 			"capture, plan, execute_chunk, stop and drop are reported as mutations because they change the plan store or the world; list, inspect and status are the read-only operations.",
 			"Chunk indices are executed in order; a chunk that the engine did not build (built and failed both zero) is not counted as done, so submitted work is never reported as done.",
+			"execute_chunk posts the chunks for the company the plan was made for and refuses to execute a plan of a company that was deleted or whose id was reused (company_lifetime_mismatch), or for a request whose actor is another company (plan_actor_mismatch); a company_id in the parameters must be the company of the request and never overrides it.",
 			"Performance: capture is one pass over at most 8192 tiles, planning a blueprint is linear in its items plus an ordered split of its station tiles, and planning a trunk line runs the engine's route search whose cost grows with the route length times the number of tracks; no call waits for the network or the model, and no call scans the whole map.",
 	});
 	return result;
@@ -1367,9 +1445,13 @@ Json BlueprintToolCapabilities()
 
 std::optional<Json> DispatchBlueprintTool(std::string_view method, const Json &params, CompanyID company)
 {
+	if (method != "world.blueprint" && method != "world.rail_route") return std::nullopt;
+
+	/* The actor of the request is pinned by the bridge; the parameters may name it but not override it. */
+	if (const auto error = CheckRequestCompany(params, company)) return *error;
+
 	if (method == "world.blueprint") return DispatchBlueprint(params, company);
-	if (method == "world.rail_route") return DispatchRailRoute(params, company);
-	return std::nullopt;
+	return DispatchRailRoute(params, company);
 }
 
 bool IsBlueprintMutation(std::string_view method, const Json &params)
@@ -1414,6 +1496,8 @@ std::optional<uint32_t> StoreBlueprintToolPlan(BlueprintToolPlan plan)
 	}
 
 	plan.plan_id = static_cast<uint32_t>(_next_plan_id++);
+	/* The plan belongs to this lifetime of the company, not just to its id. */
+	plan.company_generation = CompanyLifetime(plan.company);
 	plan.next_chunk = 0;
 	plan.cost = 0;
 	plan.built = 0;

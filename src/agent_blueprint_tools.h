@@ -43,6 +43,10 @@ using Json = nlohmann::json;
  * plan whose binding does not match, so a read or a write of one chat can never reach the plan of
  * another.
  *
+ * A plan also belongs to one lifetime of the company it was made for: the engine's own generation of
+ * that company is captured when the plan is stored, and a chunk is refused when the company was
+ * deleted or its id was reused by another company, or when the request actor is another company.
+ *
  * A plan never runs on its own: there is no timer and no background job, so nothing keeps building
  * after the bridge stops calling, and the player's own blueprint paste job is not touched.
  */
@@ -52,6 +56,7 @@ struct BlueprintToolPlan {
 	std::string name{}; ///< Blueprint name or trunk line label, for messages.
 	TileIndex origin = INVALID_TILE; ///< Tile the offsets of every chunk are relative to.
 	CompanyID company = CompanyID::Invalid(); ///< Company the chunks are posted for.
+	uint64_t company_generation = 0; ///< Lifetime generation of that company, taken when the plan was made.
 	std::string task_id{}; ///< Task the plan is bound to.
 	std::string world_id{}; ///< World the plan is bound to.
 	std::string epoch{}; ///< World epoch (the bridge's UUID string) the plan is bound to.
@@ -86,9 +91,12 @@ Json BlueprintToolCapabilities();
  * Command<Commands::PrepareRailRoute>::Post, so the engine's own eligibility, pause and finance checks
  * apply, and the reported cost is the one the engine returned.
  *
+ * The company of the request is pinned by the bridge and passed as @a company; a `company_id` in
+ * @a params must be that same company, so the parameters can never make a plan for another company.
+ *
  * @param method The method name, e.g. "world.blueprint".
  * @param params The method parameters.
- * @param company The company the call is made for; used as the default company of the call.
+ * @param company The company the call is made for; it is the actor of the call and the default company.
  * @return The result document, or std::nullopt when the method does not belong to this module.
  */
 std::optional<Json> DispatchBlueprintTool(std::string_view method, const Json &params, CompanyID company);
