@@ -142,19 +142,25 @@ Town *TestTown(TileIndex tile)
 	return Town::Create(tile);
 }
 
-/** A real company in the engine's own company pool, removed again when the guard goes out of scope. */
-class TestCompany {
+/**
+ * A real company for the structure cases, removed again when the guard goes out of scope.
+ *
+ * It carries the two things `CmdLandscapeClear` needs before it posts: money to pay for the
+ * demolition and a clearing quota (`landscape.cpp: CmdLandscapeClear` rejects a company whose
+ * `clear_limit` has no frame left), which a company created outside a running game does not have.
+ */
+class StructureTestCompany {
 public:
-	TestCompany()
+	StructureTestCompany()
 	{
 		REQUIRE(Company::CanAllocateItem());
 		this->company = Company::Create();
 		REQUIRE(this->company != nullptr);
-		/* The clearing quota a running game gives a company; the demolition below checks it. */
+		this->company->money = 100000;
 		this->company->clear_limit = UINT32_MAX;
 	}
 
-	~TestCompany() { delete this->company; }
+	~StructureTestCompany() { delete this->company; }
 
 	CompanyID Id() const { return this->company->index; }
 
@@ -208,7 +214,11 @@ private:
 		REQUIRE(RoadStop::CanAllocateItem());
 		this->station = Station::Create(tile);
 		REQUIRE(this->station != nullptr);
-		this->station->owner = owner;
+		/* The removal updates the station sign, and the sign asks for the station name: a name of its
+		 * own keeps that off the town name generator (`Station::UpdateVirtCoord` ->
+		 * `BaseStation::GetCachedName` -> `Station::FillCachedName`, which otherwise needs
+		 * `st->town`). A real station built by the engine has a town for that. */
+		this->station->name = "Test bus stop";
 
 		MakeRoadStop(tile, owner, this->station->index, RoadStopType::Bus, ROADTYPE_ROAD, INVALID_ROADTYPE, DiagDirection::NE);
 
@@ -216,8 +226,11 @@ private:
 		REQUIRE(stop != nullptr);
 		this->station->bus_stops = stop;
 		this->station->bus_station.Add(tile);
-		this->station->AddFacility(StationFacility::BusStop, tile);
 		this->station->spread.Add(tile);
+		this->station->AddFacility(StationFacility::BusStop, tile);
+		/* `AddFacility` takes the owner from the current company, which is what `CmdBuildRoadStop`
+		 * relies on; the fixture builds outside a command, so it names the owner itself. */
+		this->station->owner = owner;
 		Company::Get(owner)->infrastructure.station++;
 		return this->station;
 	}
@@ -269,7 +282,12 @@ Json ReadStructureRef(TileIndex tile)
 	return ref;
 }
 
-/** Run one engine command through the catalog's own write path, as `world.command` does. */
+/**
+ * Run one engine command through the catalog's own write path, the one `world.command` runs.
+ *
+ * The catalog checks `expected_targets` itself; `expected_refs` are the bridge's guard and are not
+ * part of this call, so a case that needs them checks `ResolveObjectRef(ref, true)` itself.
+ */
 Json CallCommandAs(const Json &params, CompanyID company)
 {
 	const std::optional<Json> result = DispatchCommandCatalog("world.command", params, company);
@@ -1170,7 +1188,7 @@ TEST_CASE("Agent bridge refs: a setting reference belongs to one world and epoch
 TEST_CASE("Agent bridge refs: a station structure tile is a generic tile object")
 {
 	MapFixture map;
-	TestCompany company;
+	StructureTestCompany company;
 
 	/* A real bus stop: the engine's own station pool item behind a bus stop tile. */
 	const TileIndex tile = TileXY(60, 60);
@@ -1231,36 +1249,56 @@ TEST_CASE("Agent bridge refs: a station structure tile is a generic tile object"
 	CHECK(ResolveObjectRef(Json{{"type", "tile"}, {"tile", TilePoint(1000, 1000)}}, false)["reason"] == "invalid_tile");
 }
 
-TEST_CASE("Agent bridge refs: a read of a bus stop guards its removal through the command path")
+TEST_CASE("Agent bridge refs: the read guard of a bus stop is current when the demolition runs")
 {
 	MapFixture map;
-	TestCompany company;
+	StructureTestCompany company;
 
 	const TileIndex tile = TileXY(61, 61);
 	TestBusStop stop(tile, company.Id());
 	REQUIRE(stop.Get() != nullptr);
 
-	/* The read the task keeps, and the strict guard built from it: the write resolves while the
-	 * stop the read saw still stands on the tile. */
+	/*
+	 * The read the task keeps, and the guard a write is planned with. `ResolveObjectRef(ref, true)`
+	 * is the check the bridge's own `CheckExpectedRefs` runs per reference before it delegates a
+	 * write (the wrapper adds the array and size checks and stops at the first stale reference), so
+	 * this is the engine's verdict on the reference, taken immediately before the command.
+	 */
 	const Json ref = ReadStructureRef(tile);
 	CHECK(ResolveObjectRef(ref, true)["found"] == true);
 
-	/* `CmdLandscapeClear` is the engine's own supported path for a demolition: it is the command
-	 * `world.construct op=demolish` posts, and on a road stop tile it removes the stop. */
-	const Json actor_guard = Json{{"entity", "company"}, {"id", company.Id().base()}};
+	/*
+	 * `CmdLandscapeClear` is the engine's own supported path for a demolition: it is the command
+	 * `world.construct op=demolish` posts, and on a road stop tile it removes the stop
+	 * (`landscape.cpp: CmdLandscapeClear` -> `station_cmd.cpp: ClearTile_Station` ->
+	 * `RemoveRoadStop`).
+	 *
+	 * The dispatch below is the catalog's real write path, the one `world.command` runs: it checks
+	 * `expected_targets` before it posts (`guard: "checked"` in the answer). It does not check
+	 * `expected_refs` - the bridge owns that guard and runs it before it delegates, which is the
+	 * `ResolveObjectRef(ref, true)` check above. So this case proves the composition: a current read
+	 * guard, then a real removal of the very tile the read named, then the same read being stale.
+	 */
+	const Json actor_guard = {{"entity", "company"}, {"id", company.Id().base()}};
+	Json targets = Json::array();
+	targets.push_back(actor_guard);
 	Json args = Json::array();
 	args.push_back(tile.base());
 	const Json removed = CallCommandAs({
 		{"command", "CmdLandscapeClear"},
 		{"args", args},
-		{"expected_targets", Json::array({actor_guard})},
+		{"expected_targets", targets},
 	}, company.Id());
 	REQUIRE(removed["ok"].get<bool>());
+	CHECK(removed["guard"] == "checked");
 	CHECK_FALSE(IsTileType(tile, TileType::Station));
 	CHECK(RoadStop::GetNumItems() == 0);
 
-	/* The reference the removal was guarded with is stale now: the tile carries no structure, so a
-	 * second removal of the stop the caller saw is rejected instead of clearing whatever is there. */
+	/*
+	 * The reference the removal was planned with is stale afterwards: the tile carries no structure,
+	 * so a second removal of the stop the caller saw is rejected instead of clearing whatever is
+	 * there now.
+	 */
 	const Json stale = ResolveObjectRef(ref, true);
 	CHECK(stale["found"] == false);
 	CHECK(stale["error"] == "stale_ref");
@@ -1270,7 +1308,7 @@ TEST_CASE("Agent bridge refs: a read of a bus stop guards its removal through th
 TEST_CASE("Agent bridge refs: a rebuilt station on the same tile is another structure lifetime")
 {
 	MapFixture map;
-	TestCompany company;
+	StructureTestCompany company;
 
 	const TileIndex tile = TileXY(62, 62);
 	TestBusStop stop(tile, company.Id());
