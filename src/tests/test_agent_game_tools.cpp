@@ -19,6 +19,7 @@
 #include "../3rdparty/catch2/catch.hpp"
 
 #include "../agent_game_tools.h"
+#include "../cargotype.h"
 
 #include "../safeguards.h"
 
@@ -100,6 +101,10 @@ TEST_CASE("agent_game_tools: capabilities list the implemented methods and their
 	CHECK(Contains(query["implemented"], "vehicles"));
 	CHECK(Contains(query["implemented"], "engines"));
 	CHECK(Contains(query["implemented"], "orders"));
+	CHECK(Contains(query["implemented"], "groups"));
+	CHECK(Contains(query["implemented"], "cargos"));
+	CHECK_FALSE(Contains(query["gaps"], "groups"));
+	CHECK_FALSE(Contains(query["gaps"], "cargos"));
 }
 
 TEST_CASE("agent_game_tools: a method outside the game tools is not claimed")
@@ -466,16 +471,21 @@ TEST_CASE("agent_game_tools: world.query answers the canonical kinds and their s
 {
 	const Json capabilities = GameToolCapabilities();
 	REQUIRE(capabilities["query_aliases"].is_object());
-	CHECK(capabilities["query_aliases"].size() == 6);
+	CHECK(capabilities["query_aliases"].size() == 10);
 	CHECK(capabilities["query_aliases"]["vehicles"] == "vehicles");
 	CHECK(capabilities["query_aliases"]["vehicle"] == "vehicles");
 	CHECK(capabilities["query_aliases"]["engines"] == "engines");
 	CHECK(capabilities["query_aliases"]["engine"] == "engines");
 	CHECK(capabilities["query_aliases"]["orders"] == "orders");
 	CHECK(capabilities["query_aliases"]["order"] == "orders");
+	CHECK(capabilities["query_aliases"]["groups"] == "groups");
+	CHECK(capabilities["query_aliases"]["group"] == "groups");
+	CHECK(capabilities["query_aliases"]["cargos"] == "cargos");
+	CHECK(capabilities["query_aliases"]["cargo"] == "cargos");
 
 	for (const auto &[kind, canonical] : {std::pair{"vehicle", "vehicles"}, {"vehicles", "vehicles"},
-			{"engine", "engines"}, {"engines", "engines"}, {"order", "orders"}, {"orders", "orders"}}) {
+			{"engine", "engines"}, {"engines", "engines"}, {"order", "orders"}, {"orders", "orders"},
+			{"group", "groups"}, {"groups", "groups"}, {"cargo", "cargos"}, {"cargos", "cargos"}}) {
 		CAPTURE(kind);
 		const std::optional<Json> result = DispatchGameTool("world.query", {{"kind", kind}}, CompanyID::Invalid());
 		REQUIRE(result.has_value());
@@ -514,7 +524,7 @@ TEST_CASE("agent_game_tools: a company id that does not fit is rejected instead 
 TEST_CASE("agent_game_tools: every filter a kind documents is read without an error")
 {
 	const std::optional<Json> vehicles = DispatchGameTool("world.query", {{"kind", "vehicles"}, {"filters", {
-			{"company_id", 0}, {"vehicle_type", "road"}, {"vehicle_id", 0}, {"cargo_id", 0},
+			{"company_id", 0}, {"vehicle_type", "road"}, {"vehicle_id", 0}, {"group_id", 0}, {"cargo_id", 0},
 			{"name_contains", "bus"}, {"in_depot", true}, {"stopped", false}}}}, CompanyID::Invalid());
 	REQUIRE(vehicles.has_value());
 	CHECK((*vehicles)["ok"] == true);
@@ -545,4 +555,133 @@ TEST_CASE("agent_game_tools: a world.query parameter the kind does not read is r
 	const std::optional<Json> known = DispatchGameTool("world.query", {{"kind", "orders"}, {"limit", 5}, {"offset", 0}, {"company_id", 1}, {"filters", {{"vehicle_id", 0}}}}, CompanyID::Invalid());
 	REQUIRE(known.has_value());
 	CHECK((*known)["ok"] == true);
+}
+
+TEST_CASE("agent_game_tools: the page of a query is bounded and the applied page is reported")
+{
+	/* A caller cannot ask for the whole world in one answer. */
+	const std::optional<Json> clamped = DispatchGameTool("world.query", {{"kind", "vehicles"}, {"limit", 1000}, {"offset", -5}}, CompanyID::Invalid());
+	REQUIRE(clamped.has_value());
+	CHECK((*clamped)["ok"] == true);
+	CHECK((*clamped)["limit"] == 500);
+	CHECK((*clamped)["offset"] == 0);
+	CHECK((*clamped)["total"] == 0);
+	CHECK((*clamped)["has_more"] == false);
+
+	const std::optional<Json> smallest = DispatchGameTool("world.query", {{"kind", "engines"}, {"limit", 0}}, CompanyID::Invalid());
+	REQUIRE(smallest.has_value());
+	CHECK((*smallest)["limit"] == 1);
+
+	const std::optional<Json> defaulted = DispatchGameTool("world.query", {{"kind", "groups"}}, CompanyID::Invalid());
+	REQUIRE(defaulted.has_value());
+	CHECK((*defaulted)["limit"] == 100);
+	CHECK((*defaulted)["offset"] == 0);
+}
+
+TEST_CASE("agent_game_tools: the ownership scope of a query is explicit")
+{
+	/* No company named and no company of the call: every owner, and the answer says so. */
+	const std::optional<Json> all = DispatchGameTool("world.query", {{"kind", "vehicles"}}, CompanyID::Invalid());
+	REQUIRE(all.has_value());
+	CHECK((*all)["scope"]["company_id"].is_null());
+
+	/* The company of the call scopes a company scoped kind, and the scope is reported. */
+	const std::optional<Json> scoped = DispatchGameTool("world.query", {{"kind", "vehicles"}}, CompanyID(2));
+	REQUIRE(scoped.has_value());
+	CHECK((*scoped)["scope"]["company_id"] == 2);
+
+	/* `company_id: null` asks for every owner even when the call names a company. */
+	const std::optional<Json> unscoped = DispatchGameTool("world.query", {{"kind", "vehicles"}, {"company_id", nullptr}}, CompanyID(2));
+	REQUIRE(unscoped.has_value());
+	CHECK((*unscoped)["scope"]["company_id"].is_null());
+
+	/* An explicit company wins over the company of the call, in the filter and at the top level. */
+	const std::optional<Json> filtered = DispatchGameTool("world.query", {{"kind", "vehicles"}, {"filters", {{"company_id", 1}}}}, CompanyID(2));
+	REQUIRE(filtered.has_value());
+	CHECK((*filtered)["scope"]["company_id"] == 1);
+
+	/* A global kind is never scoped to a company, even when the call names one. */
+	const std::optional<Json> cargos = DispatchGameTool("world.query", {{"kind", "cargos"}}, CompanyID(2));
+	REQUIRE(cargos.has_value());
+	CHECK((*cargos)["scope"]["company_id"].is_null());
+}
+
+TEST_CASE("agent_game_tools: group and cargo filters are validated instead of ignored")
+{
+	const std::optional<Json> unknown = DispatchGameTool("world.query", {{"kind", "groups"}, {"filters", {{"in_depot", true}}}}, CompanyID::Invalid());
+	REQUIRE(unknown.has_value());
+	CHECK((*unknown)["error"] == "invalid_arguments");
+	CHECK((*unknown)["detail"]["kind"] == "groups");
+	CHECK((*unknown)["detail"]["filter"] == "in_depot");
+
+	/* A group id outside the group pool is rejected instead of wrapping onto another group. */
+	const std::optional<Json> bad_group = DispatchGameTool("world.query", {{"kind", "groups"}, {"filters", {{"group_id", 0xFF000}}}}, CompanyID::Invalid());
+	REQUIRE(bad_group.has_value());
+	CHECK((*bad_group)["error"] == "invalid_arguments");
+	CHECK((*bad_group)["detail"]["max"] == 63999);
+
+	const std::optional<Json> bad_protection = DispatchGameTool("world.query", {{"kind", "groups"}, {"filters", {{"replace_protection", "yes"}}}}, CompanyID::Invalid());
+	REQUIRE(bad_protection.has_value());
+	CHECK((*bad_protection)["error"] == "invalid_arguments");
+
+	const std::optional<Json> bad_label = DispatchGameTool("world.query", {{"kind", "cargos"}, {"filters", {{"label", "PASSENGER"}}}}, CompanyID::Invalid());
+	REQUIRE(bad_label.has_value());
+	CHECK((*bad_label)["error"] == "invalid_arguments");
+
+	const std::optional<Json> bad_freight = DispatchGameTool("world.query", {{"kind", "cargos"}, {"filters", {{"is_freight", 1}}}}, CompanyID::Invalid());
+	REQUIRE(bad_freight.has_value());
+	CHECK((*bad_freight)["error"] == "invalid_arguments");
+
+	/* An unbounded name filter is rejected, so a query cannot scan for an arbitrary pattern. */
+	const std::optional<Json> long_name = DispatchGameTool("world.query", {{"kind", "vehicles"}, {"filters", {{"name_contains", std::string(65, 'a')}}}}, CompanyID::Invalid());
+	REQUIRE(long_name.has_value());
+	CHECK((*long_name)["error"] == "invalid_arguments");
+	CHECK((*long_name)["detail"]["max_length"] == 64);
+}
+
+TEST_CASE("agent_game_tools: vehicle ids are read at their real width")
+{
+	/* 70000 is a valid vehicle id; a uint16_t conversion would silently turn it into another id. */
+	const std::optional<Json> wide = DispatchGameTool("world.query", {{"kind", "vehicles"}, {"filters", {{"vehicle_id", 70000}}}}, CompanyID::Invalid());
+	REQUIRE(wide.has_value());
+	CHECK((*wide)["ok"] == true);
+
+	const std::optional<Json> outside = DispatchGameTool("world.query", {{"kind", "vehicles"}, {"filters", {{"vehicle_id", 0xFF000}}}}, CompanyID::Invalid());
+	REQUIRE(outside.has_value());
+	CHECK((*outside)["error"] == "invalid_arguments");
+	CHECK((*outside)["detail"]["max"] == 0xFEFFF);
+}
+
+TEST_CASE("agent_game_tools: the cargo inventory reads the real cargo table when it is initialised")
+{
+	const std::optional<Json> result = DispatchGameTool("world.query", {{"kind", "cargos"}}, CompanyID::Invalid());
+	REQUIRE(result.has_value());
+	CHECK((*result)["ok"] == true);
+	CHECK((*result)["kind"] == "cargos");
+	REQUIRE((*result)["rows"].is_array());
+
+	if (!CargoSpec::Get(0)->IsValid()) {
+		/* No game initialised the cargo table in this binary; the rows can only be checked in a
+		 * real game, because the cargo names come from the language pack the game loads. */
+		WARN("the cargo table is not initialised in this test binary");
+		CHECK((*result)["total"] == 0);
+		return;
+	}
+
+	REQUIRE((*result)["total"] > 0);
+	const Json &first = (*result)["rows"].front();
+	REQUIRE(first["label"].is_string());
+	CHECK(first["label"].get<std::string>().size() == 4);
+	REQUIRE(first["name"].is_string());
+	CHECK_FALSE(first["name"].get<std::string>().empty());
+	CHECK(first["is_freight"].is_boolean());
+
+	/* The label filter selects exactly the cargo the first row described. */
+	const std::string label = first["label"].get<std::string>();
+	const std::optional<Json> by_label = DispatchGameTool("world.query", {{"kind", "cargos"}, {"filters", {{"label", label}}}}, CompanyID::Invalid());
+	REQUIRE(by_label.has_value());
+	CHECK((*by_label)["ok"] == true);
+	REQUIRE((*by_label)["total"] == 1);
+	CHECK((*by_label)["rows"].front()["label"] == label);
+	CHECK((*by_label)["rows"].front()["name"] == first["name"]);
 }

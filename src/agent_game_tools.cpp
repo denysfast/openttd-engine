@@ -11,12 +11,14 @@
 #include "agent_game_tools.h"
 
 #include "articulated_vehicles.h"
+#include "cargotype.h"
 #include "command_func.h"
 #include "company_base.h"
 #include "depot_base.h"
 #include "depot_map.h"
 #include "direction_type.h"
 #include "engine_base.h"
+#include "group.h"
 #include "group_cmd.h"
 #include "landscape_cmd.h"
 #include "map_func.h"
@@ -30,6 +32,7 @@
 #include "station_cmd.h"
 #include "station_type.h"
 #include "strings_func.h"
+#include "timer/timer_game_calendar.h"
 #include "timetable_cmd.h"
 #include "vehicle_base.h"
 #include "vehicle_cmd.h"
@@ -647,6 +650,37 @@ bool ReadDiagDirection(const Json &params, DiagDirection &dir)
 
 /* -- read-only inventory ----------------------------------------------------------------- */
 
+/** Default number of rows one `world.query` returns. */
+constexpr int64_t DEFAULT_QUERY_LIMIT = 100;
+/** Largest number of rows one `world.query` may return, so an answer stays bounded. */
+constexpr int64_t MAX_QUERY_LIMIT = 500;
+/** Longest accepted `name_contains` filter, so a query cannot scan for an unbounded pattern. */
+constexpr size_t MAX_NAME_FILTER = 64;
+/** Largest number of order summaries one vehicle row carries. */
+constexpr size_t MAX_ROW_ORDERS = 64;
+
+/**
+ * Readable name of a cargo type.
+ * @param cargo The cargo type.
+ * @return The name the game shows for the cargo, or an empty string for an invalid cargo.
+ */
+std::string CargoName(CargoType cargo)
+{
+	if (!IsValidCargoType(cargo)) return {};
+	return GetString(CargoSpec::Get(cargo)->name);
+}
+
+/**
+ * Readable four character label of a cargo type.
+ * @param cargo The cargo type.
+ * @return The label the game shows, or an empty string for an invalid cargo.
+ */
+std::string CargoLabelText(CargoType cargo)
+{
+	if (!IsValidCargoType(cargo)) return {};
+	return CargoSpec::Get(cargo)->label.AsString();
+}
+
 /**
  * Map the state of a vehicle onto the protocol name.
  * @param v The vehicle.
@@ -758,6 +792,8 @@ Json VehicleCargoJson(const Vehicle *v)
 {
 	Json cargo = Json::object();
 	cargo["type"] = static_cast<uint8_t>(v->cargo_type);
+	cargo["label"] = IsValidCargoType(v->cargo_type) ? Json(CargoLabelText(v->cargo_type)) : Json(nullptr);
+	cargo["name"] = IsValidCargoType(v->cargo_type) ? Json(CargoName(v->cargo_type)) : Json(nullptr);
 	cargo["subtype"] = v->cargo_subtype;
 	cargo["load"] = v->cargo.TotalCount();
 	cargo["capacity"] = v->cargo_cap;
@@ -803,6 +839,66 @@ Json CurrentOrderJson(const Vehicle *v)
 }
 
 /**
+ * Serialise the destination of a goto order as a typed reference.
+ * @param order The order.
+ * @return Reference to the station, waypoint or depot, or null for other orders.
+ */
+Json OrderDestinationRef(const Order *order)
+{
+	if (order->IsType(OT_GOTO_STATION)) {
+		const Station *st = Station::GetIfValid(order->GetDestination().ToStationID());
+		return st == nullptr ? Json(nullptr) : PoolRef("station", st);
+	}
+	if (order->IsType(OT_GOTO_WAYPOINT)) {
+		const Waypoint *wp = Waypoint::GetIfValid(order->GetDestination().ToStationID());
+		return wp == nullptr ? Json(nullptr) : PoolRef("waypoint", wp);
+	}
+	if (order->IsType(OT_GOTO_DEPOT)) {
+		const Depot *depot = Depot::GetIfValid(order->GetDestination().ToDepotID());
+		return depot == nullptr ? Json(nullptr) : PoolRef("depot", depot);
+	}
+	return Json(nullptr);
+}
+
+/**
+ * Readable name of the destination of a goto order.
+ * @param order The order.
+ * @return The name the game shows, or an empty string when the order has no named destination.
+ */
+std::string OrderDestinationName(const Order *order)
+{
+	if (order->IsType(OT_GOTO_STATION)) {
+		const Station *st = Station::GetIfValid(order->GetDestination().ToStationID());
+		return st == nullptr ? std::string{} : st->GetCachedName();
+	}
+	if (order->IsType(OT_GOTO_WAYPOINT)) {
+		const Waypoint *wp = Waypoint::GetIfValid(order->GetDestination().ToStationID());
+		return wp == nullptr ? std::string{} : wp->GetCachedName();
+	}
+	return {};
+}
+
+/**
+ * Serialise one order of a vehicle compactly, for the order list of a vehicle row.
+ * @param index Index of the order in the order list.
+ * @param order The order.
+ * @return JSON object with the index, the type and the destination.
+ */
+Json OrderSummaryJson(VehicleOrderID index, const Order *order)
+{
+	const bool has_destination = order->IsType(OT_GOTO_STATION) || order->IsType(OT_GOTO_WAYPOINT) || order->IsType(OT_GOTO_DEPOT);
+	const std::string name = OrderDestinationName(order);
+
+	Json summary = Json::object();
+	summary["index"] = index;
+	summary["type"] = std::string(OrderTypeName(order->GetType()));
+	summary["destination_id"] = has_destination ? Json(order->GetDestination().base()) : Json(nullptr);
+	summary["destination_ref"] = OrderDestinationRef(order);
+	summary["destination_name"] = name.empty() ? Json(nullptr) : Json(name);
+	return summary;
+}
+
+/**
  * Serialise one vehicle.
  * @param v The vehicle.
  * @return JSON row with the current state of the vehicle.
@@ -819,6 +915,7 @@ Json VehicleRow(const Vehicle *v)
 	row["engine_id"] = v->engine_type.base();
 	const Engine *engine = Engine::GetIfValid(v->engine_type);
 	if (engine != nullptr) row["engine_ref"] = PoolRef("engine", engine);
+	row["engine_name"] = engine != nullptr ? Json(engine->name) : Json(nullptr);
 	row["tile"] = TileJson(v->tile);
 	row["status"] = std::string(VehicleStatusName(v));
 	row["stopped"] = v->vehstatus.Test(VehState::Stopped);
@@ -835,8 +932,24 @@ Json VehicleRow(const Vehicle *v)
 	row["profit_this_year"] = static_cast<int64_t>(v->GetDisplayProfitThisYear());
 	row["profit_last_year"] = static_cast<int64_t>(v->GetDisplayProfitLastYear());
 	row["value"] = static_cast<int64_t>(v->value);
-	row["group_id"] = v->group_id == GroupID::Invalid() ? Json(nullptr) : Json(v->group_id.base());
+	row["running_cost"] = static_cast<int64_t>(v->GetRunningCost());
+	row["halted_in_depot"] = v->vehstatus.Test(VehState::Stopped) && v->IsStoppedInDepot();
+
+	const Group *group = Group::GetIfValid(v->group_id);
+	row["group_id"] = group != nullptr ? Json(v->group_id.base()) : Json(nullptr);
+	row["group_ref"] = group != nullptr ? PoolRef("group", group) : Json(nullptr);
+	row["group_name"] = group != nullptr ? Json(group->name) : Json(nullptr);
+
+	const Depot *depot = v->IsStoppedInDepot() ? Depot::GetByTile(v->tile) : nullptr;
+	row["depot_ref"] = depot != nullptr ? PoolRef("depot", depot) : Json(nullptr);
+
 	row["orders"] = v->GetNumOrders();
+	row["current_orders"] = Json::array();
+	for (VehicleOrderID index = 0; index < v->GetNumOrders() && index < static_cast<VehicleOrderID>(MAX_ROW_ORDERS); index++) {
+		const Order *order = v->GetOrder(index);
+		if (order != nullptr) row["current_orders"].push_back(OrderSummaryJson(index, order));
+	}
+	row["current_orders_truncated"] = v->GetNumOrders() > static_cast<VehicleOrderID>(MAX_ROW_ORDERS);
 	row["cargo"] = VehicleCargoJson(v);
 	row["current_order"] = CurrentOrderJson(v);
 	row["last_station_id"] = v->last_station_visited == StationID::Invalid() ? Json(nullptr) : Json(v->last_station_visited.base());
@@ -861,11 +974,18 @@ Json EngineRow(const Engine *e, CompanyID company)
 	row["running_cost"] = static_cast<int64_t>(e->GetRunningCost());
 	row["max_speed"] = e->GetDisplayMaxSpeed();
 	row["cargo_id"] = static_cast<uint8_t>(e->GetDefaultCargoType());
+	row["cargo_label"] = IsValidCargoType(e->GetDefaultCargoType()) ? Json(CargoLabelText(e->GetDefaultCargoType())) : Json(nullptr);
+	row["cargo_name"] = IsValidCargoType(e->GetDefaultCargoType()) ? Json(CargoName(e->GetDefaultCargoType())) : Json(nullptr);
 	row["capacity"] = e->GetDisplayDefaultCapacity();
 	row["refittable"] = e->info.refit_mask.Any();
 	row["refit_cargo_ids"] = Json::array();
-	for (const CargoType cargo : e->info.refit_mask) row["refit_cargo_ids"].push_back(static_cast<uint8_t>(cargo));
+	row["refit_cargo_names"] = Json::array();
+	for (const CargoType cargo : e->info.refit_mask) {
+		row["refit_cargo_ids"].push_back(static_cast<uint8_t>(cargo));
+		row["refit_cargo_names"].push_back(CargoName(cargo));
+	}
 	row["intro_date"] = e->intro_date.base();
+	row["intro_year"] = TimerGameCalendar::ConvertDateToYMD(e->intro_date).year.base();
 	row["life_length_days"] = e->GetLifeLengthInDays().base();
 	row["reliability"] = e->reliability;
 	row["enabled"] = e->IsEnabled();
@@ -876,28 +996,6 @@ Json EngineRow(const Engine *e, CompanyID company)
 	}
 	if (company != CompanyID::Invalid()) row["available"] = e->company_avail.Test(company);
 	return row;
-}
-
-/**
- * Serialise the destination of a goto order as a typed reference.
- * @param order The order.
- * @return Reference to the station, waypoint or depot, or null for other orders.
- */
-Json OrderDestinationRef(const Order *order)
-{
-	if (order->IsType(OT_GOTO_STATION)) {
-		const Station *st = Station::GetIfValid(order->GetDestination().ToStationID());
-		return st == nullptr ? Json(nullptr) : PoolRef("station", st);
-	}
-	if (order->IsType(OT_GOTO_WAYPOINT)) {
-		const Waypoint *wp = Waypoint::GetIfValid(order->GetDestination().ToStationID());
-		return wp == nullptr ? Json(nullptr) : PoolRef("waypoint", wp);
-	}
-	if (order->IsType(OT_GOTO_DEPOT)) {
-		const Depot *depot = Depot::GetIfValid(order->GetDestination().ToDepotID());
-		return depot == nullptr ? Json(nullptr) : PoolRef("depot", depot);
-	}
-	return Json(nullptr);
 }
 
 /**
@@ -921,9 +1019,11 @@ Json OrderRow(const Vehicle *v, VehicleOrderID index, const Order *order)
 		row["destination_id"] = nullptr;
 		row["destination_ref"] = nullptr;
 	}
+	row["destination_name"] = order->IsType(OT_GOTO_STATION) || order->IsType(OT_GOTO_WAYPOINT) || order->IsType(OT_GOTO_DEPOT) ? Json(OrderDestinationName(order)) : Json(nullptr);
 	row["load"] = std::string(LoadTypeName(order->GetLoadType()));
 	row["unload"] = std::string(UnloadTypeName(order->GetUnloadType()));
 	row["refit_cargo_id"] = order->IsRefit() ? Json(static_cast<uint8_t>(order->GetRefitCargo())) : Json(nullptr);
+	row["refit_cargo_name"] = order->IsRefit() ? Json(CargoName(order->GetRefitCargo())) : Json(nullptr);
 	row["wait_time"] = order->GetWaitTime();
 	row["travel_time"] = order->GetTravelTime();
 	row["max_speed"] = order->GetMaxSpeed();
@@ -937,16 +1037,46 @@ Json OrderRow(const Vehicle *v, VehicleOrderID index, const Order *order)
 
 /** Filters of a `world.query` call, already validated. */
 struct QueryFilters {
-	CompanyID company = CompanyID::Invalid(); ///< Restrict to one company.
+	CompanyID company = CompanyID::Invalid(); ///< Restrict to one company, or an invalid company for every owner.
+	bool company_explicit = false; ///< The caller named the company, so the company of the call must not be used.
 	std::optional<VehicleType> vehicle_type; ///< Restrict to one vehicle type.
 	VehicleID vehicle_id = VehicleID::Invalid(); ///< Restrict to one vehicle.
 	EngineID engine_id = EngineID::Invalid(); ///< Restrict to one engine model.
+	GroupID group_id = GroupID::Invalid(); ///< Restrict to one group.
 	CargoType cargo = INVALID_CARGO; ///< Restrict to vehicles carrying this cargo, or engines that can carry it.
 	std::string name_contains; ///< Restrict to names containing this text.
+	std::string label; ///< Restrict to the cargo with this four character label.
 	std::optional<bool> in_depot; ///< Restrict to vehicles inside or outside a depot.
 	std::optional<bool> stopped; ///< Restrict to stopped or running vehicles.
 	std::optional<bool> refittable; ///< Restrict to refittable or non-refittable engines.
+	std::optional<bool> replace_protection; ///< Restrict to groups with or without replace protection.
+	std::optional<bool> is_freight; ///< Restrict to freight or non-freight cargoes.
 };
+
+/**
+ * Read a pool id value without narrowing it to a type smaller than the pool uses.
+ *
+ * @tparam Tpool The pool id type.
+ * @param value JSON value holding the id.
+ * @param key Parameter name, used in the error message.
+ * @param id Receives the id.
+ * @return Error result, or an empty optional when the value is an id of that pool.
+ */
+template <typename Tpool>
+std::optional<Json> ReadPoolId(const Json &value, std::string_view key, Tpool &id)
+{
+	using Tbase = typename Tpool::BaseType;
+	if (!value.is_number_integer()) return MakeError("invalid_arguments", std::string(key) + " must be an integer");
+	const int64_t raw = value.get<int64_t>();
+	if (raw < 0 || raw >= static_cast<int64_t>(Tpool::End().base())) {
+		Json detail = Json::object();
+		detail[std::string(key)] = raw;
+		detail["max"] = static_cast<int64_t>(Tpool::End().base()) - 1;
+		return MakeError("invalid_arguments", std::string(key) + " is outside its pool", std::move(detail));
+	}
+	id = Tpool(static_cast<Tbase>(raw));
+	return std::nullopt;
+}
 
 /**
  * Read a company id value without truncating it to the width of a company id.
@@ -1011,7 +1141,14 @@ std::optional<Json> ReadQueryFilters(const Json &params, std::string_view kind, 
 		}
 
 		if (key == "company_id") {
-			if (const std::optional<Json> error = ReadCompanyIdValue(value, filters.company); error.has_value()) return error;
+			/* A null company explicitly asks for every owner, including objects without one. */
+			if (value.is_null()) {
+				filters.company = CompanyID::Invalid();
+				filters.company_explicit = true;
+			} else {
+				if (const std::optional<Json> error = ReadCompanyIdValue(value, filters.company); error.has_value()) return error;
+				filters.company_explicit = true;
+			}
 		} else if (key == "vehicle_type") {
 			if (!value.is_string()) return MakeError("invalid_arguments", "filters.vehicle_type must be a string");
 			const std::string name = value.get<std::string>();
@@ -1027,11 +1164,11 @@ std::optional<Json> ReadQueryFilters(const Json &params, std::string_view kind, 
 				return MakeError("invalid_arguments", "filters.vehicle_type must be one of train, road, ship, aircraft");
 			}
 		} else if (key == "vehicle_id") {
-			if (!value.is_number_integer()) return MakeError("invalid_arguments", "filters.vehicle_id must be an integer");
-			filters.vehicle_id = VehicleID(static_cast<uint32_t>(value.get<int64_t>()));
+			if (const std::optional<Json> error = ReadPoolId(value, "filters.vehicle_id", filters.vehicle_id); error.has_value()) return error;
 		} else if (key == "engine_id") {
-			if (!value.is_number_integer()) return MakeError("invalid_arguments", "filters.engine_id must be an integer");
-			filters.engine_id = EngineID(static_cast<uint16_t>(value.get<int64_t>()));
+			if (const std::optional<Json> error = ReadPoolId(value, "filters.engine_id", filters.engine_id); error.has_value()) return error;
+		} else if (key == "group_id") {
+			if (const std::optional<Json> error = ReadPoolId(value, "filters.group_id", filters.group_id); error.has_value()) return error;
 		} else if (key == "cargo_id") {
 			if (!value.is_number_integer()) return MakeError("invalid_arguments", "filters.cargo_id must be an integer");
 			const int64_t cargo_id = value.get<int64_t>();
@@ -1045,6 +1182,16 @@ std::optional<Json> ReadQueryFilters(const Json &params, std::string_view kind, 
 		} else if (key == "name_contains") {
 			if (!value.is_string()) return MakeError("invalid_arguments", "filters.name_contains must be a string");
 			filters.name_contains = value.get<std::string>();
+			if (filters.name_contains.size() > MAX_NAME_FILTER) {
+				Json detail = Json::object();
+				detail["max_length"] = MAX_NAME_FILTER;
+				detail["length"] = filters.name_contains.size();
+				return MakeError("invalid_arguments", "filters.name_contains is too long", std::move(detail));
+			}
+		} else if (key == "label") {
+			if (!value.is_string()) return MakeError("invalid_arguments", "filters.label must be a string");
+			filters.label = value.get<std::string>();
+			if (filters.label.empty() || filters.label.size() > 4) return MakeError("invalid_arguments", "filters.label must be one to four characters");
 		} else if (key == "in_depot") {
 			if (!value.is_boolean()) return MakeError("invalid_arguments", "filters.in_depot must be a boolean");
 			filters.in_depot = value.get<bool>();
@@ -1054,6 +1201,12 @@ std::optional<Json> ReadQueryFilters(const Json &params, std::string_view kind, 
 		} else if (key == "refittable") {
 			if (!value.is_boolean()) return MakeError("invalid_arguments", "filters.refittable must be a boolean");
 			filters.refittable = value.get<bool>();
+		} else if (key == "replace_protection") {
+			if (!value.is_boolean()) return MakeError("invalid_arguments", "filters.replace_protection must be a boolean");
+			filters.replace_protection = value.get<bool>();
+		} else if (key == "is_freight") {
+			if (!value.is_boolean()) return MakeError("invalid_arguments", "filters.is_freight must be a boolean");
+			filters.is_freight = value.get<bool>();
 		}
 	}
 	return std::nullopt;
@@ -1062,31 +1215,64 @@ std::optional<Json> ReadQueryFilters(const Json &params, std::string_view kind, 
 /**
  * Read the pagination and company parameters shared by every query kind.
  *
- * A top-level `company_id` wins over `filters.company_id`, and the company of the call is used
- * when neither is given.
+ * A top-level `company_id` wins over `filters.company_id`. `company_id: null` asks for every
+ * owner, including objects that have none. When the caller names no company, a company scoped
+ * kind is answered for the company of the call, and the scope is reported in the result, so a
+ * default is never silent. The page is bounded: `limit` is clamped to
+ * [#DEFAULT_QUERY_LIMIT] .. [#MAX_QUERY_LIMIT] and `offset` is never negative.
  *
  * @param params Method parameters.
  * @param company Company of the call.
+ * @param company_scoped Whether the kind answers for one company and may fall back to it.
  * @param filters Receives the company filter.
  * @param limit Receives the row limit.
  * @param offset Receives the row offset.
  * @return Error result, or an empty optional when the parameters are usable.
  */
-std::optional<Json> ReadQueryPaging(const Json &params, CompanyID company, QueryFilters &filters, int64_t &limit, int64_t &offset)
+std::optional<Json> ReadQueryPaging(const Json &params, CompanyID company, bool company_scoped, QueryFilters &filters, int64_t &limit, int64_t &offset)
 {
-	limit = 100;
+	limit = DEFAULT_QUERY_LIMIT;
 	offset = 0;
 	if (!ReadOptionalInt(params, "limit", limit)) return MakeError("invalid_arguments", "limit must be an integer");
 	if (!ReadOptionalInt(params, "offset", offset)) return MakeError("invalid_arguments", "offset must be an integer");
-	if (limit < 1) limit = 1;
-	if (offset < 0) offset = 0;
+	limit = Clamp<int64_t>(limit, 1, MAX_QUERY_LIMIT);
+	offset = std::max<int64_t>(offset, 0);
 
 	const auto company_param = params.find("company_id");
 	if (company_param != params.end()) {
-		if (const std::optional<Json> error = ReadCompanyIdValue(*company_param, filters.company); error.has_value()) return error;
+		if (company_param->is_null()) {
+			filters.company = CompanyID::Invalid();
+			filters.company_explicit = true;
+		} else {
+			if (const std::optional<Json> error = ReadCompanyIdValue(*company_param, filters.company); error.has_value()) return error;
+			filters.company_explicit = true;
+		}
 	}
-	if (filters.company == CompanyID::Invalid()) filters.company = company;
+	if (!filters.company_explicit && company_scoped) filters.company = company;
 	return std::nullopt;
+}
+
+/**
+ * Add the page and the ownership scope a query was answered with.
+ *
+ * The agent has to be able to tell an empty answer from a page of a longer answer, and has to see
+ * which owner the rows were filtered to, so both are part of every query result.
+ *
+ * @param result Result to extend.
+ * @param filters The filters that were applied.
+ * @param total Number of matching rows before pagination.
+ * @param limit The row limit that was applied.
+ * @param offset The row offset that was applied.
+ * @param returned Number of rows in this answer.
+ */
+void AddQueryMeta(Json &result, const QueryFilters &filters, int64_t total, int64_t limit, int64_t offset, size_t returned)
+{
+	result["total"] = total;
+	result["limit"] = limit;
+	result["offset"] = offset;
+	result["has_more"] = offset + static_cast<int64_t>(returned) < total;
+	result["scope"] = Json::object();
+	result["scope"]["company_id"] = filters.company == CompanyID::Invalid() ? Json(nullptr) : Json(filters.company.base());
 }
 
 /**
@@ -1099,11 +1285,11 @@ Json QueryVehicles(const Json &params, CompanyID company)
 {
 	QueryFilters filters;
 	if (const std::optional<Json> error = ReadQueryFilters(params, "vehicles",
-			{"company_id", "vehicle_type", "vehicle_id", "cargo_id", "name_contains", "in_depot", "stopped"}, filters); error.has_value()) return *error;
+			{"company_id", "vehicle_type", "vehicle_id", "group_id", "cargo_id", "name_contains", "in_depot", "stopped"}, filters); error.has_value()) return *error;
 
 	int64_t limit = 0;
 	int64_t offset = 0;
-	if (const std::optional<Json> error = ReadQueryPaging(params, company, filters, limit, offset); error.has_value()) return *error;
+	if (const std::optional<Json> error = ReadQueryPaging(params, company, true, filters, limit, offset); error.has_value()) return *error;
 
 	Json rows = Json::array();
 	int64_t total = 0;
@@ -1111,6 +1297,7 @@ Json QueryVehicles(const Json &params, CompanyID company)
 		if (filters.company != CompanyID::Invalid() && v->owner != filters.company) continue;
 		if (filters.vehicle_type.has_value() && v->type != *filters.vehicle_type) continue;
 		if (filters.vehicle_id != VehicleID::Invalid() && v->index != filters.vehicle_id) continue;
+		if (filters.group_id != GroupID::Invalid() && v->group_id != filters.group_id) continue;
 		if (IsValidCargoType(filters.cargo) && v->cargo_type != filters.cargo) continue;
 		if (!filters.name_contains.empty() && v->name.find(filters.name_contains) == std::string::npos) continue;
 		if (filters.in_depot.has_value() && v->IsStoppedInDepot() != *filters.in_depot) continue;
@@ -1124,7 +1311,7 @@ Json QueryVehicles(const Json &params, CompanyID company)
 	result["ok"] = true;
 	result["kind"] = "vehicles";
 	result["rows"] = std::move(rows);
-	result["total"] = total;
+	AddQueryMeta(result, filters, total, limit, offset, result["rows"].size());
 	return result;
 }
 
@@ -1142,7 +1329,9 @@ Json QueryEngines(const Json &params, CompanyID company)
 
 	int64_t limit = 0;
 	int64_t offset = 0;
-	if (const std::optional<Json> error = ReadQueryPaging(params, company, filters, limit, offset); error.has_value()) return *error;
+	/* Engines belong to no company, so the company only selects whose availability is reported. */
+	if (const std::optional<Json> error = ReadQueryPaging(params, company, false, filters, limit, offset); error.has_value()) return *error;
+	const CompanyID availability = filters.company_explicit ? filters.company : company;
 
 	Json rows = Json::array();
 	int64_t total = 0;
@@ -1154,14 +1343,14 @@ Json QueryEngines(const Json &params, CompanyID company)
 		if (filters.refittable.has_value() && e->info.refit_mask.Any() != *filters.refittable) continue;
 		if (total++ < offset) continue;
 		if (static_cast<int64_t>(rows.size()) >= limit) continue;
-		rows.push_back(EngineRow(e, filters.company));
+		rows.push_back(EngineRow(e, availability));
 	}
 
 	Json result = Json::object();
 	result["ok"] = true;
 	result["kind"] = "engines";
 	result["rows"] = std::move(rows);
-	result["total"] = total;
+	AddQueryMeta(result, filters, total, limit, offset, result["rows"].size());
 	return result;
 }
 
@@ -1179,7 +1368,7 @@ Json QueryOrders(const Json &params, CompanyID company)
 
 	int64_t limit = 0;
 	int64_t offset = 0;
-	if (const std::optional<Json> error = ReadQueryPaging(params, company, filters, limit, offset); error.has_value()) return *error;
+	if (const std::optional<Json> error = ReadQueryPaging(params, company, true, filters, limit, offset); error.has_value()) return *error;
 
 	Json rows = Json::array();
 	int64_t total = 0;
@@ -1200,7 +1389,128 @@ Json QueryOrders(const Json &params, CompanyID company)
 	result["ok"] = true;
 	result["kind"] = "orders";
 	result["rows"] = std::move(rows);
-	result["total"] = total;
+	AddQueryMeta(result, filters, total, limit, offset, result["rows"].size());
+	return result;
+}
+
+/**
+ * Serialise one group.
+ * @param g The group.
+ * @return JSON row with the group, its parent and its statistics.
+ */
+Json GroupRow(const Group *g)
+{
+	Json row = Json::object();
+	row["ref"] = PoolRef("group", g);
+	row["id"] = g->index.base();
+	row["name"] = g->name;
+	row["owner"] = g->owner.base();
+	row["vehicle_type"] = std::string(VehicleTypeName(g->vehicle_type));
+	row["number"] = g->number;
+	row["replace_protection"] = g->flags.Test(GroupFlag::ReplaceProtection);
+
+	const Group *parent = Group::GetIfValid(g->parent);
+	row["parent_id"] = parent != nullptr ? Json(g->parent.base()) : Json(nullptr);
+	row["parent_ref"] = parent != nullptr ? PoolRef("group", parent) : Json(nullptr);
+
+	row["num_vehicles"] = g->statistics.num_vehicle;
+	row["profit_last_year"] = static_cast<int64_t>(g->statistics.profit_last_year);
+	row["num_engines"] = Json::object();
+	for (const auto &[engine, count] : g->statistics.num_engines) row["num_engines"][fmt::format("{}", engine.base())] = count;
+	return row;
+}
+
+/**
+ * Read the group inventory.
+ * @param params Method parameters: `limit`, `offset`, `company_id`, `filters`.
+ * @param company Company of the call, used when no company filter is given.
+ * @return Tool result with the matching rows and the total count.
+ */
+Json QueryGroups(const Json &params, CompanyID company)
+{
+	QueryFilters filters;
+	if (const std::optional<Json> error = ReadQueryFilters(params, "groups",
+			{"company_id", "group_id", "vehicle_type", "name_contains", "replace_protection"}, filters); error.has_value()) return *error;
+
+	int64_t limit = 0;
+	int64_t offset = 0;
+	if (const std::optional<Json> error = ReadQueryPaging(params, company, true, filters, limit, offset); error.has_value()) return *error;
+
+	Json rows = Json::array();
+	int64_t total = 0;
+	for (const Group *g : Group::Iterate()) {
+		if (filters.company != CompanyID::Invalid() && g->owner != filters.company) continue;
+		if (filters.group_id != GroupID::Invalid() && g->index != filters.group_id) continue;
+		if (filters.vehicle_type.has_value() && g->vehicle_type != *filters.vehicle_type) continue;
+		if (!filters.name_contains.empty() && g->name.find(filters.name_contains) == std::string::npos) continue;
+		if (filters.replace_protection.has_value() && g->flags.Test(GroupFlag::ReplaceProtection) != *filters.replace_protection) continue;
+		if (total++ < offset) continue;
+		if (static_cast<int64_t>(rows.size()) >= limit) continue;
+		rows.push_back(GroupRow(g));
+	}
+
+	Json result = Json::object();
+	result["ok"] = true;
+	result["kind"] = "groups";
+	result["rows"] = std::move(rows);
+	AddQueryMeta(result, filters, total, limit, offset, result["rows"].size());
+	return result;
+}
+
+/**
+ * Serialise one cargo type.
+ * @param cs The cargo specification.
+ * @return JSON row with the id, the label and the values the game shows.
+ */
+Json CargoRow(const CargoSpec *cs)
+{
+	Json row = Json::object();
+	row["id"] = static_cast<uint8_t>(cs->Index());
+	row["label"] = cs->label.AsString();
+	row["name"] = GetString(cs->name);
+	row["abbrev"] = GetString(cs->abbrev);
+	row["is_freight"] = cs->is_freight;
+	row["weight"] = cs->weight;
+	row["payment"] = static_cast<int64_t>(cs->current_payment);
+	return row;
+}
+
+/**
+ * Read the cargo inventory.
+ *
+ * Cargoes belong to no company, so `company_id` is accepted but does not filter them.
+ *
+ * @param params Method parameters: `limit`, `offset`, `filters`.
+ * @param company Company of the call.
+ * @return Tool result with the matching rows and the total count.
+ */
+Json QueryCargos(const Json &params, CompanyID company)
+{
+	QueryFilters filters;
+	if (const std::optional<Json> error = ReadQueryFilters(params, "cargos",
+			{"cargo_id", "label", "name_contains", "is_freight"}, filters); error.has_value()) return *error;
+
+	int64_t limit = 0;
+	int64_t offset = 0;
+	if (const std::optional<Json> error = ReadQueryPaging(params, company, false, filters, limit, offset); error.has_value()) return *error;
+
+	Json rows = Json::array();
+	int64_t total = 0;
+	for (const CargoSpec *cs : CargoSpec::Iterate()) {
+		if (filters.cargo != INVALID_CARGO && cs->Index() != filters.cargo) continue;
+		if (!filters.label.empty() && cs->label.AsString() != filters.label) continue;
+		if (!filters.name_contains.empty() && GetString(cs->name).find(filters.name_contains) == std::string::npos) continue;
+		if (filters.is_freight.has_value() && cs->is_freight != *filters.is_freight) continue;
+		if (total++ < offset) continue;
+		if (static_cast<int64_t>(rows.size()) >= limit) continue;
+		rows.push_back(CargoRow(cs));
+	}
+
+	Json result = Json::object();
+	result["ok"] = true;
+	result["kind"] = "cargos";
+	result["rows"] = std::move(rows);
+	AddQueryMeta(result, filters, total, limit, offset, result["rows"].size());
 	return result;
 }
 
@@ -2442,6 +2752,8 @@ std::string_view CanonicalQueryKind(std::string_view kind)
 	if (kind == "vehicles" || kind == "vehicle") return "vehicles";
 	if (kind == "engines" || kind == "engine") return "engines";
 	if (kind == "orders" || kind == "order") return "orders";
+	if (kind == "groups" || kind == "group") return "groups";
+	if (kind == "cargos" || kind == "cargo") return "cargos";
 	return {};
 }
 
@@ -2462,7 +2774,9 @@ std::optional<Json> DispatchQuery(const Json &params, CompanyID company)
 	if (const std::optional<Json> error = CheckKnownParams(params, "world.query", kind, {"filters", "limit", "offset"}); error.has_value()) return error;
 	if (canonical == "vehicles") return QueryVehicles(params, company);
 	if (canonical == "engines") return QueryEngines(params, company);
-	return QueryOrders(params, company);
+	if (canonical == "orders") return QueryOrders(params, company);
+	if (canonical == "groups") return QueryGroups(params, company);
+	return QueryCargos(params, company);
 }
 
 /**
@@ -2602,8 +2916,8 @@ Json GameToolCapabilities()
 {
 	Json methods = Json::array();
 	methods.push_back(Capability("world.query", "read",
-			{"vehicles", "engines", "orders"},
-			{"towns", "companies", "tiles", "stations", "industries", "cargos", "settings", "groups", "waypoints", "signs", "houses", "depots", "finances"}));
+			{"vehicles", "engines", "orders", "groups", "cargos"},
+			{"towns", "companies", "tiles", "stations", "industries", "settings", "waypoints", "signs", "houses", "depots", "finances"}));
 	methods.push_back(Capability("world.construct", "write",
 			{"road", "tram", "station", "depot", "demolish"},
 			{"rail", "signal", "airport", "dock", "bridge", "tunnel", "canal", "terraform"}));
@@ -2618,8 +2932,8 @@ Json GameToolCapabilities()
 	/* The exact `world.query` kind spellings this module answers, so the bridge can map a
 	 * canonical name onto them without guessing. */
 	Json aliases = Json::object();
-	for (const std::string_view kind : {"vehicles", "engines", "orders"}) aliases[std::string(kind)] = std::string(kind);
-	for (const std::string_view kind : {"vehicle", "engine", "order"}) aliases[std::string(kind)] = std::string(CanonicalQueryKind(kind));
+	for (const std::string_view kind : {"vehicles", "engines", "orders", "groups", "cargos"}) aliases[std::string(kind)] = std::string(kind);
+	for (const std::string_view kind : {"vehicle", "engine", "order", "group", "cargo"}) aliases[std::string(kind)] = std::string(CanonicalQueryKind(kind));
 
 	result["module"] = "agent_game_tools";
 	result["methods"] = std::move(methods);
@@ -2638,7 +2952,12 @@ Json GameToolCapabilities()
 		"world.vehicles op=clone needs a depot tile of the company (`depot_id`, `tile`, or the source vehicle's own tile when it stands in a depot), checks the owner and the engine availability before posting, and reports the created vehicle ids and the cost the engine charged; a `dry_run` clone cost is an estimate, because the command is flagged NoTest.",
 		"world.vehicles and world.orders accept `dry_run`, which only queries the cost and reports `estimated: true`.",
 		"world.orders op=timetable validates every entry against the current order list before the first command, and reads the stored timetable back.",
-		"world.query kind=vehicles/engines/orders is read-only inventory with validated filters; the other kinds are left to the other modules.",
+		"world.query kind=vehicles/engines/orders/groups/cargos is read-only inventory with validated filters; the other kinds are left to the other modules.",
+		"world.query rows carry the readable values the game shows next to the raw ids: cargo `label`/`name`, engine `name`, group `name`, order `destination_name`, and `refit_cargo_name`.",
+		"world.query never writes to the world and never uses a private counter: every value is read through the engine's own accessors, so the agent can verify a command's effect against the next read.",
+		"world.query pages are bounded: `limit` is clamped to 1..500 (default 100), `offset` is never negative, and the result reports `total`, `limit`, `offset` and `has_more`.",
+		"world.query ownership is explicit: `company_id` filters a company scoped kind, `company_id: null` asks for every owner, and the scope that was applied is reported in `scope.company_id`.",
+		"A vehicle row carries its order list compactly (`current_orders`, at most 64 entries, with `current_orders_truncated`), its group and depot references and the running cost, so the fleet can be audited without a second query.",
 	});
 	return result;
 }
