@@ -29,7 +29,7 @@ class ScreenshotProvider_Png : public ScreenshotProvider {
 public:
 	ScreenshotProvider_Png() : ScreenshotProvider("png", "PNG", 0) {}
 
-	bool MakeImage(std::string_view name, const ScreenshotCallback &callb, uint w, uint h, int pixelformat, const Colour *palette) const override
+	bool MakeImage(std::string_view name, const ScreenshotCallback &callb, uint w, uint h, int pixelformat, const Colour *palette, uint compression) const override
 	{
 		png_color rq[256];
 		uint i, y, n;
@@ -65,6 +65,11 @@ public:
 		png_init_io(png_ptr, f);
 
 		png_set_filter(png_ptr, 0, PNG_FILTER_NONE);
+
+		/* The effort is the caller's choice: a player's screenshot keeps the historical default, while a
+		 * caller with a time budget of its own (the agent capture) can ask for a faster, larger file. The
+		 * pixels, the palette and the metadata are identical either way; only the encoded bytes differ. */
+		png_set_compression_level(png_ptr, static_cast<int>(ClampScreenshotCompression(compression)));
 
 		png_set_IHDR(png_ptr, info_ptr, w, h, 8, pixelformat == 8 ? PNG_COLOR_TYPE_PALETTE : PNG_COLOR_TYPE_RGB,
 			PNG_INTERLACE_NONE, PNG_COMPRESSION_TYPE_DEFAULT, PNG_FILTER_TYPE_DEFAULT);

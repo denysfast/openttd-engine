@@ -21,10 +21,24 @@ namespace InGameAgent {
 using Json = nlohmann::json;
 
 /**
+ * Compression level the agent capture asks of the PNG provider.
+ *
+ * A capture is encoded on the draw tick inside one deferred slice that the plan bounds by 16 ms,
+ * while the video buffer and the game state are locked, so the encoder is on the game's critical
+ * path. Level 1 is lossless: the pixels, the palette, the metadata and the hash algorithm are the
+ * same as for a player's screenshot, only the encode is much cheaper and the file larger. A player's
+ * own screenshot keeps the provider default (SCREENSHOT_COMPRESSION_DEFAULT).
+ */
+inline constexpr uint CAPTURE_PNG_COMPRESSION = 1;
+
+/**
  * Capture the frame that the game is currently showing and return it as a PNG.
  *
  * The pixels are produced by the game's own renderers and encoded with the regular PNG
- * screenshot provider; nothing is synthesised. The screen modes copy the live screen buffer,
+ * screenshot provider at its fastest lossless level (CAPTURE_PNG_COMPRESSION): the pixels, the
+ * palette, the metadata and the hash algorithm are the same as for a player's screenshot, the
+ * encode is cheaper and the file larger; nothing is synthesised. The screen modes copy the live
+ * screen buffer,
  * and before that copy the dirty blocks are redrawn, exactly like a viewport screenshot does,
  * so a capture requested after a command shows the state that command produced instead of the
  * frame from before it. The image is written to a private temporary directory, read back, and

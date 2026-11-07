@@ -637,7 +637,8 @@ Json CaptureGameFrame(const Json &params)
 		return result;
 	}
 
-	/* Use the regular PNG screenshot provider, so the encoding is the same as a normal screenshot. */
+	/* Use the regular PNG screenshot provider, so the encoding is the same as a normal screenshot;
+	 * only the compression effort differs, because this encode runs inside the deferred slice. */
 	const ScreenshotProvider *provider = nullptr;
 	for (const ScreenshotProvider *candidate : ProviderManager<ScreenshotProvider>::GetProviders()) {
 		if (candidate->GetName() == "png") {
@@ -675,7 +676,7 @@ Json CaptureGameFrame(const Json &params)
 
 			written = provider->MakeImage(path.string(), [&rect](void *buf, uint y, uint pitch, uint n) {
 				CaptureFrameCallback(rect, buf, y, pitch, n);
-			}, width, height, blitter->GetScreenDepth(), _cur_palette.palette);
+			}, width, height, blitter->GetScreenDepth(), _cur_palette.palette, CAPTURE_PNG_COMPRESSION);
 
 			/* Put the windows back right away, so the reported state is the state after the capture.
 			 * The hidden count was taken when they moved, so it still describes the captured pixels. */
@@ -688,12 +689,12 @@ Json CaptureGameFrame(const Json &params)
 		camera = MakeIndependentCamera(request.target, width, height, request.zoom);
 		written = provider->MakeImage(path.string(), [&camera](void *buf, uint y, uint pitch, uint n) {
 			IndependentViewCallback(camera.viewport, buf, y, pitch, n);
-		}, width, height, blitter->GetScreenDepth(), _cur_palette.palette);
+		}, width, height, blitter->GetScreenDepth(), _cur_palette.palette, CAPTURE_PNG_COMPRESSION);
 	} else {
 		const MinimapRender render{static_cast<int>(Map::SizeX()), static_cast<int>(Map::SizeY()), width, height};
 		written = provider->MakeImage(path.string(), [&render](void *buf, uint y, uint pitch, uint n) {
 			MinimapCallback(render, buf, y, pitch, n);
-		}, width, height, 32, _cur_palette.palette);
+		}, width, height, 32, _cur_palette.palette, CAPTURE_PNG_COMPRESSION);
 	}
 
 	/* If the game advanced while the image was made, the pixels are older than the state we would
@@ -824,6 +825,8 @@ Json CaptureGameFrame(const Json &params)
 	}
 
 	result["png_bytes"] = png.size();
+	/* The lossless effort the bytes were encoded with, so a size comparison is not a guess. */
+	result["png_compression"] = CAPTURE_PNG_COMPRESSION;
 	if (request.include_png) result["png_base64"] = Base64Encode(png);
 
 	_last_capture_hash = hash_hex;

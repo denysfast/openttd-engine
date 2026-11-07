@@ -13,6 +13,7 @@
 
 #include "../agent_capture.h"
 #include "../core/math_func.hpp"
+#include "../screenshot_type.h"
 #include "../tile_type.h"
 #include "../viewport_type.h"
 #include "../window_func.h"
@@ -316,4 +317,23 @@ TEST_CASE("Agent capture: the camera parameters the bridge advertises are recogn
 		CHECK(write["ok"] == false);
 		CHECK(write["error"] != "invalid_params");
 	}
+}
+
+TEST_CASE("Agent capture: the capture asks the PNG provider for its fastest lossless level")
+{
+	/* A capture is encoded on the draw tick inside the deferred slice, so it trades file size for
+	 * time; a player's own screenshot keeps the provider default. Both have to be levels libpng
+	 * accepts, and the capture must not fall back on the historical default or on "no compression"
+	 * (which would make a full screen frame exceed the result body limit). */
+	STATIC_REQUIRE(InGameAgent::CAPTURE_PNG_COMPRESSION >= 1);
+	STATIC_REQUIRE(InGameAgent::CAPTURE_PNG_COMPRESSION < SCREENSHOT_COMPRESSION_DEFAULT);
+	STATIC_REQUIRE(SCREENSHOT_COMPRESSION_DEFAULT <= 9);
+
+	/* A requested effort is clamped into the range a provider understands, never passed on raw. */
+	CHECK(ClampScreenshotCompression(0) == 0);
+	CHECK(ClampScreenshotCompression(InGameAgent::CAPTURE_PNG_COMPRESSION) == InGameAgent::CAPTURE_PNG_COMPRESSION);
+	CHECK(ClampScreenshotCompression(SCREENSHOT_COMPRESSION_DEFAULT) == SCREENSHOT_COMPRESSION_DEFAULT);
+	CHECK(ClampScreenshotCompression(9) == 9);
+	CHECK(ClampScreenshotCompression(10) == 9);
+	CHECK(ClampScreenshotCompression(4096) == 9);
 }

@@ -14,6 +14,7 @@
 #include "company_type.h"
 #include "tile_type.h"
 
+#include <chrono>
 #include <functional>
 #include <string>
 #include <string_view>
@@ -28,6 +29,25 @@
 namespace InGameAgent {
 
 using Json = nlohmann::json;
+
+/**
+ * Delay between two polls while the backend is healthy.
+ *
+ * A request waits at most one idle interval before the engine picks it up, so this interval is part
+ * of the tool latency; the heartbeat the backend asks for is a separate, much slower connection
+ * signal and is not affected by it. One poll is in flight at a time and the loop sleeps between
+ * polls, so a short interval is still a bounded healthy poll and never a spin on the HTTP layer.
+ *
+ * It is 25 ms because the measured round trip is dominated by waiting for the next poll: E16
+ * measured ui.inspect HTTP round trips of 256..408 ms against a 250 ms budget at a 150 ms cadence,
+ * which is about one idle wait plus the HTTP and frame handling the current transport adds. A
+ * faster cadence reduces that wait, but whether the actual 250 ms budget is met with a real backend
+ * and a real frame rate is a live measurement, not a property of this constant.
+ */
+inline constexpr std::chrono::milliseconds POLL_IDLE{25};
+
+/** Delay before retrying a poll that failed; a backend that is down is not hammered. */
+inline constexpr std::chrono::milliseconds POLL_RETRY{2000};
 
 /**
  * Run one step of the bridge. Must be called from the main thread once per

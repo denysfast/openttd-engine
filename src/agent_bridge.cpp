@@ -95,15 +95,7 @@ using Clock = std::chrono::steady_clock;
 
 /** Delay before retrying a failed hello. */
 constexpr auto HELLO_RETRY = std::chrono::seconds(5);
-/** Delay before retrying a failed poll. */
-constexpr auto POLL_RETRY = std::chrono::milliseconds(2000);
-/**
- * Delay between two polls while the backend is healthy. This is the tool latency, not the
- * heartbeat: a request waits at most one idle interval before the engine picks it up, while the
- * heartbeat the backend asks for stays a separate, much slower connection signal. The floor keeps
- * the loop from turning into a busy poll of the HTTP layer.
- */
-constexpr auto POLL_IDLE = std::chrono::milliseconds(150);
+/* POLL_IDLE and POLL_RETRY are the polling contract of the bridge and live in agent_bridge.h. */
 /**
  * Budget of the plan for one ordinary query/batch main-thread slice, in microseconds:
  * "no individual ordinary query/batch main-thread slice above 5 ms on the named reference map"
@@ -2784,6 +2776,8 @@ void HandlePollResponse(bool ok, const Json &body)
 	}
 
 	const Clock::time_point batch_started = Clock::now();
+	/* A batch that carried requests says the backend had work for us; an empty one is the idle case. */
+	const size_t received = body.contains("requests") && body["requests"].is_array() ? body["requests"].size() : 0;
 	bool complete = true;
 	if (body.contains("requests") && body["requests"].is_array()) {
 		for (const Json &request : body["requests"]) {
@@ -2831,8 +2825,20 @@ void HandlePollResponse(bool ok, const Json &body)
 		_state.cursor = body["cursor"].get<int64_t>();
 	}
 
-	/* A healthy poll repeats on the idle cadence; the heartbeat stays a separate, slower signal. */
-	_state.next_poll = Clock::now() + (complete ? POLL_IDLE : POLL_RETRY);
+	/*
+	 * A healthy poll repeats on the idle cadence; the heartbeat stays a separate, slower signal.
+	 * A batch that carried requests means the backend may already have queued the next request while
+	 * this batch ran, so poll again in this game loop iteration instead of waiting a whole interval.
+	 * That cannot spin: Tick() sends at most one poll per game loop iteration and only one poll is
+	 * ever in flight. A failed batch keeps its backoff.
+	 */
+	if (!complete) {
+		_state.next_poll = Clock::now() + POLL_RETRY;
+	} else if (received > 0) {
+		_state.next_poll = Clock::now();
+	} else {
+		_state.next_poll = Clock::now() + POLL_IDLE;
+	}
 }
 
 /**
