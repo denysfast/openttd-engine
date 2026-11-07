@@ -10,6 +10,7 @@
 #include "stdafx.h"
 #include "agent_game_tools.h"
 
+#include "aircraft.h"
 #include "articulated_vehicles.h"
 #include "cargotype.h"
 #include "command_func.h"
@@ -34,6 +35,7 @@
 #include "strings_func.h"
 #include "timer/timer_game_calendar.h"
 #include "timetable_cmd.h"
+#include "train.h"
 #include "vehicle_base.h"
 #include "vehicle_cmd.h"
 #include "vehicle_func.h"
@@ -999,6 +1001,8 @@ Json VehicleRow(const Vehicle *v)
 	row["value"] = static_cast<int64_t>(v->value);
 	row["running_cost"] = static_cast<int64_t>(v->GetRunningCost());
 	row["halted_in_depot"] = v->vehstatus.Test(VehState::Stopped) && v->IsStoppedInDepot();
+	/* The wait state: the engine's own tick counters, the type specific ones null elsewhere. */
+	row.update(VehicleWaitJson(v));
 
 	const Group *group = Group::GetIfValid(v->group_id);
 	row["group_id"] = group != nullptr ? Json(v->group_id.base()) : Json(nullptr);
@@ -2937,6 +2941,41 @@ Json Capability(std::string_view method, std::string_view authority, std::initia
 
 } // namespace
 
+/* Outside the anonymous namespace: the header declares this helper, so the test binary has to link
+ * it. `VehicleRow` above calls it through that declaration. */
+/**
+ * Serialise the wait state of one vehicle.
+ *
+ * Every field is a raw engine tick counter, never a duration in seconds or in days: the engine
+ * ticks a vehicle 74 times per game day (`Ticks::DAY_TICKS`), so a counter is only comparable
+ * with another counter or with a timetable that is in the same unit.
+ *  - `current_order_time`: ticks that passed since the current order started
+ *    (`BaseConsist::current_order_time`), the base of the engine's lateness calculation. The field
+ *    is signed and the engine marks "not known" with -1 (`TimerGameTick::Ticks::INVALID_TICKS`), so a
+ *    negative value means "not known", not "one tick before the order started".
+ *  - `load_unload_ticks`: ticks the vehicle still waits before the next step of its
+ *    loading/unloading cycle (`Vehicle::load_unload_ticks`, counted down by the engine).
+ *  - `wait_counter`: the train's own counter. The engine uses this single field for three
+ *    different situations — ticks waiting in front of a signal, ticks being stuck, and the
+ *    counter for forced proceeding through signals (`Train::wait_counter`) — so it is reported
+ *    as the raw value and never as "seconds until the train moves again".
+ *  - `turn_counter`: the aircraft's countdown until the next turn is allowed, which the engine
+ *    throttles so an aircraft never turns more than 45 degrees at once (`Aircraft::turn_counter`).
+ * A counter that belongs to another vehicle type is `null`, not 0, so a caller can tell "this
+ * vehicle has no such counter" from "the counter is zero".
+ * @param v The vehicle.
+ * @return The wait fields of a vehicle row.
+ */
+Json VehicleWaitJson(const Vehicle *v)
+{
+	Json wait = Json::object();
+	wait["current_order_time"] = v->current_order_time;
+	wait["load_unload_ticks"] = v->load_unload_ticks;
+	wait["wait_counter"] = v->type == VehicleType::Train ? Json(Train::From(v)->wait_counter) : Json(nullptr);
+	wait["turn_counter"] = v->type == VehicleType::Aircraft ? Json(Aircraft::From(v)->turn_counter) : Json(nullptr);
+	return wait;
+}
+
 Json GameToolCapabilities()
 {
 	Json methods = Json::array();
@@ -2983,6 +3022,7 @@ Json GameToolCapabilities()
 		"world.query pages are bounded: `limit` is clamped to 1..500 (default 100), `offset` is never negative, and the result reports `total`, `limit`, `offset` and `has_more`.",
 		"world.query ownership is explicit: `company_id` filters a company scoped kind, `company_id: null` asks for every owner, and the scope that was applied is reported in `scope.company_id`.",
 		"A vehicle row carries its order list compactly (`current_orders`, at most 64 entries, with `current_orders_truncated`), its group and depot references and the running cost, so the fleet can be audited without a second query.",
+		"A vehicle row carries the engine's own wait counters as raw ticks: `current_order_time` (ticks since the current order started), `load_unload_ticks` (ticks left before the next loading step), `wait_counter` for a train and `turn_counter` for an aircraft. `wait_counter` is one engine field for waiting in front of a signal, being stuck or the forced-proceeding counter, so it is the raw value and not a duration; a counter of another vehicle type is null.",
 	});
 	return result;
 }

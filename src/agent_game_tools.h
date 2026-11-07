@@ -55,6 +55,31 @@ Json GameToolCapabilities();
  */
 std::optional<Json> DispatchGameTool(std::string_view method, const Json &params, CompanyID company);
 
+/**
+ * Serialise the wait state of one vehicle row.
+ *
+ * The counters are the engine's own raw tick counters, never a duration: the engine ticks a vehicle
+ * 74 times per game day (`Ticks::DAY_TICKS`), so a value is only comparable with another counter or
+ * with a timetable that is in the same unit.
+ *  - `current_order_time`: ticks that passed since the current order started
+ *    (`BaseConsist::current_order_time`). The field is signed and the engine's own "not known"
+ *    marker for it is -1 (`TimerGameTick::Ticks::INVALID_TICKS`), which is reported as it is, so a
+ *    negative value means "not known", not "one tick before the order started".
+ *  - `load_unload_ticks`: ticks the vehicle still waits before the next step of its
+ *    loading/unloading cycle (`Vehicle::load_unload_ticks`).
+ *  - `wait_counter`: trains only. One engine field for three situations — ticks waiting in front of
+ *    a signal, ticks being stuck, and the counter for forced proceeding through signals
+ *    (`Train::wait_counter`) — so it is the raw value and not the time until the train moves again.
+ *  - `turn_counter`: aircraft only, the engine's countdown until the next turn is allowed
+ *    (`Aircraft::turn_counter`), which throttles turns to at most 45 degrees at once.
+ * A counter that belongs to another vehicle type is `null`, never a made up 0, so "this vehicle has
+ * no such counter" and "the counter is zero" stay distinguishable.
+ *
+ * @param v The vehicle (the forward declaration comes from `vehicle_type.h`).
+ * @return The wait fields of a vehicle row.
+ */
+Json VehicleWaitJson(const Vehicle *v);
+
 /*
  * Command callbacks. `Command<Tcmd>::Post` asserts that the callback is registered for the
  * network command dispatch, so these are declared here and must be listed in the

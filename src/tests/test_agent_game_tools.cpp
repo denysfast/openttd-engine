@@ -19,7 +19,12 @@
 #include "../3rdparty/catch2/catch.hpp"
 
 #include "../agent_game_tools.h"
+#include "../aircraft.h"
 #include "../cargotype.h"
+#include "../company_base.h"
+#include "../roadveh.h"
+#include "../train.h"
+#include "../vehicle_base.h"
 
 #include "../safeguards.h"
 
@@ -819,4 +824,126 @@ TEST_CASE("agent_game_tools: order ids and subtypes are checked against their po
 			Json::array({Json{{"index", 0}, {"wait_time", 65536}}}));
 	CHECK(over_wait["error"] == "invalid_arguments");
 	CHECK(over_wait["detail"]["max"] == 65535);
+}
+
+namespace {
+
+/**
+ * A real company in the engine's own company pool, removed again when the guard goes out of scope.
+ *
+ * The vehicles of the cases below belong to a company, so the owner they carry is a real one: an
+ * invalid owner would make the engine's own teardown paths look up a company that does not exist.
+ */
+class TestCompanyGuard {
+public:
+	TestCompanyGuard()
+	{
+		/* The pool asserts that the allocation was checked, exactly as the blueprint cases do. */
+		REQUIRE(Company::CanAllocateItem());
+		this->company = Company::Create();
+		REQUIRE(this->company != nullptr);
+	}
+
+	~TestCompanyGuard()
+	{
+		if (this->company != nullptr) delete this->company;
+	}
+
+	CompanyID Id() const { return this->company->index; }
+
+private:
+	Company *company = nullptr; ///< The company, or nullptr when it was not created.
+};
+
+/**
+ * Three real vehicles in the engine's own vehicle pool, removed again when the fixture goes out of
+ * scope.
+ *
+ * The vehicles are genuine pool items, so their index and lifetime generation are the engine's own
+ * and the counters read from them are the fields the engine itself uses. The fixture requires an
+ * empty vehicle pool first, so the cleanup only ever removes the three vehicles it created itself
+ * and can never delete an item another case is responsible for. Removal uses the pool's own
+ * `CleanPool`: that is the engine's path for deleting items without the per-vehicle teardown (the
+ * company's unit number, the group statistics, the tile hash and the windows) that needs a running
+ * game, and it resets the pool completely, so a case that runs afterwards still sees an empty pool.
+ *
+ * Every check that can fail runs before the first allocation: `PoolItem::Create` only fails with a
+ * fatal error (`GetNew` on a full pool), so no statement after the first `Create` can throw and a
+ * failed `REQUIRE` can never leave a vehicle behind in the pool.
+ */
+class TestVehicles {
+public:
+	TestVehicles()
+	{
+		/* The pool asserts that the allocation was checked, exactly as the other agent cases do.
+		 * `CanAllocate` *assigns* the number it was asked for (`checked = n`, core/pool_type.hpp:193-196)
+		 * and `GetNew` decrements it once per allocation (core/pool_func.hpp:119-120), so the three
+		 * vehicles are reserved with one call: three separate `CanAllocateItem()` calls would leave
+		 * `checked` at 1 and the second `Create` would trip the assertion. */
+		REQUIRE(Vehicle::GetNumItems() == 0);
+		REQUIRE(Vehicle::CanAllocateItem(3));
+
+		this->train = Train::Create();
+		this->aircraft = Aircraft::Create();
+		this->road = RoadVehicle::Create();
+	}
+
+	~TestVehicles() { _vehicle_pool.CleanPool(); }
+
+	Train *train = nullptr; ///< The train the fixture created.
+	Aircraft *aircraft = nullptr; ///< The aircraft the fixture created.
+	RoadVehicle *road = nullptr; ///< The road vehicle the fixture created.
+};
+
+} // namespace
+
+TEST_CASE("agent_game_tools: a vehicle row reports the engine's own raw wait counters")
+{
+	/* The company is declared first, so the vehicles are removed before it. */
+	TestCompanyGuard company;
+	TestVehicles vehicles;
+
+	/* A train carries the signal/stuck/forced-proceeding counter and the common counters. */
+	vehicles.train->owner = company.Id();
+	vehicles.train->wait_counter = 37;
+	vehicles.train->load_unload_ticks = 11;
+	vehicles.train->current_order_time = 123;
+
+	const Json train_wait = VehicleWaitJson(vehicles.train);
+	CHECK(train_wait["wait_counter"] == 37);
+	CHECK(train_wait["load_unload_ticks"] == 11);
+	CHECK(train_wait["current_order_time"] == 123);
+	/* A train has no turn throttle: the field is null, not a made up zero. */
+	CHECK(train_wait["turn_counter"].is_null());
+
+	/* An unrelated vehicle type keeps the common counters and carries its own counter instead. */
+	vehicles.aircraft->owner = company.Id();
+	vehicles.aircraft->turn_counter = 5;
+	vehicles.aircraft->load_unload_ticks = 2;
+	vehicles.aircraft->current_order_time = 456;
+
+	const Json aircraft_wait = VehicleWaitJson(vehicles.aircraft);
+	CHECK(aircraft_wait["turn_counter"] == 5);
+	CHECK(aircraft_wait["load_unload_ticks"] == 2);
+	CHECK(aircraft_wait["current_order_time"] == 456);
+	/* The aircraft has no signal counter, so the train's counter can never leak into its row. */
+	CHECK(aircraft_wait["wait_counter"].is_null());
+
+	/* A road vehicle has neither of the two type specific counters, while its own counters are
+	 * still numbers: a zero there is a value, not the null that means "no such counter". */
+	vehicles.road->owner = company.Id();
+	vehicles.road->load_unload_ticks = 3;
+
+	const Json road_wait = VehicleWaitJson(vehicles.road);
+	CHECK(road_wait["load_unload_ticks"] == 3);
+	CHECK(road_wait["current_order_time"] == 0);
+	CHECK(road_wait["wait_counter"].is_null());
+	CHECK(road_wait["turn_counter"].is_null());
+
+	/* `current_order_time` is signed and the engine marks "not known" with -1
+	 * (`TimerGameTick::Ticks::INVALID_TICKS`): the row reports that value as it is, so it is never wrapped
+	 * into a large unsigned number and a caller can tell "not known" from a real tick count. */
+	vehicles.road->current_order_time = -1;
+	const Json road_unknown = VehicleWaitJson(vehicles.road);
+	CHECK(road_unknown["current_order_time"] == -1);
 }
