@@ -797,3 +797,64 @@ TEST_CASE("AgentCommandCatalogDefaultsStationOrdersToTheFarEnd")
 	order = Order{};
 	CHECK_FALSE(DecodeOrderForTest(Json{{"type", "goto_station"}, {"destination", 5}, {"stop_location", "far_end"}}, order, normalized, error));
 }
+
+TEST_CASE("AgentCommandCatalogDescribesTheJsonTypeOfEachArgument")
+{
+	/* A tile index, a road type and a direction are plain JSON integers. The decoder takes the number
+	 * and nothing else, so the schema has to say "integer" with the bounds it accepts: a client that
+	 * sends the quoted spelling gets invalid_arguments, which is what happened with real tool calls. */
+	const Json single = ReadCatalog({{"op", "describe"}, {"command", "CmdBuildRoadDepot"}});
+	REQUIRE(single["count"].get<size_t>() == 1);
+	const Json &args = single["commands"][0]["arguments"];
+	REQUIRE(args.size() == 3);
+
+	CHECK(args[0]["type"].get<std::string>() == "TileIndex");
+	REQUIRE(args[0]["schema"].is_object());
+	CHECK(args[0]["schema"]["type"].get<std::string>() == "integer");
+	CHECK(args[0]["schema"]["minimum"] == 0);
+	REQUIRE(args[0]["schema"]["maximum"].is_number());
+	CHECK(args[0]["schema"]["maximum"].get<int64_t>() >= 5933);
+
+	CHECK(args[1]["type"].get<std::string>() == "RoadType");
+	REQUIRE(args[1]["schema"].is_object());
+	CHECK(args[1]["schema"]["type"].get<std::string>() == "integer");
+	CHECK(args[1]["schema"]["minimum"] == 0);
+	CHECK(args[1]["schema"]["maximum"].is_number());
+	CHECK(args[1]["schema"]["values"].is_string());
+
+	CHECK(args[2]["type"].get<std::string>() == "DiagDirection");
+	REQUIRE(args[2]["schema"].is_object());
+	CHECK(args[2]["schema"]["type"].get<std::string>() == "integer");
+	CHECK(args[2]["schema"]["minimum"] == 0);
+	CHECK(args[2]["schema"]["values"].is_string());
+
+	/* A boolean argument says boolean, so a client does not send 0 or 1 and hope. */
+	const Json pause = ReadCatalog({{"op", "describe"}, {"command", "CmdPause"}});
+	REQUIRE(pause["commands"][0]["arguments"].size() == 2);
+	CHECK(pause["commands"][0]["arguments"][1]["schema"]["type"].get<std::string>() == "boolean");
+
+	/* A strong id over an integer reports the base type's JSON type and bounds. */
+	const Json cheat = ReadCatalog({{"op", "describe"}, {"command", "CmdMoneyCheat"}});
+	REQUIRE(cheat["commands"][0]["arguments"].size() == 1);
+	CHECK(cheat["commands"][0]["arguments"][0]["kind"].get<std::string>() == "strong_id");
+	REQUIRE(cheat["commands"][0]["arguments"][0]["schema"].is_object());
+	CHECK(cheat["commands"][0]["arguments"][0]["schema"]["type"].get<std::string>() == "integer");
+	CHECK(cheat["commands"][0]["arguments"][0]["schema"]["minimum"].is_number());
+	CHECK(cheat["commands"][0]["arguments"][0]["schema"]["maximum"].is_number());
+
+	/* The numbers the schema describes are the ones the decoder takes: a JSON number passes, its quoted
+	 * spelling and a boolean do not. */
+	const Json ok = ValidateCommand("CmdBuildRoadDepot", Arguments(5933, 0, 0));
+	REQUIRE(ok["ok"].get<bool>());
+	CHECK(ok["arguments"][0] == 5933);
+
+	const Json quoted_tile = ValidateCommand("CmdBuildRoadDepot", Arguments("5933", 0, 0));
+	CHECK_FALSE(quoted_tile["ok"].get<bool>());
+	CHECK(quoted_tile["error"].is_string());
+
+	const Json quoted_enum = ValidateCommand("CmdBuildRoadDepot", Arguments(5933, "0", 0));
+	CHECK_FALSE(quoted_enum["ok"].get<bool>());
+
+	const Json boolean_tile = ValidateCommand("CmdBuildRoadDepot", Arguments(true, 0, 0));
+	CHECK_FALSE(boolean_tile["ok"].get<bool>());
+}

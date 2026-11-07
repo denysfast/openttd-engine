@@ -1399,8 +1399,37 @@ template <typename T>
 Json TargetSchema();
 
 /**
- * The exact JSON schema of one argument, for the structured types the decoder understands.
- * @return The schema of the argument, or null when the argument is a plain value.
+ * The JSON schema of an integer argument: the JSON type and the bounds the decoder enforces.
+ *
+ * DecodeIntegral() accepts a JSON number that fits the type and nothing else, so the bounds are the
+ * type's own numeric limits; a client that reads them never has to guess the C++ type.
+ *
+ * @return The schema of the integral type.
+ */
+template <typename T>
+Json IntegerSchema()
+{
+	static_assert(std::is_integral_v<T>);
+
+	Json schema = {{"type", "integer"}};
+	if constexpr (std::is_signed_v<T>) {
+		schema["minimum"] = static_cast<int64_t>(std::numeric_limits<T>::min());
+	} else {
+		schema["minimum"] = 0;
+	}
+	schema["maximum"] = static_cast<uint64_t>(std::numeric_limits<T>::max());
+	return schema;
+}
+
+/**
+ * The exact JSON schema of one argument.
+ *
+ * Every type the decoder accepts gets a schema with the JSON type it expects, so a client can read the
+ * shape from the catalog instead of guessing it from the C++ type name: a plain value says `boolean`,
+ * `string`, `integer` or `null` with the bounds the decoder checks, a strong id says what its base type
+ * says, and an enum says `integer` with the range the decoder accepts.
+ *
+ * @return The schema of the argument, or null when the type has no schema yet.
  */
 template <typename T>
 Json ArgumentSchema()
@@ -1440,13 +1469,29 @@ Json ArgumentSchema()
 			{"value", "the value of the chosen alternative; 'none' takes no value"},
 		};
 	} else if constexpr (std::is_enum_v<U>) {
+		Json schema = IntegerSchema<std::underlying_type_t<U>>();
 		if constexpr (EnumEndInfo<U>::is) {
-			return {{"values", "0.." + fmt::format("{}", EnumEndInfo<U>::end - 1) + ", checked against the engine's own end marker"}};
+			/* The decoder rejects anything below zero or at the end marker, so the schema says so. */
+			schema["minimum"] = 0;
+			schema["maximum"] = static_cast<uint64_t>(EnumEndInfo<U>::end - 1);
+			schema["values"] = "0.." + fmt::format("{}", EnumEndInfo<U>::end - 1) + ", checked against the engine's own end marker";
 		} else {
-			return {{"values", "the underlying integer range; this enum declares no end marker to check against"}};
+			schema["values"] = "the underlying integer range; this enum declares no end marker to check against";
 		}
+		return schema;
 	} else if constexpr (EnumBitSetInfo<U>::is) {
 		return {{"bits", "0.." + fmt::format("{}", to_underlying(EnumBitSetInfo<U>::end) - 1) + ", checked against the engine's own bit set"}};
+	} else if constexpr (std::is_same_v<U, bool>) {
+		return {{"type", "boolean"}};
+	} else if constexpr (std::is_same_v<U, std::string>) {
+		return {{"type", "string"}};
+	} else if constexpr (std::is_same_v<U, std::monostate>) {
+		return {{"type", "null"}};
+	} else if constexpr (std::is_integral_v<U>) {
+		return IntegerSchema<U>();
+	} else if constexpr (HasBaseType<U>::value) {
+		/* A strong id is decoded as the value type it wraps, so that type's JSON schema is the exact one. */
+		return ArgumentSchema<typename HasBaseType<U>::Base>();
 	} else {
 		return nullptr;
 	}

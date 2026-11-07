@@ -66,7 +66,15 @@
  *     {
  *       "index": 0, "name": null, "type": "TileIndex", "kind": "strong_id", "supported": true,
  *       "target": {"entity": "town", "id_path": null}, // null when the argument names no entity
- *       "schema": null                 // the JSON schema of a structured argument, else null
+ *       "schema": {"type": "integer", "minimum": 0, "maximum": 4294967295}
+ *                                      // the JSON shape the decoder accepts, and the bounds it
+ *                                      // checks where it checks them: "integer" with minimum and
+ *                                      // maximum for integral arguments, strong ids (their base
+ *                                      // type's bounds) and enums (0..end-1 where the engine
+ *                                      // declares an end marker, plus the "values" text), "boolean",
+ *                                      // "string", "null" for a monostate, "bits" for an enum bit
+ *                                      // set, and the structured object schema for the structured
+ *                                      // arguments. Null when the type has no schema yet.
  *     }
  *   ],
  *   "returns": ["Money"]               // only for op=describe; extra typed returns of the proc
