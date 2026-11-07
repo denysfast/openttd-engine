@@ -1208,7 +1208,7 @@ TEST_CASE("agent_game_tools: an order's refit is a separate OrderRefit, not part
 	REQUIRE(plan["orders"].size() == 3);
 
 	/* The inserted order carries no refit at all; the refit cargo waits for the second command. */
-	CHECK(plan["orders"][0]["type"] == "goto_station");
+	CHECK(plan["orders"][0]["type"] == "station");
 	CHECK(plan["orders"][0]["insert_refit_cargo_id"].is_null());
 	CHECK(plan["orders"][0]["order_refit_cargo_id"] == 1);
 
@@ -1217,7 +1217,7 @@ TEST_CASE("agent_game_tools: an order's refit is a separate OrderRefit, not part
 	CHECK(plan["orders"][1]["order_refit_cargo_id"].is_null());
 
 	/* A depot order can carry a refit too. */
-	CHECK(plan["orders"][2]["type"] == "goto_depot");
+	CHECK(plan["orders"][2]["type"] == "depot");
 	CHECK(plan["orders"][2]["insert_refit_cargo_id"].is_null());
 	CHECK(plan["orders"][2]["order_refit_cargo_id"] == 2);
 }
