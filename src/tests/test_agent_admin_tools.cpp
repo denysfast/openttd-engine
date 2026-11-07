@@ -138,10 +138,10 @@ TEST_CASE("Agent admin tools: dispatch")
 
 	/* A missing operation is an argument error, an unknown one is a reported gap. */
 	CHECK(Dispatch("world.company", Json::object())["error"] == "invalid_arguments");
-	const Json gap = Dispatch("world.company", Json::object({{"op", "buy"}}));
+	const Json gap = Dispatch("world.company", Json::object({{"op", "company_password"}}));
 	CHECK(gap["ok"] == false);
 	CHECK(gap["error"] == "unsupported_op");
-	CHECK(gap["detail"]["op"] == "buy");
+	CHECK(gap["detail"]["op"] == "company_password");
 }
 
 TEST_CASE("Agent admin tools: mutation classification")
@@ -364,10 +364,10 @@ TEST_CASE("Agent admin tools: town validation")
 	CHECK(negative["error"] == "invalid_amount");
 
 	/* An unknown operation is a reported gap. */
-	const Json gap = Dispatch("world.towns", Json::object({{"op", "found"}}));
+	const Json gap = Dispatch("world.towns", Json::object({{"op", "district"}}));
 	CHECK(gap["ok"] == false);
 	CHECK(gap["error"] == "unsupported_op");
-	CHECK(gap["detail"]["op"] == "found");
+	CHECK(gap["detail"]["op"] == "district");
 }
 
 TEST_CASE("Agent admin tools: project validation")
@@ -407,3 +407,321 @@ TEST_CASE("Agent admin tools: project validation")
 	CHECK(save["error"] == "unsupported_op");
 	CHECK(save["detail"]["op"] == "save");
 }
+
+TEST_CASE("Agent admin tools: extended capability inventory")
+{
+	const Json capabilities = AdminToolCapabilities();
+
+	/* The query operations are listed apart from the write operations. */
+	REQUIRE(capabilities["query_ops"].is_array());
+	CHECK(Contains(capabilities["query_ops"], "world.industry op=needs"));
+	CHECK(Contains(capabilities["query_ops"], "world.industry op=production"));
+	CHECK(Contains(capabilities["query_ops"], "world.industry op=cargo"));
+	CHECK(Contains(capabilities["query_ops"], "world.signs op=list"));
+	CHECK(Contains(capabilities["query_ops"], "world.landscape op=object_types"));
+	CHECK(Contains(capabilities["query_ops"], "world.towns op=power"));
+	CHECK(Contains(capabilities["query_ops"], "world.project op=catchment"));
+
+	/* The industry family now covers the queries, the funding and the control commands. */
+	const Json industry = FindCapability(capabilities, "world.industry");
+	REQUIRE(!industry.empty());
+	CHECK(Contains(industry["implemented"], "list"));
+	CHECK(Contains(industry["implemented"], "info"));
+	CHECK(Contains(industry["implemented"], "needs"));
+	CHECK(Contains(industry["implemented"], "production"));
+	CHECK(Contains(industry["implemented"], "cargo"));
+	CHECK(Contains(industry["implemented"], "fund"));
+	CHECK(Contains(industry["implemented"], "fund_area"));
+	CHECK(Contains(industry["implemented"], "prospect"));
+	CHECK(Contains(industry["implemented"], "set_production"));
+	CHECK(Contains(industry["implemented"], "set_flags"));
+	CHECK(Contains(industry["implemented"], "set_exclusivity"));
+	CHECK(Contains(industry["gaps"], "industry_text"));
+
+	/* Signs, objects, trees and the cheats are new families of this module. */
+	const Json signs = FindCapability(capabilities, "world.signs");
+	REQUIRE(!signs.empty());
+	CHECK(Contains(signs["implemented"], "list"));
+	CHECK(Contains(signs["implemented"], "place"));
+	CHECK(Contains(signs["implemented"], "rename"));
+	CHECK(Contains(signs["implemented"], "delete"));
+	CHECK(Contains(signs["implemented"], "move"));
+
+	const Json landscape = FindCapability(capabilities, "world.landscape");
+	REQUIRE(!landscape.empty());
+	CHECK(Contains(landscape["implemented"], "object_types"));
+	CHECK(Contains(landscape["implemented"], "object"));
+	CHECK(Contains(landscape["implemented"], "object_area"));
+	CHECK(Contains(landscape["implemented"], "tree"));
+	CHECK(Contains(landscape["implemented"], "tree_area"));
+
+	const Json cheat = FindCapability(capabilities, "world.cheat");
+	REQUIRE(!cheat.empty());
+	CHECK(Contains(cheat["implemented"], "money"));
+	CHECK(Contains(cheat["implemented"], "bank_balance"));
+
+	/* The town and company families gained the founding, the actions and the company identity. */
+	const Json towns = FindCapability(capabilities, "world.towns");
+	REQUIRE(!towns.empty());
+	CHECK(Contains(towns["implemented"], "found"));
+	CHECK(Contains(towns["implemented"], "rename"));
+	CHECK(Contains(towns["implemented"], "town_action"));
+	CHECK(Contains(towns["implemented"], "list"));
+
+	const Json company = FindCapability(capabilities, "world.company");
+	REQUIRE(!company.empty());
+	CHECK(Contains(company["implemented"], "colour"));
+	CHECK(Contains(company["implemented"], "livery_set"));
+	CHECK(Contains(company["implemented"], "manager_face"));
+	CHECK(Contains(company["implemented"], "rename"));
+	CHECK(Contains(company["implemented"], "rename_president"));
+	CHECK(Contains(company["implemented"], "buy"));
+
+	/* The station catchment is a project operation, and the save lifecycle stays a gap. */
+	const Json project = FindCapability(capabilities, "world.project");
+	REQUIRE(!project.empty());
+	CHECK(Contains(project["implemented"], "catchment"));
+	CHECK(Contains(project["implemented"], "catchment_upgrade"));
+	CHECK(Contains(project["implemented"], "settings"));
+	CHECK(Contains(project["gaps"], "save"));
+	CHECK(Contains(project["gaps"], "load"));
+}
+
+TEST_CASE("Agent admin tools: extended mutation classification")
+{
+	/* The query operations of the new families do not change the world. */
+	CHECK_FALSE(IsAdminMutation("world.industry", Json::object({{"op", "list"}})));
+	CHECK_FALSE(IsAdminMutation("world.industry", Json::object({{"op", "types"}})));
+	CHECK_FALSE(IsAdminMutation("world.industry", Json::object({{"op", "info"}})));
+	CHECK_FALSE(IsAdminMutation("world.industry", Json::object({{"op", "needs"}})));
+	CHECK_FALSE(IsAdminMutation("world.industry", Json::object({{"op", "production"}})));
+	CHECK_FALSE(IsAdminMutation("world.industry", Json::object({{"op", "cargo"}})));
+	CHECK_FALSE(IsAdminMutation("world.signs", Json::object({{"op", "list"}})));
+	CHECK_FALSE(IsAdminMutation("world.signs", Json::object({{"op", "info"}})));
+	CHECK_FALSE(IsAdminMutation("world.landscape", Json::object({{"op", "object_types"}})));
+	CHECK_FALSE(IsAdminMutation("world.company", Json::object({{"op", "livery"}})));
+	CHECK_FALSE(IsAdminMutation("world.towns", Json::object({{"op", "list"}})));
+	CHECK_FALSE(IsAdminMutation("world.towns", Json::object({{"op", "growth"}})));
+	CHECK_FALSE(IsAdminMutation("world.towns", Json::object({{"op", "settings"}})));
+	CHECK_FALSE(IsAdminMutation("world.project", Json::object({{"op", "catchment"}})));
+	CHECK_FALSE(IsAdminMutation("world.project", Json::object({{"op", "settings"}})));
+
+	/* Every write operation of the new families is a mutation. */
+	CHECK(IsAdminMutation("world.industry", Json::object({{"op", "fund"}})));
+	CHECK(IsAdminMutation("world.industry", Json::object({{"op", "fund_area"}})));
+	CHECK(IsAdminMutation("world.industry", Json::object({{"op", "prospect"}})));
+	CHECK(IsAdminMutation("world.industry", Json::object({{"op", "set_production"}})));
+	CHECK(IsAdminMutation("world.industry", Json::object({{"op", "set_flags"}})));
+	CHECK(IsAdminMutation("world.industry", Json::object({{"op", "set_exclusivity"}})));
+	CHECK(IsAdminMutation("world.signs", Json::object({{"op", "place"}})));
+	CHECK(IsAdminMutation("world.signs", Json::object({{"op", "rename"}})));
+	CHECK(IsAdminMutation("world.signs", Json::object({{"op", "delete"}})));
+	CHECK(IsAdminMutation("world.signs", Json::object({{"op", "move"}})));
+	CHECK(IsAdminMutation("world.landscape", Json::object({{"op", "object"}})));
+	CHECK(IsAdminMutation("world.landscape", Json::object({{"op", "tree"}})));
+	CHECK(IsAdminMutation("world.cheat", Json::object({{"op", "money"}})));
+	CHECK(IsAdminMutation("world.cheat", Json::object({{"op", "bank_balance"}})));
+	CHECK(IsAdminMutation("world.towns", Json::object({{"op", "found"}})));
+	CHECK(IsAdminMutation("world.towns", Json::object({{"op", "rename"}})));
+	CHECK(IsAdminMutation("world.towns", Json::object({{"op", "town_action"}})));
+	CHECK(IsAdminMutation("world.project", Json::object({{"op", "catchment_upgrade"}})));
+
+	/* An unknown operation of a write family is treated as a mutation, so the write gate is never skipped. */
+	CHECK(IsAdminMutation("world.industry", Json::object({{"op", "no_such_op"}})));
+	/* A call without an operation may write, so it is classified as a mutation. */
+	CHECK(IsAdminMutation("world.industry", Json::object()));
+	CHECK(IsAdminMutation("world.cheat", Json::object()));
+
+	/* The methods of the other modules stay non-mutations of this one. */
+	CHECK_FALSE(IsAdminMutation("world.construct", Json::object()));
+	CHECK_FALSE(IsAdminMutation("world.query", Json::object()));
+}
+
+TEST_CASE("Agent admin tools: industry validation")
+{
+	/* The industry list runs on the empty pool of the test binary. */
+	const Json list = Dispatch("world.industry", Json::object({{"op", "list"}}));
+	REQUIRE(list["ok"] == true);
+	CHECK(list["industries"].is_array());
+	CHECK(list["industries"].empty());
+	CHECK(list["types"].is_array());
+
+	/* The list is bounded, so one call can never return the whole world. */
+	CHECK(list["total"] == 0);
+	CHECK(list["offset"] == 0);
+	CHECK(list["limit"] == 64);
+	CHECK(Dispatch("world.industry", Json::object({{"op", "list"}, {"limit", 0}}))["error"] == "invalid_arguments");
+	CHECK(Dispatch("world.industry", Json::object({{"op", "list"}, {"limit", 100000}}))["error"] == "invalid_arguments");
+	CHECK(Dispatch("world.industry", Json::object({{"op", "list"}, {"offset", -1}}))["error"] == "invalid_arguments");
+	const Json windowed = Dispatch("world.industry", Json::object({{"op", "list"}, {"limit", 2}, {"offset", 1}}));
+	REQUIRE(windowed["ok"] == true);
+	CHECK(windowed["limit"] == 2);
+	CHECK(windowed["offset"] == 1);
+
+	/* A query needs an industry id, and the world of the test binary has no industry. */
+	CHECK(Dispatch("world.industry", Json::object({{"op", "needs"}}))["error"] == "invalid_arguments");
+	CHECK(Dispatch("world.industry", Json::object({{"op", "cargo"}, {"industry_id", "x"}}))["error"] == "invalid_arguments");
+	CHECK(Dispatch("world.industry", Json::object({{"op", "info"}, {"industry_id", 99999}}))["error"] == "unknown_industry");
+	const Json unknown = Dispatch("world.industry", Json::object({{"op", "production"}, {"industry_id", 0}}));
+	CHECK(unknown["ok"] == false);
+	CHECK(unknown["error"] == "unknown_industry");
+
+	/* Funding needs a type the current game offers, and the type is validated before the tile. */
+	CHECK(Dispatch("world.industry", Json::object({{"op", "fund"}}))["error"] == "invalid_arguments");
+	const Json bad_type = Dispatch("world.industry", Json::object({{"op", "fund"}, {"industry_type", 9999}, {"tile", Json{{"x", 1}, {"y", 1}}}}));
+	CHECK(bad_type["ok"] == false);
+	CHECK(bad_type["error"] == "unknown_industry_type");
+	CHECK(Dispatch("world.industry", Json::object({{"op", "prospect"}}))["error"] == "invalid_arguments");
+	CHECK(Dispatch("world.industry", Json::object({{"op", "fund_area"}, {"industry_type", 9999}}))["error"] == "unknown_industry_type");
+
+	/* The control commands need an existing industry. */
+	CHECK(Dispatch("world.industry", Json::object({{"op", "set_production"}, {"industry_id", 0}, {"prod_level", 32}}))["error"] == "unknown_industry");
+	CHECK(Dispatch("world.industry", Json::object({{"op", "set_flags"}, {"industry_id", 0}, {"flags", Json::array({"no_closure"})}}))["error"] == "unknown_industry");
+	CHECK(Dispatch("world.industry", Json::object({{"op", "set_exclusivity"}, {"industry_id", 0}, {"consumer", true}}))["error"] == "unknown_industry");
+	CHECK(Dispatch("world.industry", Json::object({{"op", "set_production"}, {"prod_level", 32}}))["error"] == "invalid_arguments");
+}
+
+TEST_CASE("Agent admin tools: signs landscape and cheat validation")
+{
+	/* The sign list runs on the empty pool of the test binary. */
+	const Json signs = Dispatch("world.signs", Json::object({{"op", "list"}}));
+	REQUIRE(signs["ok"] == true);
+	CHECK(signs["signs"].is_array());
+	CHECK(signs["signs"].empty());
+	CHECK(signs["total"] == 0);
+	CHECK(Dispatch("world.signs", Json::object({{"op", "list"}, {"limit", 0}}))["error"] == "invalid_arguments");
+
+	/* A sign id is required and must exist. */
+	CHECK(Dispatch("world.signs", Json::object({{"op", "info"}}))["error"] == "invalid_arguments");
+	const Json unknown_sign = Dispatch("world.signs", Json::object({{"op", "info"}, {"sign_id", 0}}));
+	CHECK(unknown_sign["ok"] == false);
+	CHECK(unknown_sign["error"] == "unknown_sign");
+
+	/* The tile and the text length are validated before the sign command is posted. */
+	CHECK(Dispatch("world.signs", Json::object({{"op", "place"}}))["error"] == "invalid_arguments");
+	const Json long_text = Dispatch("world.signs", Json::object({{"op", "place"}, {"tile", Json{{"x", 1}, {"y", 1}}},
+			{"text", "a sign text that is far longer than the limit"}}));
+	CHECK(long_text["ok"] == false);
+	CHECK(long_text["error"] == "invalid_arguments");
+	CHECK(long_text["detail"]["max"] == MAX_LENGTH_SIGN_NAME_CHARS - 1);
+
+	/* Renaming needs a text, and the sign must exist before the text is checked. */
+	CHECK(Dispatch("world.signs", Json::object({{"op", "rename"}, {"sign_id", 0}}))["error"] == "unknown_sign");
+	CHECK(Dispatch("world.signs", Json::object({{"op", "delete"}}))["error"] == "invalid_arguments");
+	CHECK(Dispatch("world.signs", Json::object({{"op", "move"}, {"sign_id", 0}}))["error"] == "unknown_sign");
+
+	/* The object types can be listed; building one needs a valid type and a tile. */
+	const Json object_types = Dispatch("world.landscape", Json::object({{"op", "object_types"}}));
+	REQUIRE(object_types["ok"] == true);
+	CHECK(object_types["types"].is_array());
+	CHECK(object_types["total"].is_number_integer());
+	CHECK(Dispatch("world.landscape", Json::object({{"op", "object_types"}, {"limit", 0}}))["error"] == "invalid_arguments");
+	CHECK(Dispatch("world.landscape", Json::object({{"op", "object"}}))["error"] == "invalid_arguments");
+	const Json bad_object = Dispatch("world.landscape", Json::object({{"op", "object"}, {"object_type", 999999}, {"tile", Json{{"x", 1}, {"y", 1}}}}));
+	CHECK(bad_object["ok"] == false);
+	CHECK(bad_object["error"] == "unknown_object_type");
+
+	/* Planting trees needs a tile, and the tree type is range checked before the command is posted. */
+	CHECK(Dispatch("world.landscape", Json::object({{"op", "tree"}}))["error"] == "invalid_arguments");
+	const Json bad_tree = Dispatch("world.landscape", Json::object({{"op", "tree"}, {"tile", Json{{"x", 1}, {"y", 1}}}, {"tree_type", 300}}));
+	CHECK(bad_tree["ok"] == false);
+	CHECK(bad_tree["error"] == "invalid_arguments");
+	CHECK(Dispatch("world.landscape", Json::object({{"op", "tree"}, {"tile", Json{{"x", -1}, {"y", 1}}}}))["error"] == "invalid_arguments");
+
+	/* The money cheat needs a positive amount, and a bank balance needs a real company. */
+	CHECK(Dispatch("world.cheat", Json::object({{"op", "money"}}))["error"] == "invalid_arguments");
+	CHECK(Dispatch("world.cheat", Json::object({{"op", "money"}, {"amount", 0}}))["error"] == "invalid_amount");
+	CHECK(Dispatch("world.cheat", Json::object({{"op", "money"}, {"amount", -5}}))["error"] == "invalid_amount");
+	const Json balance = Dispatch("world.cheat", Json::object({{"op", "bank_balance"}, {"delta", 100}}));
+	CHECK(balance["ok"] == false);
+	CHECK(balance["error"] == "unknown_company");
+}
+
+TEST_CASE("Agent admin tools: town and company identity validation")
+{
+	/* The town list runs on the empty pool of the test binary. */
+	const Json towns = Dispatch("world.towns", Json::object({{"op", "list"}}));
+	REQUIRE(towns["ok"] == true);
+	CHECK(towns["towns"].is_array());
+	CHECK(towns["towns"].empty());
+	CHECK(towns["total"] == 0);
+	CHECK(Dispatch("world.towns", Json::object({{"op", "list"}, {"limit", 100000}}))["error"] == "invalid_arguments");
+
+	/* The town queries need an existing town. */
+	CHECK(Dispatch("world.towns", Json::object({{"op", "growth"}}))["error"] == "invalid_arguments");
+	CHECK(Dispatch("world.towns", Json::object({{"op", "settings"}, {"town_id", 0}}))["error"] == "unknown_town");
+	CHECK(Dispatch("world.towns", Json::object({{"op", "power"}, {"town_id", 0}}))["error"] == "unknown_town");
+
+	/* Founding needs a tile, and the size and layout names are checked before the command is posted. */
+	CHECK(Dispatch("world.towns", Json::object({{"op", "found"}}))["error"] == "invalid_arguments");
+	const Json bad_size = Dispatch("world.towns", Json::object({{"op", "found"}, {"tile", Json{{"x", 1}, {"y", 1}}}, {"size", "huge"}}));
+	CHECK(bad_size["ok"] == false);
+	CHECK(bad_size["error"] == "invalid_arguments");
+	CHECK(bad_size["detail"]["allowed"].is_array());
+	const Json bad_layout = Dispatch("world.towns", Json::object({{"op", "found"}, {"tile", Json{{"x", 1}, {"y", 1}}}, {"layout", "spiral"}}));
+	CHECK(bad_layout["ok"] == false);
+	CHECK(bad_layout["error"] == "invalid_arguments");
+	const Json long_name = Dispatch("world.towns", Json::object({{"op", "found"}, {"tile", Json{{"x", 1}, {"y", 1}}},
+			{"name", "a town name that is far longer than the limit"}}));
+	CHECK(long_name["ok"] == false);
+	CHECK(long_name["error"] == "invalid_arguments");
+	CHECK(long_name["detail"]["max"] == MAX_LENGTH_TOWN_NAME_CHARS - 1);
+
+	/* Renaming and the town actions need an existing town. */
+	CHECK(Dispatch("world.towns", Json::object({{"op", "rename"}, {"town_id", 0}, {"text", "New name"}}))["error"] == "unknown_town");
+	CHECK(Dispatch("world.towns", Json::object({{"op", "town_action"}, {"town_id", 0}, {"action", "bribe"}}))["error"] == "unknown_town");
+	const Json bad_action = Dispatch("world.towns", Json::object({{"op", "town_action"}, {"town_id", 0}, {"action", "teleport"}}));
+	CHECK(bad_action["ok"] == false);
+	CHECK(bad_action["error"] == "unknown_town");
+
+	/* The company identity operations need an existing company. */
+	CHECK(Dispatch("world.company", Json::object({{"op", "livery"}}))["error"] == "unknown_company");
+	CHECK(Dispatch("world.company", Json::object({{"op", "colour"}, {"colour", "red"}}))["error"] == "unknown_company");
+	CHECK(Dispatch("world.company", Json::object({{"op", "livery_set"}, {"scheme", "steam"}, {"colour", "red"}}))["error"] == "unknown_company");
+	CHECK(Dispatch("world.company", Json::object({{"op", "manager_face"}, {"style", 0}, {"bits", 0}}))["error"] == "unknown_company");
+	CHECK(Dispatch("world.company", Json::object({{"op", "rename"}, {"text", "Renamed"}}))["error"] == "unknown_company");
+	CHECK(Dispatch("world.company", Json::object({{"op", "rename_president"}, {"text", "Renamed"}}))["error"] == "unknown_company");
+
+	/* Buying a company needs the target, and a company cannot buy itself. */
+	CHECK(Dispatch("world.company", Json::object({{"op", "buy"}}))["error"] == "invalid_arguments");
+	CHECK(Dispatch("world.company", Json::object({{"op", "buy"}, {"company_id", 0}}))["error"] == "unknown_company");
+
+	/* The catchment query lists the stations of the empty world and needs an id for one station. */
+	const Json catchment = Dispatch("world.project", Json::object({{"op", "catchment"}}));
+	REQUIRE(catchment["ok"] == true);
+	CHECK(catchment["stations"].is_array());
+	CHECK(catchment["stations"].empty());
+	CHECK(catchment["total"] == 0);
+	CHECK(Dispatch("world.project", Json::object({{"op", "catchment"}, {"offset", -1}}))["error"] == "invalid_arguments");
+	CHECK(Dispatch("world.project", Json::object({{"op", "catchment"}, {"station_id", 0}}))["error"] == "unknown_station");
+	CHECK(Dispatch("world.project", Json::object({{"op", "catchment_upgrade"}}))["error"] == "invalid_arguments");
+
+	/* The project settings report the settings that drive the catchment and the town growth. */
+	const Json settings = Dispatch("world.project", Json::object({{"op", "settings"}}));
+	REQUIRE(settings["ok"] == true);
+	CHECK(!FindSetting(settings, "station.modified_catchment").empty());
+}
+
+TEST_CASE("Agent admin tools: normal command path for a boolean setting")
+{
+	/* A boolean game setting goes through the same Post path and is read back from the setting. */
+	const Json before = Dispatch("world.settings.get", Json::object({{"names", Json::array({"construction.build_on_slopes"})}}));
+	REQUIRE(before["ok"] == true);
+	const Json row = FindSetting(before, "construction.build_on_slopes");
+	REQUIRE(!row.empty());
+	CHECK(row["type"] == "bool");
+	REQUIRE(row["value"].is_number_integer());
+	const int64_t old_value = row["value"].get<int64_t>();
+	const int64_t new_value = old_value == 0 ? 1 : 0;
+
+	const Json changed = Dispatch("world.settings.set", Json::object({{"name", "construction.build_on_slopes"}, {"value", new_value}}));
+	REQUIRE(changed["ok"] == true);
+	CHECK(changed["changed"] == true);
+	CHECK(changed["value"] == new_value);
+	CHECK(changed["cost"] == 0);
+
+	const Json restored = Dispatch("world.settings.set", Json::object({{"name", "construction.build_on_slopes"}, {"value", old_value}}));
+	REQUIRE(restored["ok"] == true);
+	CHECK(restored["value"] == old_value);
+}
+

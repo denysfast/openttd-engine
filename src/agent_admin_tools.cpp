@@ -10,22 +10,38 @@
 #include "stdafx.h"
 #include "agent_admin_tools.h"
 
+#include "cargotype.h"
 #include "command_func.h"
 #include "company_base.h"
 #include "company_cmd.h"
 #include "company_func.h"
+#include "company_manager_face.h"
 #include "core/backup_type.hpp"
 #include "core/enum_type.hpp"
+#include "economy_cmd.h"
 #include "economy_type.h"
+#include "gfx_type.h"
 #include "industry.h"
+#include "industry_cmd.h"
+#include "industrytype.h"
+#include "livery.h"
 #include "map_func.h"
 #include "misc_cmd.h"
+#include "newgrf_object.h"
+#include "object_cmd.h"
+#include "object_type.h"
+#include "core/random_func.hpp"
 #include "settings_cmd.h"
 #include "settings_internal.h"
 #include "settings_table.h"
 #include "settings_type.h"
+#include "signs_base.h"
+#include "signs_cmd.h"
+#include "signs_func.h"
 #include "station_base.h"
 #include "station_cmd.h"
+#include "station_type.h"
+#include "string_func.h"
 #include "strings_func.h"
 #include "town.h"
 #include "town_cmd.h"
@@ -33,7 +49,10 @@
 #include "town_growth.h"
 #include "town_growth_type.h"
 #include "town_type.h"
+#include "tree_cmd.h"
+#include "tree_map.h"
 
+#include <algorithm>
 #include <array>
 #include <charconv>
 #include <cmath>
@@ -58,12 +77,47 @@ struct PostedCommand {
 /** The last posted command of this module. The command path is synchronous in single player. */
 PostedCommand _posted;
 
+/** Result of the last posted Commands::FoundTown, which also returns the new town. */
+struct PostedFoundTown {
+	bool captured = false; ///< The engine called the callback, so the command really ran.
+	CommandCost cost{}; ///< The result the engine reported.
+	Money town_cost = 0; ///< The price of the founded town.
+	TownID town = TownID::Invalid(); ///< The new town, or an invalid id.
+};
+
+/** The last posted Commands::FoundTown of this module. */
+PostedFoundTown _posted_found_town;
+
+/** Result of the last posted Commands::PlaceSign, which also returns the new sign. */
+struct PostedPlaceSign {
+	bool captured = false; ///< The engine called the callback, so the command really ran.
+	CommandCost cost{}; ///< The result the engine reported.
+	SignID sign = SignID::Invalid(); ///< The new sign, or an invalid id.
+};
+
+/** The last posted Commands::PlaceSign of this module. */
+PostedPlaceSign _posted_place_sign;
+
+/** Result of the last posted Commands::BuildIndustryArea, which also returns how many it built. */
+struct PostedIndustryArea {
+	bool captured = false; ///< The engine called the callback, so the command really ran.
+	CommandCost cost{}; ///< The result the engine reported.
+	uint32_t count = 0; ///< The number of industries the command built.
+};
+
+/** The last posted Commands::BuildIndustryArea of this module. */
+PostedIndustryArea _posted_industry_area;
+
 /** Maximum number of setting names accepted by one world.settings.get call. */
 constexpr size_t MAX_SETTING_NAMES = 64;
 /** Default number of settings returned by one world.settings.get call. */
 constexpr size_t DEFAULT_SETTING_LIMIT = 50;
 /** Maximum number of settings returned by one world.settings.get call. */
 constexpr size_t MAX_SETTING_LIMIT = 500;
+/** Default number of rows returned by one bounded list query. */
+constexpr size_t DEFAULT_LIST_LIMIT = 64;
+/** Maximum number of rows returned by one bounded list query. */
+constexpr size_t MAX_LIST_LIMIT = 512;
 
 /**
  * Build an error document.
@@ -213,6 +267,42 @@ ParamState ReadTile(const Json &params, std::string_view key, TileIndex &tile)
 }
 
 /**
+ * Read the `limit` and `offset` of a bounded list query.
+ *
+ * Every list query of this module is bounded, so one call can never return the whole world.
+ *
+ * @param params The method parameters.
+ * @param offset Receives the number of rows to skip.
+ * @param limit Receives the maximum number of rows to return.
+ * @return An error document, or nothing when the window is usable.
+ */
+std::optional<Json> ReadListWindow(const Json &params, size_t &offset, size_t &limit)
+{
+	int64_t requested = static_cast<int64_t>(DEFAULT_LIST_LIMIT);
+	switch (ReadInt(params, "limit", requested)) {
+		case ParamState::Invalid: return MakeError("invalid_arguments", "`limit` must be an integer");
+		case ParamState::Present:
+			if (requested < 1 || requested > static_cast<int64_t>(MAX_LIST_LIMIT)) {
+				return MakeError("invalid_arguments", "`limit` is out of range", {{"min", 1}, {"max", MAX_LIST_LIMIT}});
+			}
+			break;
+		case ParamState::Absent: break;
+	}
+	limit = static_cast<size_t>(requested);
+
+	int64_t skipped = 0;
+	switch (ReadInt(params, "offset", skipped)) {
+		case ParamState::Invalid: return MakeError("invalid_arguments", "`offset` must be an integer");
+		case ParamState::Present:
+			if (skipped < 0) return MakeError("invalid_arguments", "`offset` must not be negative");
+			break;
+		case ParamState::Absent: break;
+	}
+	offset = static_cast<size_t>(skipped);
+	return std::nullopt;
+}
+
+/**
  * Check that a company exists.
  * @param company The company to check.
  * @return An error document, or nothing when the company is usable.
@@ -302,17 +392,75 @@ bool RunCommand(Targs... args)
 }
 
 /**
- * Add the cost and the engine error of the last command to a result document.
+ * Post one command that has no tile argument of its own, with the tile the engine reports it on.
+ *
+ * Commands with CommandFlag::Location take no TileIndex themselves, so the engine needs the
+ * location of the command for its error window; this is the Post overload for them.
+ *
+ * @param location The tile the command is reported on.
+ * @param args The command arguments.
+ * @return True when the engine executed the command and it succeeded.
+ */
+template <Commands Tcmd, typename... Targs>
+bool RunCommandAt(TileIndex location, Targs... args)
+{
+	_posted = PostedCommand{};
+	Command<Tcmd>::Post(STR_NULL, &AgentAdminCommandCallback, location, std::forward<Targs>(args)...);
+	return _posted.captured && _posted.cost.Succeeded();
+}
+
+/**
+ * Post Commands::FoundTown and remember the new town it returns.
+ * @param args The command arguments.
+ * @return True when the engine executed the command and it succeeded.
+ */
+template <Commands Tcmd, typename... Targs>
+bool RunFoundTown(Targs... args)
+{
+	_posted_found_town = PostedFoundTown{};
+	Command<Tcmd>::Post(STR_NULL, &AgentAdminFoundTownCallback, std::forward<Targs>(args)...);
+	return _posted_found_town.captured && _posted_found_town.cost.Succeeded();
+}
+
+/**
+ * Post Commands::PlaceSign and remember the new sign it returns.
+ * @param args The command arguments.
+ * @return True when the engine executed the command and it succeeded.
+ */
+template <Commands Tcmd, typename... Targs>
+bool RunPlaceSign(Targs... args)
+{
+	_posted_place_sign = PostedPlaceSign{};
+	Command<Tcmd>::Post(STR_NULL, &AgentAdminPlaceSignCallback, std::forward<Targs>(args)...);
+	return _posted_place_sign.captured && _posted_place_sign.cost.Succeeded();
+}
+
+/**
+ * Post Commands::BuildIndustryArea and remember how many industries it built.
+ * @param args The command arguments.
+ * @return True when the engine executed the command and it succeeded.
+ */
+template <Commands Tcmd, typename... Targs>
+bool RunBuildIndustryArea(Targs... args)
+{
+	_posted_industry_area = PostedIndustryArea{};
+	Command<Tcmd>::Post(STR_NULL, &AgentAdminBuildIndustryAreaCallback, std::forward<Targs>(args)...);
+	return _posted_industry_area.captured && _posted_industry_area.cost.Succeeded();
+}
+
+/**
+ * Add the cost and the engine error of one command result to a result document.
  * @param result The result document to complete.
+ * @param cost The result the engine reported.
  * @return The completed document.
  */
-Json AddCommandResult(Json result)
+Json AddCommandResult(Json result, const CommandCost &cost)
 {
-	result["cost"] = static_cast<int64_t>(_posted.cost.GetCost());
-	if (_posted.cost.Failed()) {
+	result["cost"] = static_cast<int64_t>(cost.GetCost());
+	if (cost.Failed()) {
 		result["ok"] = false;
 		result["error"] = "command_failed";
-		const StringID message = _posted.cost.GetErrorMessage();
+		const StringID message = cost.GetErrorMessage();
 		if (message != INVALID_STRING_ID) {
 			result["message_id"] = message.base();
 			result["message"] = GetString(message);
@@ -323,6 +471,16 @@ Json AddCommandResult(Json result)
 		result["ok"] = true;
 	}
 	return result;
+}
+
+/**
+ * Add the cost and the engine error of the last command to a result document.
+ * @param result The result document to complete.
+ * @return The completed document.
+ */
+Json AddCommandResult(Json result)
+{
+	return AddCommandResult(std::move(result), _posted.cost);
 }
 
 /**
@@ -770,6 +928,743 @@ Json PowerPlantInfo(const Industry *i)
 	return info;
 }
 
+/**
+ * Describe one setting by name, for the dependency reports of the query operations.
+ * @param name The setting name.
+ * @param company The company for per-company settings.
+ * @return The description, or an empty object when the setting does not exist.
+ */
+Json SettingRow(std::string_view name, CompanyID company)
+{
+	const SettingDesc *sd = GetSettingFromName(name);
+	if (sd == nullptr || !SlIsObjectCurrentlyValid(sd->save.version_from, sd->save.version_to)) return Json::object();
+	if (sd->GetType() == ST_COMPANY && !Company::IsValidID(company)) return Json::object();
+	return DescribeSetting(*sd, SettingObject(*sd, company));
+}
+
+/**
+ * Describe a list of settings by name, skipping the ones that do not exist.
+ * @param names The setting names.
+ * @param company The company for per-company settings.
+ * @return The descriptions, in the order of the names.
+ */
+Json SettingRows(std::initializer_list<std::string_view> names, CompanyID company)
+{
+	Json rows = Json::array();
+	for (const std::string_view name : names) {
+		Json row = SettingRow(name, company);
+		if (!row.empty()) rows.push_back(std::move(row));
+	}
+	return rows;
+}
+
+/**
+ * The name of a cargo type.
+ * @param cargo The cargo type.
+ * @return The name, or "invalid" for an unused slot.
+ */
+std::string CargoName(CargoType cargo)
+{
+	if (!IsValidCargoType(cargo)) return "invalid";
+	return GetString(CargoSpec::Get(cargo)->name);
+}
+
+/**
+ * The name of a company colour for the protocol.
+ * @param colour The colour.
+ * @return The name.
+ */
+std::string_view ColourName(Colours colour)
+{
+	switch (colour) {
+		case Colours::DarkBlue: return "dark_blue";
+		case Colours::PaleGreen: return "pale_green";
+		case Colours::Pink: return "pink";
+		case Colours::Yellow: return "yellow";
+		case Colours::Red: return "red";
+		case Colours::LightBlue: return "light_blue";
+		case Colours::Green: return "green";
+		case Colours::DarkGreen: return "dark_green";
+		case Colours::Blue: return "blue";
+		case Colours::Cream: return "cream";
+		case Colours::Mauve: return "mauve";
+		case Colours::Purple: return "purple";
+		case Colours::Orange: return "orange";
+		case Colours::Brown: return "brown";
+		case Colours::Grey: return "grey";
+		case Colours::White: return "white";
+		default: return "invalid";
+	}
+}
+
+/**
+ * Read a company colour by name or by palette index.
+ * @param value The value as sent by the caller.
+ * @param colour Receives the colour.
+ * @return True when the value is a usable colour.
+ */
+bool ParseColour(const Json &value, Colours &colour)
+{
+	if (value.is_number_integer()) {
+		const int64_t number = value.get<int64_t>();
+		if (number < 0 || number >= static_cast<int64_t>(Colours::End)) return false;
+		colour = static_cast<Colours>(number);
+		return true;
+	}
+	if (!value.is_string()) return false;
+	const std::string name = value.get<std::string>();
+	for (Colours candidate : EnumRange(Colours::End)) {
+		if (ColourName(candidate) == name) {
+			colour = candidate;
+			return true;
+		}
+	}
+	return false;
+}
+
+/**
+ * The name of a livery scheme for the protocol.
+ * @param scheme The scheme.
+ * @return The name.
+ */
+std::string_view LiverySchemeName(LiveryScheme scheme)
+{
+	switch (scheme) {
+		case LiveryScheme::Default: return "default";
+		case LiveryScheme::Steam: return "steam";
+		case LiveryScheme::Diesel: return "diesel";
+		case LiveryScheme::Electric: return "electric";
+		case LiveryScheme::Monorail: return "monorail";
+		case LiveryScheme::Maglev: return "maglev";
+		case LiveryScheme::DMU: return "dmu";
+		case LiveryScheme::EMU: return "emu";
+		case LiveryScheme::PassengerWagonSteam: return "passenger_wagon_steam";
+		case LiveryScheme::PassengerWagonDiesel: return "passenger_wagon_diesel";
+		case LiveryScheme::PassengerWagonElectric: return "passenger_wagon_electric";
+		case LiveryScheme::PassengerWagonMonorail: return "passenger_wagon_monorail";
+		case LiveryScheme::PassengerWagonMaglev: return "passenger_wagon_maglev";
+		case LiveryScheme::FreightWagon: return "freight_wagon";
+		case LiveryScheme::Bus: return "bus";
+		case LiveryScheme::Truck: return "truck";
+		case LiveryScheme::PassengerShip: return "passenger_ship";
+		case LiveryScheme::FreightShip: return "freight_ship";
+		case LiveryScheme::Helicopter: return "helicopter";
+		case LiveryScheme::SmallPlane: return "small_plane";
+		case LiveryScheme::LargePlane: return "large_plane";
+		case LiveryScheme::PassengerTram: return "passenger_tram";
+		case LiveryScheme::FreightTram: return "freight_tram";
+		default: return "unknown";
+	}
+}
+
+/**
+ * Read a livery scheme by name.
+ * @param name The name.
+ * @param scheme Receives the scheme.
+ * @return True when the name is known.
+ */
+bool ParseLiverySchemeName(std::string_view name, LiveryScheme &scheme)
+{
+	for (LiveryScheme candidate : EnumRange(LiveryScheme::End)) {
+		if (LiverySchemeName(candidate) == name) {
+			scheme = candidate;
+			return true;
+		}
+	}
+	return false;
+}
+
+/**
+ * The name of a town action for the protocol.
+ * @param action The action.
+ * @return The name.
+ */
+std::string_view TownActionName(TownAction action)
+{
+	switch (action) {
+		case TownAction::AdvertiseSmall: return "advertise_small";
+		case TownAction::AdvertiseMedium: return "advertise_medium";
+		case TownAction::AdvertiseLarge: return "advertise_large";
+		case TownAction::RoadRebuild: return "road_rebuild";
+		case TownAction::BuildStatue: return "build_statue";
+		case TownAction::FundBuildings: return "fund_buildings";
+		case TownAction::BuyRights: return "buy_rights";
+		case TownAction::Bribe: return "bribe";
+		default: return "unknown";
+	}
+}
+
+/**
+ * Read a town action by name.
+ * @param name The name.
+ * @param action Receives the action.
+ * @return True when the name is known.
+ */
+bool ParseTownActionName(std::string_view name, TownAction &action)
+{
+	for (TownAction candidate : EnumRange(TownAction::End)) {
+		if (TownActionName(candidate) == name) {
+			action = candidate;
+			return true;
+		}
+	}
+	return false;
+}
+
+/**
+ * The name of a town size for the protocol.
+ * @param size The size.
+ * @return The name.
+ */
+std::string_view TownSizeName(TownSize size)
+{
+	switch (size) {
+		case TownSize::Small: return "small";
+		case TownSize::Medium: return "medium";
+		case TownSize::Large: return "large";
+		case TownSize::Random: return "random";
+		default: return "unknown";
+	}
+}
+
+/**
+ * Read a town size by name.
+ * @param name The name.
+ * @param size Receives the size.
+ * @return True when the name is known.
+ */
+bool ParseTownSizeName(std::string_view name, TownSize &size)
+{
+	for (TownSize candidate : EnumRange(TownSize::End)) {
+		if (TownSizeName(candidate) == name) {
+			size = candidate;
+			return true;
+		}
+	}
+	return false;
+}
+
+/**
+ * The name of a town layout for the protocol.
+ * @param layout The layout.
+ * @return The name.
+ */
+std::string_view TownLayoutName(TownLayout layout)
+{
+	switch (layout) {
+		case TownLayout::Original: return "original";
+		case TownLayout::BetterRoads: return "better_roads";
+		case TownLayout::Grid2x2: return "grid_2x2";
+		case TownLayout::Grid3x3: return "grid_3x3";
+		case TownLayout::Random: return "random";
+		default: return "unknown";
+	}
+}
+
+/**
+ * Read a town layout by name.
+ * @param name The name.
+ * @param layout Receives the layout.
+ * @return True when the name is known.
+ */
+bool ParseTownLayoutName(std::string_view name, TownLayout &layout)
+{
+	for (TownLayout candidate : EnumRange(TownLayout::End)) {
+		if (TownLayoutName(candidate) == name) {
+			layout = candidate;
+			return true;
+		}
+	}
+	return false;
+}
+
+/**
+ * The name of an industry control flag for the protocol.
+ * @param flag The flag.
+ * @return The name.
+ */
+std::string_view IndustryControlFlagName(IndustryControlFlag flag)
+{
+	switch (flag) {
+		case IndustryControlFlag::NoProductionDecrease: return "no_production_decrease";
+		case IndustryControlFlag::NoProductionIncrease: return "no_production_increase";
+		case IndustryControlFlag::NoClosure: return "no_closure";
+		case IndustryControlFlag::ExternalProdLevel: return "external_prod_level";
+		default: return "unknown";
+	}
+}
+
+/**
+ * Read an industry control flag by name.
+ * @param name The name.
+ * @param flag Receives the flag.
+ * @return True when the name is known.
+ */
+bool ParseIndustryControlFlagName(std::string_view name, IndustryControlFlag &flag)
+{
+	for (IndustryControlFlag candidate : EnumRange(IndustryControlFlag::End)) {
+		if (IndustryControlFlagName(candidate) == name) {
+			flag = candidate;
+			return true;
+		}
+	}
+	return false;
+}
+
+/**
+ * Read an optional industry id parameter.
+ * @param params The method parameters.
+ * @param key The parameter name.
+ * @param industry Receives the industry.
+ * @return An error document, or nothing when the parameter is usable or absent.
+ */
+std::optional<Json> ReadIndustryId(const Json &params, std::string_view key, IndustryID &industry)
+{
+	int64_t id = 0;
+	switch (ReadInt(params, key, id)) {
+		case ParamState::Absent:
+			return std::nullopt;
+		case ParamState::Invalid:
+			return MakeError("invalid_arguments", "`" + std::string(key) + "` must be an industry id");
+		case ParamState::Present:
+			break;
+	}
+	if (id < 0 || id >= static_cast<int64_t>(IndustryID::End().base())) {
+		return MakeError("unknown_industry", "the industry id is out of range", {{"industry_id", id}});
+	}
+	industry = IndustryID(static_cast<uint16_t>(id));
+	return std::nullopt;
+}
+
+/**
+ * Read an optional sign id parameter.
+ * @param params The method parameters.
+ * @param key The parameter name.
+ * @param sign Receives the sign.
+ * @return An error document, or nothing when the parameter is usable or absent.
+ */
+std::optional<Json> ReadSignId(const Json &params, std::string_view key, SignID &sign)
+{
+	int64_t id = 0;
+	switch (ReadInt(params, key, id)) {
+		case ParamState::Absent:
+			return std::nullopt;
+		case ParamState::Invalid:
+			return MakeError("invalid_arguments", "`" + std::string(key) + "` must be a sign id");
+		case ParamState::Present:
+			break;
+	}
+	if (id < 0 || id >= static_cast<int64_t>(SignID::End().base())) {
+		return MakeError("unknown_sign", "the sign id is out of range", {{"sign_id", id}});
+	}
+	sign = SignID(static_cast<uint16_t>(id));
+	return std::nullopt;
+}
+
+/**
+ * Read an optional station id parameter.
+ * @param params The method parameters.
+ * @param key The parameter name.
+ * @param station Receives the station.
+ * @return An error document, or nothing when the parameter is usable or absent.
+ */
+std::optional<Json> ReadStationId(const Json &params, std::string_view key, StationID &station)
+{
+	int64_t id = 0;
+	switch (ReadInt(params, key, id)) {
+		case ParamState::Absent:
+			return std::nullopt;
+		case ParamState::Invalid:
+			return MakeError("invalid_arguments", "`" + std::string(key) + "` must be a station id");
+		case ParamState::Present:
+			break;
+	}
+	if (id < 0 || id >= static_cast<int64_t>(StationID::End().base())) {
+		return MakeError("unknown_station", "the station id is out of range", {{"station_id", id}});
+	}
+	station = StationID(static_cast<uint16_t>(id));
+	return std::nullopt;
+}
+
+/**
+ * Check that an industry exists.
+ * @param industry The industry to check.
+ * @return An error document, or nothing when the industry is usable.
+ */
+std::optional<Json> CheckIndustry(IndustryID industry)
+{
+	if (!Industry::IsValidID(industry)) {
+		return MakeError("unknown_industry", "there is no industry with that id", {{"industry_id", industry.base()}});
+	}
+	return std::nullopt;
+}
+
+/**
+ * Check that a sign exists.
+ * @param sign The sign to check.
+ * @return An error document, or nothing when the sign is usable.
+ */
+std::optional<Json> CheckSign(SignID sign)
+{
+	if (!Sign::IsValidID(sign)) {
+		return MakeError("unknown_sign", "there is no sign with that id", {{"sign_id", sign.base()}});
+	}
+	return std::nullopt;
+}
+
+/**
+ * Check that a station exists.
+ * @param station The station to check.
+ * @return An error document, or nothing when the station is usable.
+ */
+std::optional<Json> CheckStation(StationID station)
+{
+	if (!Station::IsValidID(station)) {
+		return MakeError("unknown_station", "there is no station with that id", {{"station_id", station.base()}});
+	}
+	return std::nullopt;
+}
+
+/**
+ * The identity and the control state of one industry.
+ * @param i The industry; must be valid.
+ * @return The description.
+ */
+Json IndustryInfo(const Industry *i)
+{
+	Json info = Json::object();
+	info["industry_id"] = i->index.base();
+	info["name"] = GetString(STR_INDUSTRY_NAME, i->index);
+	info["type"] = i->type;
+	info["type_name"] = GetString(GetIndustrySpec(i->type)->name);
+	info["town_id"] = i->town == nullptr ? Json(nullptr) : Json(i->town->index.base());
+	info["town_name"] = i->town == nullptr ? Json(nullptr) : Json(TownName(i->town));
+	info["location"] = Json{{"x", TileX(i->location.tile)}, {"y", TileY(i->location.tile)}, {"w", i->location.w}, {"h", i->location.h}};
+	info["prod_level"] = i->prod_level;
+	info["prod_level_min"] = PRODLEVEL_MINIMUM;
+	info["prod_level_max"] = PRODLEVEL_MAXIMUM;
+	info["founder"] = i->founder == INVALID_OWNER ? Json(nullptr) : Json(i->founder.base());
+	info["construction_date"] = i->construction_date.base();
+	info["last_prod_year"] = i->last_prod_year.base();
+	info["exclusive_supplier"] = i->exclusive_supplier == INVALID_OWNER ? Json(nullptr) : Json(i->exclusive_supplier.base());
+	info["exclusive_consumer"] = i->exclusive_consumer == INVALID_OWNER ? Json(nullptr) : Json(i->exclusive_consumer.base());
+	info["is_raw_industry"] = GetIndustrySpec(i->type)->IsRawIndustry();
+	info["is_power_plant"] = IsPowerPlant(i);
+
+	Json flags = Json::array();
+	for (const IndustryControlFlag flag : EnumRange(IndustryControlFlag::End)) {
+		if (i->ctlflags.Test(flag)) flags.push_back(IndustryControlFlagName(flag));
+	}
+	info["control_flags"] = std::move(flags);
+	return info;
+}
+
+/**
+ * The cargo an industry accepts, with the waiting amount and the recent history.
+ * @param i The industry; must be valid.
+ * @return The description.
+ */
+Json IndustryNeeds(const Industry *i)
+{
+	Json result = Json::object();
+	result["industry_id"] = i->index.base();
+	result["name"] = GetString(STR_INDUSTRY_NAME, i->index);
+	result["type_name"] = GetString(GetIndustrySpec(i->type)->name);
+
+	Json accepted = Json::array();
+	for (const Industry::AcceptedCargo &slot : i->accepted) {
+		if (!IsValidCargoType(slot.cargo)) continue;
+		Json row = Json::object();
+		row["cargo"] = CargoName(slot.cargo);
+		row["cargo_type"] = static_cast<uint8_t>(slot.cargo);
+		row["waiting"] = slot.waiting;
+		row["accumulated_waiting"] = slot.accumulated_waiting;
+		row["last_accepted"] = slot.last_accepted.base();
+		if (slot.history != nullptr) {
+			Json history = Json::array();
+			for (const Industry::AcceptedHistory &entry : *slot.history) {
+				history.push_back(Json{{"accepted", entry.accepted}, {"waiting", entry.waiting}});
+			}
+			row["history"] = std::move(history);
+		}
+		accepted.push_back(std::move(row));
+	}
+	result["accepted"] = std::move(accepted);
+	result["accepts_cargo"] = !accepted.empty();
+	return result;
+}
+
+/**
+ * The cargo an industry produces, with the rate and the recent history.
+ * @param i The industry; must be valid.
+ * @return The description.
+ */
+Json IndustryProduction(const Industry *i)
+{
+	Json result = Json::object();
+	result["industry_id"] = i->index.base();
+	result["name"] = GetString(STR_INDUSTRY_NAME, i->index);
+	result["type_name"] = GetString(GetIndustrySpec(i->type)->name);
+	result["prod_level"] = i->prod_level;
+	result["prod_level_min"] = PRODLEVEL_MINIMUM;
+	result["prod_level_max"] = PRODLEVEL_MAXIMUM;
+
+	Json produced = Json::array();
+	for (const Industry::ProducedCargo &slot : i->produced) {
+		if (!IsValidCargoType(slot.cargo)) continue;
+		Json row = Json::object();
+		row["cargo"] = CargoName(slot.cargo);
+		row["cargo_type"] = static_cast<uint8_t>(slot.cargo);
+		row["waiting"] = slot.waiting;
+		row["rate"] = slot.rate;
+		Json history = Json::array();
+		for (const Industry::ProducedHistory &entry : slot.history) {
+			history.push_back(Json{{"production", entry.production}, {"transported", entry.transported}, {"transported_pct", entry.PctTransported()}});
+		}
+		row["history"] = std::move(history);
+		produced.push_back(std::move(row));
+	}
+	result["produced"] = std::move(produced);
+	result["produces_cargo"] = !produced.empty();
+	return result;
+}
+
+/**
+ * The cargo an industry accepts and produces in one document.
+ * @param i The industry; must be valid.
+ * @return The description.
+ */
+Json IndustryCargo(const Industry *i)
+{
+	Json result = IndustryProduction(i);
+	Json needs = IndustryNeeds(i);
+	result["accepted"] = std::move(needs["accepted"]);
+	result["accepts_cargo"] = needs["accepts_cargo"];
+	return result;
+}
+
+/**
+ * The growth state of one town together with the settings that actually drive it.
+ * @param t The town; must be valid.
+ * @return The description.
+ */
+Json TownGrowth(const Town *t)
+{
+	Json result = TownNeeds(t->index);
+	result["settings"] = SettingRows({
+			"economy.town_growth_rate",
+			"economy.larger_towns",
+			"economy.town_growth_base",
+			"economy.town_cargo_scale",
+			"economy.town_need_power_residents",
+			"economy.town_power_link_radius",
+	}, _local_company);
+	result["dependencies"] = Json::array({
+			"the growth budget accumulates from the population and the town growth rate setting",
+			"an unlocked need at level 0 blocks growth until it is supplied again",
+			"the investment of the companies adds to the budget while it lasts",
+			"electricity needs a power plant within the power link radius of the town",
+	});
+	return result;
+}
+
+/**
+ * The own settings of one town and the global settings that drive them.
+ * @param t The town; must be valid.
+ * @return The description.
+ */
+Json TownSettings(const Town *t)
+{
+	Json result = Json::object();
+	result["town_id"] = t->index.base();
+	result["name"] = TownName(t);
+	result["population"] = t->cache.population;
+	result["houses"] = t->cache.num_houses;
+	result["growth_rate"] = t->growth_rate;
+	result["custom_growth"] = t->flags.Test(TownFlag::CustomGrowth);
+	result["grow_counter"] = t->grow_counter;
+	result["time_until_rebuild"] = t->time_until_rebuild;
+	result["fund_buildings_months"] = t->fund_buildings_months;
+	result["road_build_months"] = t->road_build_months;
+	result["exclusive_counter"] = t->exclusive_counter;
+	result["statues"] = t->statues.base();
+	result["noise_reached"] = t->noise_reached;
+	result["layout"] = TownLayoutName(t->layout);
+	result["larger_town"] = t->larger_town;
+	result["is_city"] = t->larger_town;
+	result["growth_status"] = GrowthStatusName(t->growth.status);
+	result["investment"] = t->growth.investment;
+	result["investment_bonus"] = GetTownInvestmentBonus(t);
+	result["districts_from_population"] = TOWN_DISTRICTS_MIN_POPULATION;
+
+	Json ratings = Json::array();
+	for (const Company *c : Company::Iterate()) {
+		ratings.push_back(Json{{"company_id", c->index.base()}, {"rating", t->ratings[c->index]}});
+	}
+	result["ratings"] = std::move(ratings);
+
+	result["settings"] = SettingRows({
+			"economy.town_layout",
+			"economy.found_town",
+			"economy.town_growth_rate",
+			"economy.larger_towns",
+			"economy.town_growth_base",
+			"economy.town_cargo_scale",
+			"economy.town_need_power_residents",
+			"economy.town_power_link_radius",
+	}, _local_company);
+	return result;
+}
+
+/**
+ * The power links of one town and the plants behind them.
+ * @param t The town; must be valid.
+ * @return The description.
+ */
+Json TownPower(const Town *t)
+{
+	Json result = Json::object();
+	result["town_id"] = t->index.base();
+	result["name"] = TownName(t);
+	result["population"] = t->cache.population;
+	result["electricity_available"] = IsElectricityAvailable();
+	result["power_received"] = GetTownPowerReceived(t);
+	result["power_links_wanted"] = GetTownWantedPowerLinks(t);
+
+	Json links = Json::array();
+	for (const TownPowerLink &link : t->growth.power_links) {
+		const Industry *plant = Industry::GetIfValid(link.plant);
+		Json row = Json::object();
+		row["plant"] = link.plant.base();
+		row["delivered"] = link.delivered;
+		if (plant != nullptr) {
+			row["name"] = GetString(STR_INDUSTRY_NAME, plant->index);
+			row["fuel"] = GetPowerPlantFuelStock(plant);
+			row["output"] = plant->power_output;
+			row["demand"] = plant->power_demand;
+		}
+		links.push_back(std::move(row));
+	}
+	result["power_links"] = std::move(links);
+
+	result["settings"] = SettingRows({
+			"economy.town_need_power_residents",
+			"economy.town_power_link_radius",
+	}, _local_company);
+	return result;
+}
+
+/**
+ * The identity and the owner of one sign.
+ * @param si The sign; must be valid.
+ * @return The description.
+ */
+Json SignInfo(const Sign *si)
+{
+	Json info = Json::object();
+	info["sign_id"] = si->index.base();
+	info["name"] = si->name;
+	info["owner"] = si->owner == INVALID_OWNER ? Json(nullptr) : Json(si->owner.base());
+	info["text_colour"] = ColourName(si->text_colour);
+	info["x"] = si->x;
+	info["y"] = si->y;
+	info["z"] = si->z;
+	info["tile"] = Json{{"x", si->x / TILE_SIZE}, {"y", si->y / TILE_SIZE}};
+	return info;
+}
+
+/**
+ * The catchment of one station and the settings that drive it.
+ * @param st The station; must be valid.
+ * @return The description.
+ */
+Json StationCatchment(const Station *st)
+{
+	Json result = Json::object();
+	result["station_id"] = st->index.base();
+	result["name"] = st->name;
+	result["owner"] = st->owner == OWNER_NONE ? Json(nullptr) : Json(st->owner.base());
+	result["catchment_level"] = st->catchment_level;
+	result["max_catchment_level"] = MAX_STATION_CATCHMENT_LEVEL;
+	result["next_upgrade_cost"] = st->catchment_level >= MAX_STATION_CATCHMENT_LEVEL
+			? Json(nullptr)
+			: Json(static_cast<int64_t>(GetStationCatchmentUpgradeCost(st->catchment_level + 1)));
+	result["modified_catchment"] = _settings_game.station.modified_catchment;
+	result["max_catchment"] = _settings_game.station.modified_catchment ? MAX_CATCHMENT : MAX_CATCHMENT_UNMODIFIED;
+	result["settings"] = SettingRows({"station.modified_catchment"}, _local_company);
+	return result;
+}
+
+/**
+ * The object types that can be built in the current game.
+ * @return The descriptions.
+ */
+Json ObjectTypeList()
+{
+	Json types = Json::array();
+	for (ObjectType type = 0; type < ObjectSpec::Count(); type++) {
+		const ObjectSpec *spec = ObjectSpec::Get(type);
+		if (!spec->IsEnabled()) continue;
+		Json row = Json::object();
+		row["type"] = type;
+		row["name"] = GetString(spec->name);
+		row["views"] = spec->views;
+		row["size_x"] = GB(spec->size, 0, 4);
+		row["size_y"] = GB(spec->size, 4, 4);
+		row["available"] = spec->IsAvailable();
+		row["build_cost_multiplier"] = spec->build_cost_multiplier;
+		types.push_back(std::move(row));
+	}
+	return types;
+}
+
+/**
+ * The industry types that can be funded in the current game.
+ * @return The descriptions.
+ */
+Json IndustryTypeList()
+{
+	Json types = Json::array();
+	for (IndustryType type = 0; type < NUM_INDUSTRYTYPES; type++) {
+		const IndustrySpec *spec = GetIndustrySpec(type);
+		if (!spec->enabled || spec->layouts.empty()) continue;
+		Json row = Json::object();
+		row["type"] = type;
+		row["name"] = GetString(spec->name);
+		row["is_raw_industry"] = spec->IsRawIndustry();
+		row["construction_cost"] = static_cast<int64_t>(spec->GetConstructionCost());
+		row["prospecting_chance"] = spec->prospecting_chance;
+		types.push_back(std::move(row));
+	}
+	return types;
+}
+
+/**
+ * The livery of one company.
+ * @param company The company; must be valid.
+ * @return The description.
+ */
+Json CompanyLivery(CompanyID company)
+{
+	const Company *c = Company::Get(company);
+	Json schemes = Json::array();
+	for (const LiveryScheme scheme : EnumRange(LiveryScheme::End)) {
+		const Livery &livery = c->livery[scheme];
+		schemes.push_back(Json{
+				{"scheme", LiverySchemeName(scheme)},
+				{"in_use", livery.in_use.Any()},
+				{"primary", livery.in_use.Test(Livery::Flag::Primary) ? Json(ColourName(livery.colour1)) : Json(nullptr)},
+				{"secondary", livery.in_use.Test(Livery::Flag::Secondary) ? Json(ColourName(livery.colour2)) : Json(nullptr)},
+		});
+	}
+	Json result = Json::object();
+	result["company_id"] = company.base();
+	result["colour"] = ColourName(c->colour);
+	result["colour_index"] = to_underlying(c->colour);
+	result["schemes"] = std::move(schemes);
+	return result;
+}
+
 /* --- world.settings.get --- */
 
 /**
@@ -1135,6 +2030,218 @@ Json CompanyOp(const Json &params, CompanyID company)
 		return result;
 	}
 
+	if (op == "info") {
+		CompanyID target = company;
+		if (const auto error = ReadCompanyId(params, "company_id", target); error.has_value()) return *error;
+		if (const auto error = CheckCompany(target); error.has_value()) return *error;
+		Json result = Json::object();
+		result["ok"] = true;
+		result["company"] = CompanyInfo(target);
+		return result;
+	}
+
+	if (op == "livery") {
+		CompanyID target = company;
+		if (const auto error = ReadCompanyId(params, "company_id", target); error.has_value()) return *error;
+		if (const auto error = CheckCompany(target); error.has_value()) return *error;
+		Json result = Json::object();
+		result["ok"] = true;
+		result["livery"] = CompanyLivery(target);
+		return result;
+	}
+
+	if (op == "colour") {
+		CompanyID target = company;
+		if (const auto error = ReadCompanyId(params, "company_id", target); error.has_value()) return *error;
+		if (const auto error = CheckCompany(target); error.has_value()) return *error;
+
+		const auto colour_it = params.find("colour");
+		if (colour_it == params.end() || colour_it->is_null()) return MakeError("invalid_arguments", "`colour` is required");
+		Colours colour = Colours::Begin;
+		if (!ParseColour(*colour_it, colour)) {
+			Json allowed = Json::array();
+			for (const Colours candidate : EnumRange(Colours::End)) allowed.push_back(ColourName(candidate));
+			return MakeError("invalid_arguments", "`colour` must be a colour name or a palette index", {{"colour", *colour_it}, {"allowed", std::move(allowed)}});
+		}
+
+		Json result = Json::object();
+		result["company_id"] = target.base();
+		result["colour"] = ColourName(colour);
+		result["colour_before"] = ColourName(Company::Get(target)->colour);
+		const Backup<CompanyID> context(_current_company, target);
+		const bool ok = RunCommand<Commands::SetCompanyColour>(LiveryScheme::Default, true, colour);
+		if (!_posted.captured) return AddNotExecuted(std::move(result));
+		result = AddCommandResult(std::move(result));
+		if (ok) result["colour_after"] = ColourName(Company::Get(target)->colour);
+		return result;
+	}
+
+	if (op == "livery_set") {
+		CompanyID target = company;
+		if (const auto error = ReadCompanyId(params, "company_id", target); error.has_value()) return *error;
+		if (const auto error = CheckCompany(target); error.has_value()) return *error;
+
+		std::string scheme_name;
+		switch (ReadString(params, "scheme", scheme_name)) {
+			case ParamState::Invalid: return MakeError("invalid_arguments", "`scheme` must be a string");
+			case ParamState::Absent: return MakeError("invalid_arguments", "`scheme` is required");
+			case ParamState::Present: break;
+		}
+		LiveryScheme scheme = LiveryScheme::Default;
+		if (!ParseLiverySchemeName(scheme_name, scheme)) {
+			Json allowed = Json::array();
+			for (const LiveryScheme candidate : EnumRange(LiveryScheme::End)) allowed.push_back(LiverySchemeName(candidate));
+			return MakeError("invalid_arguments", "unknown livery scheme", {{"scheme", scheme_name}, {"allowed", std::move(allowed)}});
+		}
+
+		bool primary = true;
+		switch (ReadBool(params, "primary", primary)) {
+			case ParamState::Invalid: return MakeError("invalid_arguments", "`primary` must be a boolean");
+			case ParamState::Present: break;
+			case ParamState::Absent: break;
+		}
+
+		const auto colour_it = params.find("colour");
+		if (colour_it == params.end() || colour_it->is_null()) return MakeError("invalid_arguments", "`colour` is required");
+		Colours colour = Colours::Begin;
+		if (!ParseColour(*colour_it, colour)) {
+			return MakeError("invalid_arguments", "`colour` must be a colour name or a palette index", {{"colour", *colour_it}});
+		}
+
+		Json result = Json::object();
+		result["company_id"] = target.base();
+		result["scheme"] = LiverySchemeName(scheme);
+		result["primary"] = primary;
+		result["colour"] = ColourName(colour);
+		const Backup<CompanyID> context(_current_company, target);
+		const bool ok = RunCommand<Commands::SetCompanyColour>(scheme, primary, colour);
+		if (!_posted.captured) return AddNotExecuted(std::move(result));
+		result = AddCommandResult(std::move(result));
+		if (ok) result["livery"] = CompanyLivery(target);
+		return result;
+	}
+
+	if (op == "manager_face") {
+		CompanyID target = company;
+		if (const auto error = ReadCompanyId(params, "company_id", target); error.has_value()) return *error;
+		if (const auto error = CheckCompany(target); error.has_value()) return *error;
+
+		int64_t style = 0;
+		switch (ReadInt(params, "style", style)) {
+			case ParamState::Invalid: return MakeError("invalid_arguments", "`style` must be an integer");
+			case ParamState::Absent: return MakeError("invalid_arguments", "`style` is required");
+			case ParamState::Present: break;
+		}
+		if (style < 0 || style >= static_cast<int64_t>(GetNumCompanyManagerFaceStyles())) {
+			return MakeError("invalid_arguments", "the manager face style is out of range",
+					{{"style", style}, {"max", GetNumCompanyManagerFaceStyles() - 1}});
+		}
+
+		int64_t bits = 0;
+		switch (ReadInt(params, "bits", bits)) {
+			case ParamState::Invalid: return MakeError("invalid_arguments", "`bits` must be an integer");
+			case ParamState::Absent: return MakeError("invalid_arguments", "`bits` is required");
+			case ParamState::Present: break;
+		}
+		if (bits < 0 || bits > static_cast<int64_t>(UINT32_MAX)) {
+			return MakeError("invalid_arguments", "the manager face bits are out of range", {{"bits", bits}});
+		}
+
+		Json result = Json::object();
+		result["company_id"] = target.base();
+		result["style"] = style;
+		result["bits"] = bits;
+		const Backup<CompanyID> context(_current_company, target);
+		const bool ok = RunCommand<Commands::SetCompanyManagerFace>(static_cast<uint>(style), static_cast<uint32_t>(bits));
+		if (!_posted.captured) return AddNotExecuted(std::move(result));
+		result = AddCommandResult(std::move(result));
+		if (ok) {
+			const Company *c = Company::Get(target);
+			result["face_after"] = Json{{"style", c->face.style}, {"bits", c->face.bits}};
+		}
+		return result;
+	}
+
+	if (op == "rename") {
+		CompanyID target = company;
+		if (const auto error = ReadCompanyId(params, "company_id", target); error.has_value()) return *error;
+		if (const auto error = CheckCompany(target); error.has_value()) return *error;
+
+		std::string text;
+		switch (ReadString(params, "text", text)) {
+			case ParamState::Invalid: return MakeError("invalid_arguments", "`text` must be a string");
+			case ParamState::Absent: return MakeError("invalid_arguments", "`text` is required");
+			case ParamState::Present: break;
+		}
+
+		Json result = Json::object();
+		result["company_id"] = target.base();
+		result["name_before"] = CompanyName(Company::Get(target));
+		const Backup<CompanyID> context(_current_company, target);
+		const bool ok = RunCommand<Commands::RenameCompany>(text);
+		if (!_posted.captured) return AddNotExecuted(std::move(result));
+		result = AddCommandResult(std::move(result));
+		if (ok) result["name_after"] = CompanyName(Company::Get(target));
+		return result;
+	}
+
+	if (op == "rename_president") {
+		CompanyID target = company;
+		if (const auto error = ReadCompanyId(params, "company_id", target); error.has_value()) return *error;
+		if (const auto error = CheckCompany(target); error.has_value()) return *error;
+
+		std::string text;
+		switch (ReadString(params, "text", text)) {
+			case ParamState::Invalid: return MakeError("invalid_arguments", "`text` must be a string");
+			case ParamState::Absent: return MakeError("invalid_arguments", "`text` is required");
+			case ParamState::Present: break;
+		}
+
+		Json result = Json::object();
+		result["company_id"] = target.base();
+		result["president_name_before"] = PresidentName(Company::Get(target));
+		const Backup<CompanyID> context(_current_company, target);
+		const bool ok = RunCommand<Commands::RenamePresident>(text);
+		if (!_posted.captured) return AddNotExecuted(std::move(result));
+		result = AddCommandResult(std::move(result));
+		if (ok) result["president_name_after"] = PresidentName(Company::Get(target));
+		return result;
+	}
+
+	if (op == "buy") {
+		CompanyID target = CompanyID::Invalid();
+		if (const auto error = ReadCompanyId(params, "company_id", target); error.has_value()) return *error;
+		if (target == CompanyID::Invalid()) return MakeError("invalid_arguments", "`company_id` is required");
+		if (const auto error = CheckCompany(target); error.has_value()) return *error;
+
+		bool hostile = false;
+		switch (ReadBool(params, "hostile", hostile)) {
+			case ParamState::Invalid: return MakeError("invalid_arguments", "`hostile` must be a boolean");
+			case ParamState::Present: break;
+			case ParamState::Absent: break;
+		}
+
+		CompanyID buyer = company;
+		if (const auto error = ReadCompanyId(params, "buyer_company_id", buyer); error.has_value()) return *error;
+		if (const auto error = CheckCompany(buyer); error.has_value()) return *error;
+		if (buyer == target) return MakeError("invalid_arguments", "a company cannot buy itself", {{"company_id", target.base()}});
+
+		Json result = Json::object();
+		result["company_id"] = target.base();
+		result["buyer_company_id"] = buyer.base();
+		result["hostile"] = hostile;
+		result["before"] = CompanyInfo(target);
+		const Backup<CompanyID> context(_current_company, buyer);
+		const bool ok = RunCommand<Commands::BuyCompany>(target, hostile);
+		if (!_posted.captured) return AddNotExecuted(std::move(result));
+		result = AddCommandResult(std::move(result));
+		if (ok) {
+			result["bought"] = !Company::IsValidID(target);
+			result["buyer"] = CompanyInfo(buyer);
+		}
+		return result;
+	}
+
 	return MakeGap("world.company", op);
 }
 
@@ -1455,6 +2562,236 @@ Json TownsOp(const Json &params, CompanyID company)
 		return result;
 	}
 
+	if (op == "list") {
+		size_t offset = 0;
+		size_t limit = 0;
+		if (const auto error = ReadListWindow(params, offset, limit)) return *error;
+
+		Json towns = Json::array();
+		size_t total = 0;
+		for (const Town *t : Town::Iterate()) {
+			if (total >= offset && towns.size() < limit) {
+				towns.push_back(Json{
+						{"town_id", t->index.base()},
+						{"name", TownName(t)},
+						{"population", t->cache.population},
+						{"houses", t->cache.num_houses},
+						{"is_city", t->larger_town},
+						{"growth_status", GrowthStatusName(t->growth.status)},
+						{"location", Json{{"x", TileX(t->xy)}, {"y", TileY(t->xy)}}},
+				});
+			}
+			total++;
+		}
+		Json result = Json::object();
+		result["ok"] = true;
+		result["towns"] = std::move(towns);
+		result["total"] = total;
+		result["offset"] = offset;
+		result["limit"] = limit;
+		return result;
+	}
+
+	if (op == "growth") {
+		TownID town = TownID::Invalid();
+		if (const auto error = ReadTownId(params, "town_id", town); error.has_value()) return *error;
+		if (town == TownID::Invalid()) return MakeError("invalid_arguments", "`town_id` is required");
+		if (const auto error = CheckTown(town); error.has_value()) return *error;
+		Json result = Json::object();
+		result["ok"] = true;
+		result["town"] = TownGrowth(Town::Get(town));
+		return result;
+	}
+
+	if (op == "settings") {
+		TownID town = TownID::Invalid();
+		if (const auto error = ReadTownId(params, "town_id", town); error.has_value()) return *error;
+		if (town == TownID::Invalid()) return MakeError("invalid_arguments", "`town_id` is required");
+		if (const auto error = CheckTown(town); error.has_value()) return *error;
+		Json result = Json::object();
+		result["ok"] = true;
+		result["town"] = TownSettings(Town::Get(town));
+		return result;
+	}
+
+	if (op == "power") {
+		TownID town = TownID::Invalid();
+		if (const auto error = ReadTownId(params, "town_id", town); error.has_value()) return *error;
+		if (town == TownID::Invalid()) return MakeError("invalid_arguments", "`town_id` is required");
+		if (const auto error = CheckTown(town); error.has_value()) return *error;
+		Json result = Json::object();
+		result["ok"] = true;
+		result["town"] = TownPower(Town::Get(town));
+		return result;
+	}
+
+	if (op == "found") {
+		/* The cheap arguments are checked before the tile, so a malformed call never reaches the map. */
+		TownSize size = TownSize::Small;
+		std::string size_name;
+		switch (ReadString(params, "size", size_name)) {
+			case ParamState::Invalid: return MakeError("invalid_arguments", "`size` must be a string");
+			case ParamState::Present:
+				if (!ParseTownSizeName(size_name, size)) {
+					Json allowed = Json::array();
+					for (const TownSize candidate : EnumRange(TownSize::End)) allowed.push_back(TownSizeName(candidate));
+					return MakeError("invalid_arguments", "unknown town size", {{"size", size_name}, {"allowed", std::move(allowed)}});
+				}
+				break;
+			case ParamState::Absent: break;
+		}
+
+		bool city = false;
+		switch (ReadBool(params, "city", city)) {
+			case ParamState::Invalid: return MakeError("invalid_arguments", "`city` must be a boolean");
+			case ParamState::Present: break;
+			case ParamState::Absent: break;
+		}
+
+		TownLayout layout = _settings_game.economy.town_layout;
+		std::string layout_name;
+		switch (ReadString(params, "layout", layout_name)) {
+			case ParamState::Invalid: return MakeError("invalid_arguments", "`layout` must be a string");
+			case ParamState::Present:
+				if (!ParseTownLayoutName(layout_name, layout)) {
+					Json allowed = Json::array();
+					for (const TownLayout candidate : EnumRange(TownLayout::End)) allowed.push_back(TownLayoutName(candidate));
+					return MakeError("invalid_arguments", "unknown town layout", {{"layout", layout_name}, {"allowed", std::move(allowed)}});
+				}
+				break;
+			case ParamState::Absent: break;
+		}
+
+		std::string name;
+		switch (ReadString(params, "name", name)) {
+			case ParamState::Invalid: return MakeError("invalid_arguments", "`name` must be a string");
+			case ParamState::Present: break;
+			case ParamState::Absent: break;
+		}
+		if (Utf8StringLength(name) >= MAX_LENGTH_TOWN_NAME_CHARS) {
+			return MakeError("invalid_arguments", "the town name is too long",
+					{{"length", Utf8StringLength(name)}, {"max", MAX_LENGTH_TOWN_NAME_CHARS - 1}});
+		}
+
+		TileIndex tile = INVALID_TILE;
+		switch (ReadTile(params, "tile", tile)) {
+			case ParamState::Invalid: return MakeError("invalid_arguments", "`tile` must be an object with `x` and `y` inside the map");
+			case ParamState::Absent: return MakeError("invalid_arguments", "`tile` is required");
+			case ParamState::Present: break;
+		}
+
+		Json result = Json::object();
+		result["tile"] = Json{{"x", TileX(tile)}, {"y", TileY(tile)}};
+		result["size"] = TownSizeName(size);
+		result["city"] = city;
+		result["layout"] = TownLayoutName(layout);
+		result["name"] = name;
+
+		/*
+		 * The engine generates the name from the town name parts and rejects a duplicate, so an
+		 * automatic name is retried with a fresh seed a few times before the error is reported.
+		 */
+		const Backup<CompanyID> context(_current_company, OWNER_DEITY);
+		bool ok = false;
+		for (int attempt = 0; attempt < 8; attempt++) {
+			const uint32_t parts = Random();
+			ok = RunFoundTown<Commands::FoundTown>(tile, size, city, layout, false, parts, name);
+			if (ok) break;
+			if (!_posted_found_town.captured) break;
+			if (!name.empty()) break;
+			if (_posted_found_town.cost.GetErrorMessage() != STR_ERROR_NAME_MUST_BE_UNIQUE) break;
+		}
+		if (!_posted_found_town.captured) return AddNotExecuted(std::move(result));
+		result = AddCommandResult(std::move(result), _posted_found_town.cost);
+		if (ok) {
+			result["town_cost"] = static_cast<int64_t>(_posted_found_town.town_cost);
+			if (Town::IsValidID(_posted_found_town.town)) {
+				const Town *t = Town::Get(_posted_found_town.town);
+				result["town_id"] = t->index.base();
+				result["town_name"] = TownName(t);
+				result["population"] = t->cache.population;
+			}
+		}
+		return result;
+	}
+
+	if (op == "rename") {
+		TownID town = TownID::Invalid();
+		if (const auto error = ReadTownId(params, "town_id", town); error.has_value()) return *error;
+		if (town == TownID::Invalid()) return MakeError("invalid_arguments", "`town_id` is required");
+		if (const auto error = CheckTown(town); error.has_value()) return *error;
+
+		std::string text;
+		switch (ReadString(params, "text", text)) {
+			case ParamState::Invalid: return MakeError("invalid_arguments", "`text` must be a string");
+			case ParamState::Absent: return MakeError("invalid_arguments", "`text` is required");
+			case ParamState::Present: break;
+		}
+		if (Utf8StringLength(text) >= MAX_LENGTH_TOWN_NAME_CHARS) {
+			return MakeError("invalid_arguments", "the town name is too long",
+					{{"length", Utf8StringLength(text)}, {"max", MAX_LENGTH_TOWN_NAME_CHARS - 1}});
+		}
+
+		Json result = Json::object();
+		result["town_id"] = town.base();
+		result["name_before"] = TownName(Town::Get(town));
+		const Backup<CompanyID> context(_current_company, OWNER_DEITY);
+		const bool ok = RunCommand<Commands::RenameTown>(town, text);
+		if (!_posted.captured) return AddNotExecuted(std::move(result));
+		result = AddCommandResult(std::move(result));
+		if (ok) result["name_after"] = TownName(Town::Get(town));
+		return result;
+	}
+
+	if (op == "town_action") {
+		TownID town = TownID::Invalid();
+		if (const auto error = ReadTownId(params, "town_id", town); error.has_value()) return *error;
+		if (town == TownID::Invalid()) return MakeError("invalid_arguments", "`town_id` is required");
+		if (const auto error = CheckTown(town); error.has_value()) return *error;
+
+		std::string action_name;
+		switch (ReadString(params, "action", action_name)) {
+			case ParamState::Invalid: return MakeError("invalid_arguments", "`action` must be a string");
+			case ParamState::Absent: return MakeError("invalid_arguments", "`action` is required");
+			case ParamState::Present: break;
+		}
+		TownAction action = TownAction::AdvertiseSmall;
+		if (!ParseTownActionName(action_name, action)) {
+			Json allowed = Json::array();
+			for (const TownAction candidate : EnumRange(TownAction::End)) allowed.push_back(TownActionName(candidate));
+			return MakeError("invalid_arguments", "unknown town action", {{"action", action_name}, {"allowed", std::move(allowed)}});
+		}
+
+		CompanyID actor = company;
+		if (const auto error = ReadCompanyId(params, "company_id", actor); error.has_value()) return *error;
+		if (const auto error = CheckCompany(actor); error.has_value()) return *error;
+
+		const Town *t = Town::Get(town);
+		const TownActions available = GetMaskOfTownActions(actor, t);
+		if (!available.Test(action)) {
+			Json allowed = Json::array();
+			for (const TownAction candidate : EnumRange(TownAction::End)) {
+				if (available.Test(candidate)) allowed.push_back(TownActionName(candidate));
+			}
+			return MakeError("action_not_available", "the town does not offer that action to the company",
+					{{"town_id", town.base()}, {"action", action_name}, {"allowed", std::move(allowed)}});
+		}
+
+		Json result = Json::object();
+		result["town_id"] = town.base();
+		result["company_id"] = actor.base();
+		result["action"] = action_name;
+		result["expected_cost"] = GetTownActionCost(action);
+		result["rating_before"] = t->ratings[actor];
+		const Backup<CompanyID> context(_current_company, actor);
+		/* Commands::TownAction has CommandFlag::Location, so it is posted with the town tile. */
+		const bool ok = RunCommandAt<Commands::TownAction>(t->xy, town, action);
+		if (!_posted.captured) return AddNotExecuted(std::move(result));
+		result = AddCommandResult(std::move(result));
+		if (ok) result["rating_after"] = Town::Get(town)->ratings[actor];
+		return result;
+	}
+
 	return MakeGap("world.towns", op);
 }
 
@@ -1466,7 +2803,7 @@ Json TownsOp(const Json &params, CompanyID company)
  * @param company The company the call is made for.
  * @return The result document.
  */
-Json ProjectOp(const Json &params, [[maybe_unused]] CompanyID company)
+Json ProjectOp(const Json &params, CompanyID company)
 {
 	std::string op;
 	switch (ReadString(params, "op", op)) {
@@ -1625,6 +2962,84 @@ Json ProjectOp(const Json &params, [[maybe_unused]] CompanyID company)
 		return result;
 	}
 
+	if (op == "catchment") {
+		StationID station = StationID::Invalid();
+		if (const auto error = ReadStationId(params, "station_id", station); error.has_value()) return *error;
+		if (station != StationID::Invalid()) {
+			if (const auto error = CheckStation(station); error.has_value()) return *error;
+			Json result = Json::object();
+			result["ok"] = true;
+			result["station"] = StationCatchment(Station::Get(station));
+			return result;
+		}
+
+		/* No id given: list the stations that have an owner and a facility, bounded like the other lists. */
+		size_t offset = 0;
+		size_t limit = 0;
+		if (const auto error = ReadListWindow(params, offset, limit)) return *error;
+
+		Json stations = Json::array();
+		size_t total = 0;
+		for (const Station *st : Station::Iterate()) {
+			if (st->owner == OWNER_NONE || st->facilities.None()) continue;
+			if (total >= offset && stations.size() < limit) stations.push_back(StationCatchment(st));
+			total++;
+		}
+		Json result = Json::object();
+		result["ok"] = true;
+		result["stations"] = std::move(stations);
+		result["total"] = total;
+		result["offset"] = offset;
+		result["limit"] = limit;
+		return result;
+	}
+
+	if (op == "catchment_upgrade") {
+		StationID station = StationID::Invalid();
+		if (const auto error = ReadStationId(params, "station_id", station); error.has_value()) return *error;
+		if (station == StationID::Invalid()) return MakeError("invalid_arguments", "`station_id` is required");
+		if (const auto error = CheckStation(station); error.has_value()) return *error;
+
+		const Station *st = Station::Get(station);
+		if (st->catchment_level >= MAX_STATION_CATCHMENT_LEVEL) {
+			return MakeError("catchment_max_level", "the station already has the maximum catchment level",
+					{{"station_id", station.base()}, {"max", MAX_STATION_CATCHMENT_LEVEL}});
+		}
+
+		Json result = Json::object();
+		result["station_id"] = station.base();
+		result["catchment_level_before"] = st->catchment_level;
+		result["expected_cost"] = static_cast<int64_t>(GetStationCatchmentUpgradeCost(st->catchment_level + 1));
+		/* The command checks the ownership itself, so it runs as the station owner. */
+		const Backup<CompanyID> context(_current_company, st->owner);
+		const bool ok = RunCommand<Commands::UpgradeStationCatchment>(station);
+		if (!_posted.captured) return AddNotExecuted(std::move(result));
+		result = AddCommandResult(std::move(result));
+		if (ok) result["catchment_level_after"] = Station::Get(station)->catchment_level;
+		return result;
+	}
+
+	if (op == "settings") {
+		Json result = Json::object();
+		result["ok"] = true;
+		result["settings"] = SettingRows({
+				"station.modified_catchment",
+				"economy.town_growth_rate",
+				"economy.town_growth_base",
+				"economy.town_cargo_scale",
+				"economy.town_need_power_residents",
+				"economy.town_power_link_radius",
+				"economy.town_layout",
+				"economy.found_town",
+		}, company);
+		result["notes"] = Json::array({
+				"station.modified_catchment decides whether the catchment radius follows the station type or is a fixed square",
+				"the town power settings decide which towns need electricity and how far a plant reaches",
+				"the town growth settings decide the growth budget and the cargo scale of every town",
+		});
+		return result;
+	}
+
 	return MakeGap("world.project", op);
 }
 
@@ -1648,12 +3063,735 @@ Json Capability(std::string_view method, std::string_view authority, std::initia
 	return entry;
 }
 
+/* --- world.industry --- */
+
+/**
+ * Industry queries and the industry control commands.
+ * @param params The method parameters.
+ * @param company The company the call is made for.
+ * @return The result document.
+ */
+Json IndustryOp(const Json &params, CompanyID company)
+{
+	std::string op;
+	switch (ReadString(params, "op", op)) {
+		case ParamState::Invalid: return MakeError("invalid_arguments", "`op` must be a string");
+		case ParamState::Absent: return MakeError("invalid_arguments", "`op` is required");
+		case ParamState::Present: break;
+	}
+
+	if (op == "list") {
+		size_t offset = 0;
+		size_t limit = 0;
+		if (const auto error = ReadListWindow(params, offset, limit)) return *error;
+
+		Json industries = Json::array();
+		size_t total = 0;
+		for (const Industry *i : Industry::Iterate()) {
+			if (total >= offset && industries.size() < limit) industries.push_back(IndustryInfo(i));
+			total++;
+		}
+		Json result = Json::object();
+		result["ok"] = true;
+		result["industries"] = std::move(industries);
+		result["types"] = IndustryTypeList();
+		result["total"] = total;
+		result["offset"] = offset;
+		result["limit"] = limit;
+		return result;
+	}
+
+	if (op == "types") {
+		Json result = Json::object();
+		result["ok"] = true;
+		result["types"] = IndustryTypeList();
+		return result;
+	}
+
+	if (op == "info" || op == "needs" || op == "production" || op == "cargo") {
+		IndustryID industry = IndustryID::Invalid();
+		if (const auto error = ReadIndustryId(params, "industry_id", industry); error.has_value()) return *error;
+		if (industry == IndustryID::Invalid()) return MakeError("invalid_arguments", "`industry_id` is required");
+		if (const auto error = CheckIndustry(industry); error.has_value()) return *error;
+
+		const Industry *i = Industry::Get(industry);
+		Json result = Json::object();
+		result["ok"] = true;
+		if (op == "info") {
+			result["industry"] = IndustryInfo(i);
+		} else if (op == "needs") {
+			result["industry"] = IndustryNeeds(i);
+		} else if (op == "production") {
+			result["industry"] = IndustryProduction(i);
+		} else {
+			result["industry"] = IndustryCargo(i);
+		}
+		return result;
+	}
+
+	if (op == "fund" || op == "prospect") {
+		/* The argument shape is checked before the world is touched. */
+		int64_t type = 0;
+		switch (ReadInt(params, "industry_type", type)) {
+			case ParamState::Invalid: return MakeError("invalid_arguments", "`industry_type` must be an integer");
+			case ParamState::Absent: return MakeError("invalid_arguments", "`industry_type` is required");
+			case ParamState::Present: break;
+		}
+		if (type < 0 || type >= static_cast<int64_t>(NUM_INDUSTRYTYPES)) {
+			return MakeError("unknown_industry_type", "the industry type is out of range", {{"industry_type", type}, {"max", NUM_INDUSTRYTYPES - 1}});
+		}
+		const IndustrySpec *spec = GetIndustrySpec(static_cast<IndustryType>(type));
+		if (!spec->enabled || spec->layouts.empty()) {
+			return MakeError("unknown_industry_type", "the industry type is not available in this game", {{"industry_type", type}});
+		}
+
+		TileIndex tile = INVALID_TILE;
+		switch (ReadTile(params, "tile", tile)) {
+			case ParamState::Invalid: return MakeError("invalid_arguments", "`tile` must be an object with `x` and `y` inside the map");
+			case ParamState::Absent:
+				/* Prospecting picks the place itself; funding needs one. */
+				if (op == "fund") return MakeError("invalid_arguments", "`tile` is required");
+				tile = TileXY(0, 0);
+				break;
+			case ParamState::Present: break;
+		}
+
+		int64_t layout = 0;
+		switch (ReadInt(params, "layout", layout)) {
+			case ParamState::Invalid: return MakeError("invalid_arguments", "`layout` must be an integer");
+			case ParamState::Present:
+				if (layout < 0 || layout >= static_cast<int64_t>(spec->layouts.size())) {
+					return MakeError("invalid_arguments", "the layout index is out of range",
+							{{"layout", layout}, {"max", spec->layouts.size() - 1}});
+				}
+				break;
+			case ParamState::Absent: break;
+		}
+
+		int64_t seed = 0;
+		switch (ReadInt(params, "seed", seed)) {
+			case ParamState::Invalid: return MakeError("invalid_arguments", "`seed` must be an integer");
+			case ParamState::Present:
+				if (seed < 0 || seed > UINT32_MAX) return MakeError("invalid_arguments", "the seed is out of range", {{"seed", seed}});
+				break;
+			case ParamState::Absent: seed = static_cast<int64_t>(Random()); break;
+		}
+
+		/* The new industry is read back from the pool, because the command only reports a cost. */
+		std::vector<IndustryID> before;
+		for (const Industry *i : Industry::Iterate()) before.push_back(i->index);
+
+		Json result = Json::object();
+		result["industry_type"] = type;
+		result["type_name"] = GetString(spec->name);
+		result["fund"] = op == "fund";
+		result["seed"] = seed;
+		if (op == "fund") {
+			result["tile"] = Json{{"x", TileX(tile)}, {"y", TileY(tile)}};
+			result["layout"] = layout;
+		}
+		const Backup<CompanyID> context(_current_company, OWNER_DEITY);
+		const bool ok = RunCommand<Commands::BuildIndustry>(tile, static_cast<IndustryType>(type),
+				static_cast<uint32_t>(layout), op == "fund", static_cast<uint32_t>(seed));
+		if (!_posted.captured) return AddNotExecuted(std::move(result));
+		result = AddCommandResult(std::move(result));
+		if (ok) {
+			Json created = Json::array();
+			for (const Industry *i : Industry::Iterate()) {
+				if (std::find(before.begin(), before.end(), i->index) == before.end()) created.push_back(IndustryInfo(i));
+			}
+			result["created"] = std::move(created);
+			result["created_count"] = created.size();
+		}
+		return result;
+	}
+
+	if (op == "fund_area") {
+		int64_t type = 0;
+		switch (ReadInt(params, "industry_type", type)) {
+			case ParamState::Invalid: return MakeError("invalid_arguments", "`industry_type` must be an integer");
+			case ParamState::Absent: return MakeError("invalid_arguments", "`industry_type` is required");
+			case ParamState::Present: break;
+		}
+		if (type < 0 || type >= static_cast<int64_t>(NUM_INDUSTRYTYPES)) {
+			return MakeError("unknown_industry_type", "the industry type is out of range", {{"industry_type", type}, {"max", NUM_INDUSTRYTYPES - 1}});
+		}
+		const IndustrySpec *spec = GetIndustrySpec(static_cast<IndustryType>(type));
+		if (!spec->enabled || spec->layouts.empty()) {
+			return MakeError("unknown_industry_type", "the industry type is not available in this game", {{"industry_type", type}});
+		}
+
+		TileIndex tile = INVALID_TILE;
+		switch (ReadTile(params, "tile", tile)) {
+			case ParamState::Invalid: return MakeError("invalid_arguments", "`tile` must be an object with `x` and `y` inside the map");
+			case ParamState::Absent: return MakeError("invalid_arguments", "`tile` is required");
+			case ParamState::Present: break;
+		}
+		TileIndex start_tile = tile;
+		switch (ReadTile(params, "start_tile", start_tile)) {
+			case ParamState::Invalid: return MakeError("invalid_arguments", "`start_tile` must be an object with `x` and `y` inside the map");
+			case ParamState::Present: break;
+			case ParamState::Absent: break;
+		}
+
+		int64_t seed = 0;
+		switch (ReadInt(params, "seed", seed)) {
+			case ParamState::Invalid: return MakeError("invalid_arguments", "`seed` must be an integer");
+			case ParamState::Present:
+				if (seed < 0 || seed > UINT32_MAX) return MakeError("invalid_arguments", "the seed is out of range", {{"seed", seed}});
+				break;
+			case ParamState::Absent: seed = static_cast<int64_t>(Random()); break;
+		}
+
+		std::vector<IndustryID> before;
+		for (const Industry *i : Industry::Iterate()) before.push_back(i->index);
+
+		Json result = Json::object();
+		result["industry_type"] = type;
+		result["type_name"] = GetString(spec->name);
+		result["tile"] = Json{{"x", TileX(tile)}, {"y", TileY(tile)}};
+		result["start_tile"] = Json{{"x", TileX(start_tile)}, {"y", TileY(start_tile)}};
+		result["seed"] = seed;
+		const Backup<CompanyID> context(_current_company, OWNER_DEITY);
+		const bool ok = RunBuildIndustryArea<Commands::BuildIndustryArea>(tile, start_tile, static_cast<IndustryType>(type), static_cast<uint32_t>(seed));
+		if (!_posted_industry_area.captured) return AddNotExecuted(std::move(result));
+		result = AddCommandResult(std::move(result), _posted_industry_area.cost);
+		result["built_count"] = _posted_industry_area.count;
+		if (ok) {
+			Json created = Json::array();
+			for (const Industry *i : Industry::Iterate()) {
+				if (std::find(before.begin(), before.end(), i->index) == before.end()) created.push_back(IndustryInfo(i));
+			}
+			result["created"] = std::move(created);
+		}
+		return result;
+	}
+
+	if (op == "set_production") {
+		IndustryID industry = IndustryID::Invalid();
+		if (const auto error = ReadIndustryId(params, "industry_id", industry); error.has_value()) return *error;
+		if (industry == IndustryID::Invalid()) return MakeError("invalid_arguments", "`industry_id` is required");
+		if (const auto error = CheckIndustry(industry); error.has_value()) return *error;
+
+		int64_t level = 0;
+		switch (ReadInt(params, "prod_level", level)) {
+			case ParamState::Invalid: return MakeError("invalid_arguments", "`prod_level` must be an integer");
+			case ParamState::Absent: return MakeError("invalid_arguments", "`prod_level` is required");
+			case ParamState::Present: break;
+		}
+		if (level < PRODLEVEL_MINIMUM || level > PRODLEVEL_MAXIMUM) {
+			return MakeError("invalid_arguments", "the production level is out of range",
+					{{"prod_level", level}, {"min", PRODLEVEL_MINIMUM}, {"max", PRODLEVEL_MAXIMUM}});
+		}
+
+		bool show_news = false;
+		switch (ReadBool(params, "show_news", show_news)) {
+			case ParamState::Invalid: return MakeError("invalid_arguments", "`show_news` must be a boolean");
+			case ParamState::Present: break;
+			case ParamState::Absent: break;
+		}
+
+		Json result = Json::object();
+		result["industry_id"] = industry.base();
+		result["prod_level"] = level;
+		result["prod_level_before"] = Industry::Get(industry)->prod_level;
+		const Backup<CompanyID> context(_current_company, OWNER_DEITY);
+		const bool ok = RunCommand<Commands::IndustrySetProduction>(industry, static_cast<uint8_t>(level), show_news, EncodedString{});
+		if (!_posted.captured) return AddNotExecuted(std::move(result));
+		result = AddCommandResult(std::move(result));
+		if (ok) {
+			const Industry *i = Industry::Get(industry);
+			result["prod_level_after"] = i->prod_level;
+			result["external_prod_level"] = i->ctlflags.Test(IndustryControlFlag::ExternalProdLevel);
+		}
+		return result;
+	}
+
+	if (op == "set_flags") {
+		IndustryID industry = IndustryID::Invalid();
+		if (const auto error = ReadIndustryId(params, "industry_id", industry); error.has_value()) return *error;
+		if (industry == IndustryID::Invalid()) return MakeError("invalid_arguments", "`industry_id` is required");
+		if (const auto error = CheckIndustry(industry); error.has_value()) return *error;
+
+		IndustryControlFlags flags;
+		const auto flags_it = params.find("flags");
+		if (flags_it != params.end() && !flags_it->is_null()) {
+			if (!flags_it->is_array()) return MakeError("invalid_arguments", "`flags` must be an array of control flag names");
+			for (const Json &item : *flags_it) {
+				if (!item.is_string()) return MakeError("invalid_arguments", "`flags` must be an array of control flag names");
+				const std::string name = item.get<std::string>();
+				IndustryControlFlag flag = IndustryControlFlag::NoClosure;
+				if (!ParseIndustryControlFlagName(name, flag)) {
+					Json allowed = Json::array();
+					for (const IndustryControlFlag candidate : EnumRange(IndustryControlFlag::End)) allowed.push_back(IndustryControlFlagName(candidate));
+					return MakeError("invalid_arguments", "unknown industry control flag", {{"flag", name}, {"allowed", std::move(allowed)}});
+				}
+				flags.Set(flag);
+			}
+		}
+
+		Json result = Json::object();
+		result["industry_id"] = industry.base();
+		Json requested = Json::array();
+		for (const IndustryControlFlag flag : EnumRange(IndustryControlFlag::End)) {
+			if (flags.Test(flag)) requested.push_back(IndustryControlFlagName(flag));
+		}
+		result["flags"] = std::move(requested);
+		const Backup<CompanyID> context(_current_company, OWNER_DEITY);
+		const bool ok = RunCommand<Commands::IndustrySetFlags>(industry, flags);
+		if (!_posted.captured) return AddNotExecuted(std::move(result));
+		result = AddCommandResult(std::move(result));
+		if (ok) {
+			Json after = Json::array();
+			for (const IndustryControlFlag flag : EnumRange(IndustryControlFlag::End)) {
+				if (Industry::Get(industry)->ctlflags.Test(flag)) after.push_back(IndustryControlFlagName(flag));
+			}
+			result["flags_after"] = std::move(after);
+		}
+		return result;
+	}
+
+	if (op == "set_exclusivity") {
+		IndustryID industry = IndustryID::Invalid();
+		if (const auto error = ReadIndustryId(params, "industry_id", industry); error.has_value()) return *error;
+		if (industry == IndustryID::Invalid()) return MakeError("invalid_arguments", "`industry_id` is required");
+		if (const auto error = CheckIndustry(industry); error.has_value()) return *error;
+
+		bool consumer = false;
+		switch (ReadBool(params, "consumer", consumer)) {
+			case ParamState::Invalid: return MakeError("invalid_arguments", "`consumer` must be a boolean");
+			case ParamState::Present: break;
+			case ParamState::Absent: break;
+		}
+
+		/* A null company clears the exclusive right; otherwise the company must exist. */
+		Owner exclusive = OWNER_NONE;
+		const auto company_it = params.find("company_id");
+		if (company_it != params.end() && !company_it->is_null()) {
+			CompanyID holder = company;
+			if (const auto error = ReadCompanyId(params, "company_id", holder); error.has_value()) return *error;
+			if (const auto error = CheckCompany(holder); error.has_value()) return *error;
+			exclusive = holder;
+		}
+
+		Json result = Json::object();
+		result["industry_id"] = industry.base();
+		result["consumer"] = consumer;
+		result["company_id"] = exclusive == OWNER_NONE ? Json(nullptr) : Json(exclusive.base());
+		const Backup<CompanyID> context(_current_company, OWNER_DEITY);
+		const bool ok = RunCommand<Commands::IndustrySetExclusivity>(industry, exclusive, consumer);
+		if (!_posted.captured) return AddNotExecuted(std::move(result));
+		result = AddCommandResult(std::move(result));
+		if (ok) {
+			const Industry *i = Industry::Get(industry);
+			const Owner after = consumer ? i->exclusive_consumer : i->exclusive_supplier;
+			result["exclusive_after"] = after == INVALID_OWNER ? Json(nullptr) : Json(after.base());
+		}
+		return result;
+	}
+
+	return MakeGap("world.industry", op);
+}
+
+/* --- world.signs --- */
+
+/**
+ * Sign queries and the sign commands.
+ * @param params The method parameters.
+ * @param company The company the call is made for.
+ * @return The result document.
+ */
+Json SignsOp(const Json &params, CompanyID company)
+{
+	std::string op;
+	switch (ReadString(params, "op", op)) {
+		case ParamState::Invalid: return MakeError("invalid_arguments", "`op` must be a string");
+		case ParamState::Absent: return MakeError("invalid_arguments", "`op` is required");
+		case ParamState::Present: break;
+	}
+
+	if (op == "list") {
+		size_t offset = 0;
+		size_t limit = 0;
+		if (const auto error = ReadListWindow(params, offset, limit)) return *error;
+
+		Json signs = Json::array();
+		size_t total = 0;
+		for (const Sign *si : Sign::Iterate()) {
+			if (total >= offset && signs.size() < limit) signs.push_back(SignInfo(si));
+			total++;
+		}
+		Json result = Json::object();
+		result["ok"] = true;
+		result["signs"] = std::move(signs);
+		result["total"] = total;
+		result["offset"] = offset;
+		result["limit"] = limit;
+		return result;
+	}
+
+	if (op == "info") {
+		SignID sign = SignID::Invalid();
+		if (const auto error = ReadSignId(params, "sign_id", sign); error.has_value()) return *error;
+		if (sign == SignID::Invalid()) return MakeError("invalid_arguments", "`sign_id` is required");
+		if (const auto error = CheckSign(sign); error.has_value()) return *error;
+		Json result = Json::object();
+		result["ok"] = true;
+		result["sign"] = SignInfo(Sign::Get(sign));
+		return result;
+	}
+
+	if (op == "place") {
+		/* The text is checked before the tile, so a malformed call never reaches the map. */
+		std::string text;
+		switch (ReadString(params, "text", text)) {
+			case ParamState::Invalid: return MakeError("invalid_arguments", "`text` must be a string");
+			case ParamState::Absent: break;
+			case ParamState::Present: break;
+		}
+		if (Utf8StringLength(text) >= MAX_LENGTH_SIGN_NAME_CHARS) {
+			return MakeError("invalid_arguments", "the sign text is too long",
+					{{"length", Utf8StringLength(text)}, {"max", MAX_LENGTH_SIGN_NAME_CHARS - 1}});
+		}
+
+		TileIndex tile = INVALID_TILE;
+		switch (ReadTile(params, "tile", tile)) {
+			case ParamState::Invalid: return MakeError("invalid_arguments", "`tile` must be an object with `x` and `y` inside the map");
+			case ParamState::Absent: return MakeError("invalid_arguments", "`tile` is required");
+			case ParamState::Present: break;
+		}
+
+		Json result = Json::object();
+		result["tile"] = Json{{"x", TileX(tile)}, {"y", TileY(tile)}};
+		result["text"] = text;
+		const Backup<CompanyID> context(_current_company, company);
+		const bool ok = RunPlaceSign<Commands::PlaceSign>(tile, text);
+		if (!_posted_place_sign.captured) return AddNotExecuted(std::move(result));
+		result = AddCommandResult(std::move(result), _posted_place_sign.cost);
+		if (ok && Sign::IsValidID(_posted_place_sign.sign)) {
+			result["sign_id"] = _posted_place_sign.sign.base();
+			result["sign"] = SignInfo(Sign::Get(_posted_place_sign.sign));
+		}
+		return result;
+	}
+
+	if (op == "rename" || op == "delete") {
+		SignID sign = SignID::Invalid();
+		if (const auto error = ReadSignId(params, "sign_id", sign); error.has_value()) return *error;
+		if (sign == SignID::Invalid()) return MakeError("invalid_arguments", "`sign_id` is required");
+		if (const auto error = CheckSign(sign); error.has_value()) return *error;
+
+		std::string text;
+		if (op == "rename") {
+			switch (ReadString(params, "text", text)) {
+				case ParamState::Invalid: return MakeError("invalid_arguments", "`text` must be a string");
+				case ParamState::Absent: return MakeError("invalid_arguments", "`text` is required");
+				case ParamState::Present: break;
+			}
+			if (text.empty()) return MakeError("invalid_arguments", "`text` must not be empty; use op=delete to remove the sign");
+			if (Utf8StringLength(text) >= MAX_LENGTH_SIGN_NAME_CHARS) {
+				return MakeError("invalid_arguments", "the sign text is too long",
+						{{"length", Utf8StringLength(text)}, {"max", MAX_LENGTH_SIGN_NAME_CHARS - 1}});
+			}
+		}
+
+		/* The text colour is only meaningful for deity signs; an absent colour keeps the current one. */
+		Colours colour = Colours::Invalid;
+		const auto colour_it = params.find("text_colour");
+		if (colour_it != params.end() && !colour_it->is_null()) {
+			if (!ParseColour(*colour_it, colour)) {
+				return MakeError("invalid_arguments", "`text_colour` must be a colour name or a palette index", {{"text_colour", *colour_it}});
+			}
+		}
+
+		Json result = Json::object();
+		result["sign_id"] = sign.base();
+		result["text"] = text;
+		result["text_colour"] = colour == Colours::Invalid ? Json(nullptr) : Json(ColourName(colour));
+		const Backup<CompanyID> context(_current_company, OWNER_DEITY);
+		const bool ok = RunCommand<Commands::RenameSign>(sign, text, colour);
+		if (!_posted.captured) return AddNotExecuted(std::move(result));
+		result = AddCommandResult(std::move(result));
+		if (ok) {
+			if (op == "delete") {
+				result["deleted"] = !Sign::IsValidID(sign);
+			} else {
+				result["sign"] = SignInfo(Sign::Get(sign));
+			}
+		}
+		return result;
+	}
+
+	if (op == "move") {
+		SignID sign = SignID::Invalid();
+		if (const auto error = ReadSignId(params, "sign_id", sign); error.has_value()) return *error;
+		if (sign == SignID::Invalid()) return MakeError("invalid_arguments", "`sign_id` is required");
+		if (const auto error = CheckSign(sign); error.has_value()) return *error;
+
+		TileIndex tile = INVALID_TILE;
+		switch (ReadTile(params, "tile", tile)) {
+			case ParamState::Invalid: return MakeError("invalid_arguments", "`tile` must be an object with `x` and `y` inside the map");
+			case ParamState::Absent: return MakeError("invalid_arguments", "`tile` is required");
+			case ParamState::Present: break;
+		}
+
+		Json result = Json::object();
+		result["sign_id"] = sign.base();
+		result["tile"] = Json{{"x", TileX(tile)}, {"y", TileY(tile)}};
+		const Backup<CompanyID> context(_current_company, OWNER_DEITY);
+		const bool ok = RunCommand<Commands::MoveSign>(sign, tile);
+		if (!_posted.captured) return AddNotExecuted(std::move(result));
+		result = AddCommandResult(std::move(result));
+		if (ok) result["sign"] = SignInfo(Sign::Get(sign));
+		return result;
+	}
+
+	return MakeGap("world.signs", op);
+}
+
+/* --- world.landscape --- */
+
+/**
+ * Object and tree planting, the landscape commands this module owns.
+ * @param params The method parameters.
+ * @param company The company the call is made for.
+ * @return The result document.
+ */
+Json LandscapeOp(const Json &params, CompanyID company)
+{
+	std::string op;
+	switch (ReadString(params, "op", op)) {
+		case ParamState::Invalid: return MakeError("invalid_arguments", "`op` must be a string");
+		case ParamState::Absent: return MakeError("invalid_arguments", "`op` is required");
+		case ParamState::Present: break;
+	}
+
+	if (op == "object_types") {
+		size_t offset = 0;
+		size_t limit = 0;
+		if (const auto error = ReadListWindow(params, offset, limit)) return *error;
+
+		Json types = Json::array();
+		size_t total = 0;
+		for (const Json &row : ObjectTypeList()) {
+			if (total >= offset && types.size() < limit) types.push_back(row);
+			total++;
+		}
+		Json result = Json::object();
+		result["ok"] = true;
+		result["types"] = std::move(types);
+		result["total"] = total;
+		result["offset"] = offset;
+		result["limit"] = limit;
+		return result;
+	}
+
+	if (op == "object" || op == "object_area") {
+		int64_t type = 0;
+		switch (ReadInt(params, "object_type", type)) {
+			case ParamState::Invalid: return MakeError("invalid_arguments", "`object_type` must be an integer");
+			case ParamState::Absent: return MakeError("invalid_arguments", "`object_type` is required");
+			case ParamState::Present: break;
+		}
+		if (type < 0 || type >= static_cast<int64_t>(ObjectSpec::Count())) {
+			return MakeError("unknown_object_type", "the object type is out of range", {{"object_type", type}, {"max", ObjectSpec::Count() - 1}});
+		}
+		const ObjectSpec *spec = ObjectSpec::Get(static_cast<ObjectType>(type));
+		if (!spec->IsEnabled()) {
+			return MakeError("unknown_object_type", "the object type is not available in this game", {{"object_type", type}});
+		}
+
+		int64_t view = 0;
+		switch (ReadInt(params, "view", view)) {
+			case ParamState::Invalid: return MakeError("invalid_arguments", "`view` must be an integer");
+			case ParamState::Present:
+				if (view < 0 || view >= static_cast<int64_t>(spec->views)) {
+					return MakeError("invalid_arguments", "the view is out of range", {{"view", view}, {"max", spec->views - 1}});
+				}
+				break;
+			case ParamState::Absent: break;
+		}
+
+		TileIndex tile = INVALID_TILE;
+		switch (ReadTile(params, "tile", tile)) {
+			case ParamState::Invalid: return MakeError("invalid_arguments", "`tile` must be an object with `x` and `y` inside the map");
+			case ParamState::Absent: return MakeError("invalid_arguments", "`tile` is required");
+			case ParamState::Present: break;
+		}
+
+		Json result = Json::object();
+		result["object_type"] = type;
+		result["name"] = GetString(spec->name);
+		result["view"] = view;
+		result["tile"] = Json{{"x", TileX(tile)}, {"y", TileY(tile)}};
+		const Backup<CompanyID> context(_current_company, company);
+		bool ok;
+		if (op == "object") {
+			ok = RunCommand<Commands::BuildObject>(tile, static_cast<ObjectType>(type), static_cast<uint8_t>(view));
+		} else {
+			TileIndex start_tile = tile;
+			switch (ReadTile(params, "start_tile", start_tile)) {
+				case ParamState::Invalid: return MakeError("invalid_arguments", "`start_tile` must be an object with `x` and `y` inside the map");
+				case ParamState::Present: break;
+				case ParamState::Absent: break;
+			}
+			bool diagonal = false;
+			switch (ReadBool(params, "diagonal", diagonal)) {
+				case ParamState::Invalid: return MakeError("invalid_arguments", "`diagonal` must be a boolean");
+				case ParamState::Present: break;
+				case ParamState::Absent: break;
+			}
+			result["start_tile"] = Json{{"x", TileX(start_tile)}, {"y", TileY(start_tile)}};
+			result["diagonal"] = diagonal;
+			ok = RunCommand<Commands::BuildObjectArea>(tile, start_tile, static_cast<ObjectType>(type), static_cast<uint8_t>(view), diagonal);
+		}
+		if (!_posted.captured) return AddNotExecuted(std::move(result));
+		result = AddCommandResult(std::move(result));
+		if (ok) result["built"] = true;
+		return result;
+	}
+
+	if (op == "tree" || op == "tree_area") {
+		/* TREE_INVALID lets the engine pick a tree type that fits the climate. */
+		int64_t tree = TREE_INVALID;
+		switch (ReadInt(params, "tree_type", tree)) {
+			case ParamState::Invalid: return MakeError("invalid_arguments", "`tree_type` must be an integer");
+			case ParamState::Present:
+				if (tree < 0 || tree > UINT8_MAX) return MakeError("invalid_arguments", "the tree type is out of range", {{"tree_type", tree}, {"max", UINT8_MAX}});
+				break;
+			case ParamState::Absent: break;
+		}
+
+		TileIndex tile = INVALID_TILE;
+		switch (ReadTile(params, "tile", tile)) {
+			case ParamState::Invalid: return MakeError("invalid_arguments", "`tile` must be an object with `x` and `y` inside the map");
+			case ParamState::Absent: return MakeError("invalid_arguments", "`tile` is required");
+			case ParamState::Present: break;
+		}
+
+		TileIndex start_tile = tile;
+		switch (ReadTile(params, "start_tile", start_tile)) {
+			case ParamState::Invalid: return MakeError("invalid_arguments", "`start_tile` must be an object with `x` and `y` inside the map");
+			case ParamState::Present: break;
+			case ParamState::Absent: break;
+		}
+
+		bool diagonal = false;
+		switch (ReadBool(params, "diagonal", diagonal)) {
+			case ParamState::Invalid: return MakeError("invalid_arguments", "`diagonal` must be a boolean");
+			case ParamState::Present: break;
+			case ParamState::Absent: break;
+		}
+
+		Json result = Json::object();
+		result["tile"] = Json{{"x", TileX(tile)}, {"y", TileY(tile)}};
+		result["start_tile"] = Json{{"x", TileX(start_tile)}, {"y", TileY(start_tile)}};
+		result["tree_type"] = tree == TREE_INVALID ? Json(nullptr) : Json(tree);
+		result["diagonal"] = diagonal;
+		const Backup<CompanyID> context(_current_company, company);
+		const bool ok = RunCommand<Commands::PlantTree>(tile, start_tile, static_cast<uint8_t>(tree), diagonal);
+		if (!_posted.captured) return AddNotExecuted(std::move(result));
+		result = AddCommandResult(std::move(result));
+		if (ok) result["planted"] = true;
+		return result;
+	}
+
+	return MakeGap("world.landscape", op);
+}
+
+/* --- world.cheat --- */
+
+/**
+ * The money cheats, which only run in a single player game.
+ * @param params The method parameters.
+ * @param company The company the call is made for.
+ * @return The result document.
+ */
+Json CheatOp(const Json &params, CompanyID company)
+{
+	std::string op;
+	switch (ReadString(params, "op", op)) {
+		case ParamState::Invalid: return MakeError("invalid_arguments", "`op` must be a string");
+		case ParamState::Absent: return MakeError("invalid_arguments", "`op` is required");
+		case ParamState::Present: break;
+	}
+
+	if (op == "money") {
+		int64_t amount = 0;
+		switch (ReadInt(params, "amount", amount)) {
+			case ParamState::Invalid: return MakeError("invalid_arguments", "`amount` must be an integer");
+			case ParamState::Absent: return MakeError("invalid_arguments", "`amount` is required");
+			case ParamState::Present: break;
+		}
+		if (amount <= 0) return MakeError("invalid_amount", "the amount must be positive", {{"amount", amount}});
+
+		Json result = Json::object();
+		result["amount"] = amount;
+		result["company_id"] = company == CompanyID::Invalid() ? Json(nullptr) : Json(company.base());
+		const Backup<CompanyID> context(_current_company, company);
+		const bool ok = RunCommand<Commands::MoneyCheat>(Money(amount));
+		if (!_posted.captured) return AddNotExecuted(std::move(result));
+		result = AddCommandResult(std::move(result));
+		if (ok && Company::IsValidID(company)) result["money_after"] = static_cast<int64_t>(Company::Get(company)->money);
+		return result;
+	}
+
+	if (op == "bank_balance") {
+		CompanyID target = company;
+		if (const auto error = ReadCompanyId(params, "company_id", target); error.has_value()) return *error;
+		if (const auto error = CheckCompany(target); error.has_value()) return *error;
+
+		int64_t delta = 0;
+		switch (ReadInt(params, "delta", delta)) {
+			case ParamState::Invalid: return MakeError("invalid_arguments", "`delta` must be an integer");
+			case ParamState::Absent: return MakeError("invalid_arguments", "`delta` is required");
+			case ParamState::Present: break;
+		}
+		if (delta == 0) return MakeError("invalid_amount", "the delta must not be zero", {{"delta", delta}});
+
+		Json result = Json::object();
+		result["company_id"] = target.base();
+		result["delta"] = delta;
+		result["money_before"] = static_cast<int64_t>(Company::Get(target)->money);
+		const Backup<CompanyID> context(_current_company, OWNER_DEITY);
+		const bool ok = RunCommand<Commands::ChangeBankBalance>(INVALID_TILE, Money(delta), target, ExpensesType::Other);
+		if (!_posted.captured) return AddNotExecuted(std::move(result));
+		result = AddCommandResult(std::move(result));
+		if (ok) result["money_after"] = static_cast<int64_t>(Company::Get(target)->money);
+		return result;
+	}
+
+	return MakeGap("world.cheat", op);
+}
+
 } // anonymous namespace
 
 void AgentAdminCommandCallback([[maybe_unused]] Commands cmd, const CommandCost &result, [[maybe_unused]] TileIndex tile)
 {
 	_posted.captured = true;
 	_posted.cost = result;
+}
+
+void AgentAdminFoundTownCallback([[maybe_unused]] Commands cmd, const CommandCost &result, Money cost, TownID town_id)
+{
+	_posted_found_town.captured = true;
+	_posted_found_town.cost = result;
+	_posted_found_town.town_cost = cost;
+	_posted_found_town.town = town_id;
+}
+
+void AgentAdminPlaceSignCallback([[maybe_unused]] Commands cmd, const CommandCost &result, SignID sign_id)
+{
+	_posted_place_sign.captured = true;
+	_posted_place_sign.cost = result;
+	_posted_place_sign.sign = sign_id;
+}
+
+void AgentAdminBuildIndustryAreaCallback([[maybe_unused]] Commands cmd, const CommandCost &result, uint32_t count)
+{
+	_posted_industry_area.captured = true;
+	_posted_industry_area.cost = result;
+	_posted_industry_area.count = count;
 }
 
 Json AdminToolCapabilities()
@@ -1666,26 +3804,76 @@ Json AdminToolCapabilities()
 			{"game", "company", "bool", "int", "one_of_many", "many_of_many"},
 			{"client_scope", "string_setting"}));
 	methods.push_back(Capability("world.company", "write",
-			{"info", "loan_increase", "loan_decrease", "set_max_loan", "create", "delete", "give_money"},
-			{"buy", "colour", "manager_face", "rename_president"}));
+			{"info", "livery", "loan_increase", "loan_decrease", "set_max_loan", "create", "delete", "give_money",
+					"colour", "livery_set", "manager_face", "rename", "rename_president", "buy"},
+			{"hostile_takeover_of_a_human_company", "company_password"}));
 	methods.push_back(Capability("world.towns", "write",
-			{"needs", "force_need", "invest", "set_investment", "growth_rate", "expand", "cargo_goal", "rating", "destroy"},
-			{"found", "town_action"}));
+			{"list", "needs", "growth", "settings", "power", "force_need", "invest", "set_investment", "growth_rate",
+					"expand", "cargo_goal", "rating", "destroy", "found", "rename", "town_action"},
+			{"town_district_authority", "town_road_layout_change"}));
+	methods.push_back(Capability("world.industry", "write",
+			{"list", "types", "info", "needs", "production", "cargo", "fund", "fund_area", "prospect",
+					"set_production", "set_flags", "set_exclusivity"},
+			{"industry_text"}));
+	methods.push_back(Capability("world.signs", "write",
+			{"list", "info", "place", "rename", "delete", "move"},
+			{"sign_owner_transfer"}));
+	methods.push_back(Capability("world.landscape", "write",
+			{"object_types", "object", "object_area", "tree", "tree_area"},
+			{"clear_tile", "terraform", "build_canal", "build_lock", "build_bridge", "build_tunnel"}));
+	methods.push_back(Capability("world.cheat", "write",
+			{"money", "bank_balance"},
+			{"magic_bulldozer", "ignore_vehicle_limits", "change_date"}));
 	methods.push_back(Capability("world.project", "write",
-			{"power", "power_fuel", "station_town", "district"},
+			{"power", "power_fuel", "station_town", "district", "catchment", "catchment_upgrade", "settings"},
 			{"save", "load"}));
 
 	Json result = Json::object();
 	result["module"] = "agent_admin_tools";
 	result["methods"] = std::move(methods);
 	result["unimplemented_methods"] = Json::array({"world.pause", "world.rename", "world.objects", "world.info", "world.capture", "task.barrier"});
+	result["query_ops"] = Json::array({
+			"world.settings.get",
+			"world.company op=info",
+			"world.company op=livery",
+			"world.towns op=list",
+			"world.towns op=needs",
+			"world.towns op=growth",
+			"world.towns op=settings",
+			"world.towns op=power",
+			"world.industry op=list",
+			"world.industry op=types",
+			"world.industry op=info",
+			"world.industry op=needs",
+			"world.industry op=production",
+			"world.industry op=cargo",
+			"world.signs op=list",
+			"world.signs op=info",
+			"world.landscape op=object_types",
+			"world.project op=power",
+			"world.project op=district",
+			"world.project op=catchment",
+			"world.project op=settings",
+	});
 	result["notes"] = Json::array({
 		"Actual mutations go through Command<Commands::...>::Post, the normal player command path, so the engine's own eligibility, pause and finance checks apply; results carry the actual cost and the engine error.",
 		"world.settings.get returns the setting descriptors with their current value, type, scope, allowed values or range, default and whether they can be changed now.",
 		"world.settings.set validates the name, the scope, the type and the range before it posts Commands::ChangeSetting or Commands::ChangeCompanySetting, and reports the value the engine actually applied.",
 		"world.company op=create uses Commands::CompanyControl with CompanyCtrlAction::NewAI, the only company creation the single player engine has; the created id is read back from the company pool.",
+		"world.company op=colour and op=livery_set post Commands::SetCompanyColour as the company itself; op=manager_face posts Commands::SetCompanyManagerFace; op=rename and op=rename_president post the matching rename commands; op=buy posts Commands::BuyCompany and needs the company to be bankrupt-asked or an AI for a hostile takeover.",
 		"world.towns op=invest is paid by the company and reports the real cost; op=set_investment, op=force_need, op=growth_rate, op=expand, op=cargo_goal, op=rating and op=destroy are the free administrative commands and run as the deity.",
+		"world.towns op=found posts Commands::FoundTown as the deity, so the random location form is not available; the new town id comes from the command callback, and an automatic name is retried a few times when the engine reports a duplicate.",
+		"world.towns op=rename posts Commands::RenameTown, which the engine runs as the server; op=town_action posts Commands::TownAction as the company and reports the rating before and after.",
+		"world.towns op=growth, op=settings and op=power are queries: they report the town state together with the settings that actually drive it, so the caller can see the dependency instead of guessing.",
+		"world.industry op=fund and op=prospect post Commands::BuildIndustry as the deity; op=fund_area posts Commands::BuildIndustryArea and reports the count from the callback; the created industries are read back from the pool because the command only reports a cost.",
+		"world.industry op=set_production, op=set_flags and op=set_exclusivity post the matching deity commands and report the state after the command.",
+		"world.signs op=place posts Commands::PlaceSign as the company and reports the new sign id from the callback; op=rename, op=delete and op=move post the deity sign commands.",
+		"world.landscape op=object and op=object_area post Commands::BuildObject and Commands::BuildObjectArea as the company; op=tree and op=tree_area post Commands::PlantTree and let the engine pick a tree type when `tree_type` is absent.",
+		"world.cheat op=money posts Commands::MoneyCheat, which is a single player only command and reports the income as a negative cost; op=bank_balance posts Commands::ChangeBankBalance as the deity.",
 		"world.project op=station_town only accepts a town that is a candidate of the station and reports the candidates otherwise; op=district reports the district of one tile of a town.",
+		"world.project op=catchment is a query; op=catchment_upgrade posts Commands::UpgradeStationCatchment as the station owner and reports the level before and after.",
+		"Every list query (world.industry op=list, world.signs op=list, world.towns op=list, world.landscape op=object_types, world.project op=catchment) is bounded: `limit` defaults to 64, `limit` is at most 512 and `offset` skips rows, and the result always reports the `total` number of rows.",
+		"world.industry op=set_flags covers the closure control (the no_closure flag); op=set_production reports the production level before and after, and the engine marks the industry as externally controlled.",
 		"world.project op=save/load is not implemented: the durable save lifecycle is left to the bridge.",
 	});
 
@@ -1695,19 +3883,28 @@ Json AdminToolCapabilities()
 bool IsAdminMutation(std::string_view method, const Json &params)
 {
 	if (method == "world.settings.set") return true;
-	if (method != "world.company" && method != "world.towns" && method != "world.project") return false;
+	if (method != "world.company" && method != "world.towns" && method != "world.project" &&
+			method != "world.industry" && method != "world.signs" && method != "world.landscape" &&
+			method != "world.cheat") {
+		return false;
+	}
 
 	std::string op;
 	if (ReadString(params, "op", op) != ParamState::Present) return true;
-	if (method == "world.company") return op != "info";
-	if (method == "world.towns") return op != "needs";
-	return op != "power" && op != "district";
+	if (method == "world.company") return op != "info" && op != "livery";
+	if (method == "world.towns") return op != "list" && op != "needs" && op != "growth" && op != "settings" && op != "power";
+	if (method == "world.industry") return op != "list" && op != "types" && op != "info" && op != "needs" && op != "production" && op != "cargo";
+	if (method == "world.signs") return op != "list" && op != "info";
+	if (method == "world.landscape") return op != "object_types";
+	return op != "power" && op != "district" && op != "catchment" && op != "settings";
 }
 
 std::optional<Json> DispatchAdminTool(std::string_view method, const Json &params, CompanyID company)
 {
 	if (method != "world.settings.get" && method != "world.settings.set" &&
-			method != "world.company" && method != "world.towns" && method != "world.project") {
+			method != "world.company" && method != "world.towns" && method != "world.project" &&
+			method != "world.industry" && method != "world.signs" && method != "world.landscape" &&
+			method != "world.cheat") {
 		return std::nullopt;
 	}
 	if (!params.is_object()) return MakeError("invalid_arguments", "params must be an object");
@@ -1716,6 +3913,10 @@ std::optional<Json> DispatchAdminTool(std::string_view method, const Json &param
 	if (method == "world.settings.set") return SettingsSet(params, company);
 	if (method == "world.company") return CompanyOp(params, company);
 	if (method == "world.towns") return TownsOp(params, company);
+	if (method == "world.industry") return IndustryOp(params, company);
+	if (method == "world.signs") return SignsOp(params, company);
+	if (method == "world.landscape") return LandscapeOp(params, company);
+	if (method == "world.cheat") return CheatOp(params, company);
 	return ProjectOp(params, company);
 }
 
