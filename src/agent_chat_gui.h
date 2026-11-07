@@ -46,7 +46,7 @@ void AgentChatGuiTick();
  * - "input": current text of the message input.
  * - "widgets": object mapping widget names to rectangles, only present when the window is open.
  *   Names are caption, chat_list, chat_scroll, new_chat, transcript, transcript_scroll, tray,
- *   add_point, add_object, input, status, send, stop and closebox (the close box has no widget
+ *   add_point, add_object, add_company, input, status, send, stop and closebox (the close box has no widget
  *   id of its own, so it is looked up in the nested tree; Esc closes the window as well). The
  *   caption is the title bar, i.e. the area a real input test can drag the window by.
  * - "chats": array of {id, title, selected, task_active, status}. "task_active" stays true while
