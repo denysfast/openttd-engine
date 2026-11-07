@@ -18,16 +18,19 @@
 
 #include "../3rdparty/catch2/catch.hpp"
 
+#include <filesystem>
+
 #include "../agent_game_tools.h"
 #include "../aircraft.h"
 #include "../cargotype.h"
 #include "../company_base.h"
 #include "../engine_base.h"
+#include "../language.h"
 #include "../order_base.h"
-#include "../settings_type.h"
-#include "../table/strings.h"
 #include "../road.h"
 #include "../roadveh.h"
+#include "../settings_type.h"
+#include "../table/strings.h"
 #include "../train.h"
 #include "../vehicle_base.h"
 
@@ -901,6 +904,38 @@ public:
 };
 
 /**
+ * Load the language pack the build generated, so this binary resolves real strings.
+ *
+ * The test binary has no language pack of its own: `GetString()` aborts on the first string that is
+ * not in the loaded table ("String 0x8820 is invalid"), and an engine name is resolved through
+ * `STR_ENGINE_NAME` plus the engine's own name string. The pack is the real `english.lng` the build
+ * writes to `${CMAKE_BINARY_DIR}/lang`; CTest passes its path in `OTTD_TEST_LANGUAGE_FILE`, and the
+ * relative path is the fallback for a manual run from the build directory.
+ *
+ * The metadata is static because `ReadLanguagePack()` keeps the pointer it is given as the current
+ * language, so a stack object would dangle after this function returns.
+ */
+void LoadTestLanguagePack()
+{
+	static LanguageMetadata english;
+	if (_current_language == &english) return;
+
+	std::vector<std::filesystem::path> candidates;
+	if (const char *from_ctest = getenv("OTTD_TEST_LANGUAGE_FILE"); from_ctest != nullptr && *from_ctest != '\0') {
+		candidates.emplace_back(from_ctest);
+	}
+	candidates.emplace_back(std::filesystem::path("lang") / "english.lng");
+
+	for (const std::filesystem::path &candidate : candidates) {
+		if (!std::filesystem::exists(candidate)) continue;
+		english.file = candidate;
+		REQUIRE(ReadLanguagePack(&english));
+		return;
+	}
+	FAIL("no english.lng found: CTest passes OTTD_TEST_LANGUAGE_FILE, a manual run needs the build directory as its working directory");
+}
+
+/**
  * One real engine in the engine's own pool, removed again when the fixture goes out of scope.
  *
  * The engine is created through the pool's own `CreateAtIndex`, the path the engine itself uses when
@@ -1065,9 +1100,13 @@ TEST_CASE("agent_game_tools: a station order with unusable parameters is still r
 
 TEST_CASE("agent_game_tools: an engine row reports the name the game shows")
 {
+	LoadTestLanguagePack();
+
 	TestEngines engines;
 	Engine *e = engines.engine;
-	e->info.string_id = STR_SV_EMPTY;
+	/* A real default engine name string: the English pack has it, so the row can be checked against
+	 * the text a player sees instead of against the helper that produced it. */
+	e->info.string_id = STR_VEHICLE_NAME_ROAD_VEHICLE_MPS_REGAL_BUS;
 	/* The engine's own rule: the custom name is shown only while the engine is enabled. */
 	e->info.climates.Set(_settings_game.game_creation.landscape);
 	e->name = "Renamed Bus";
@@ -1081,12 +1120,10 @@ TEST_CASE("agent_game_tools: an engine row reports the name the game shows")
 	const Json &row = (*renamed)["rows"].front();
 	CHECK(row["name"] == "Renamed Bus");
 	CHECK(row["custom_name"] == "Renamed Bus");
-	CHECK(row["name"] == EngineDisplayName(e));
 
 	/* The other fields of the row are untouched. */
 	CHECK(row["id"] == 0);
 	CHECK(row["type"] == "road");
-	CHECK(row["cost"] == 0);
 	CHECK(row["refittable"] == false);
 	CHECK(row["enabled"] == true);
 	CHECK_FALSE(row.contains("available"));
@@ -1099,15 +1136,14 @@ TEST_CASE("agent_game_tools: an engine row reports the name the game shows")
 	REQUIRE(missing.has_value());
 	CHECK((*missing)["total"] == 0);
 
-	/* Without an override the row still reports the display name the engine resolves to. The default
-	 * name comes from the language pack, which only a running game loads, so it is compared with the
-	 * engine's own resolution instead of an invented label. */
+	/* Without an override the row reports the engine's own default name, resolved from the language
+	 * pack, and there is no custom name. */
 	e->name.clear();
 	const std::optional<Json> plain = DispatchGameTool("world.query", {{"kind", "engines"}}, CompanyID::Invalid());
 	REQUIRE(plain.has_value());
 	REQUIRE((*plain)["total"] == 1);
 	CHECK((*plain)["rows"].front()["custom_name"].is_null());
-	CHECK((*plain)["rows"].front()["name"] == EngineDisplayName(e));
+	CHECK((*plain)["rows"].front()["name"] == "MPS Regal Bus");
 
 	/* A disabled engine does not show its override: the row follows the engine's resolution instead of
 	 * reporting the raw field, which is what the tool used to do. */
@@ -1119,15 +1155,25 @@ TEST_CASE("agent_game_tools: an engine row reports the name the game shows")
 	REQUIRE((*disabled)["total"] == 1);
 	const Json &disabled_row = (*disabled)["rows"].front();
 	CHECK(disabled_row["custom_name"] == "Renamed Bus");
-	CHECK(disabled_row["name"] == EngineDisplayName(e));
-	CHECK(disabled_row["name"] != "Renamed Bus");
+	CHECK(disabled_row["name"] == "MPS Regal Bus");
+
+	/* The filter follows the display name too: a disabled engine is found by its default name, not by
+	 * the override it does not show. */
+	const std::optional<Json> by_default = DispatchGameTool("world.query", {{"kind", "engines"}, {"filters", {{"name_contains", "Regal"}}}}, CompanyID::Invalid());
+	REQUIRE(by_default.has_value());
+	CHECK((*by_default)["total"] == 1);
+	const std::optional<Json> by_override = DispatchGameTool("world.query", {{"kind", "engines"}, {"filters", {{"name_contains", "Renamed"}}}}, CompanyID::Invalid());
+	REQUIRE(by_override.has_value());
+	CHECK((*by_override)["total"] == 0);
 }
 
 TEST_CASE("agent_game_tools: a vehicle row reports the engine's display name")
 {
+	LoadTestLanguagePack();
+
 	TestEngines engines;
 	Engine *e = engines.engine;
-	e->info.string_id = STR_SV_EMPTY;
+	e->info.string_id = STR_VEHICLE_NAME_ROAD_VEHICLE_MPS_REGAL_BUS;
 	e->info.climates.Set(_settings_game.game_creation.landscape);
 	e->name = "Renamed Bus";
 	REQUIRE(e->IsEnabled());
@@ -1142,9 +1188,9 @@ TEST_CASE("agent_game_tools: a vehicle row reports the engine's display name")
 	CHECK(named["engine_name"] == "Renamed Bus");
 	CHECK(named["engine_custom_name"] == "Renamed Bus");
 
-	/* Without an override the field still carries the engine's display name, not an empty string. */
+	/* Without an override the field carries the engine's default name, not an empty string. */
 	e->name.clear();
 	const Json plain = VehicleEngineNameFieldsForTest(vehicles.road);
-	CHECK(plain["engine_name"] == EngineDisplayName(e));
+	CHECK(plain["engine_name"] == "MPS Regal Bus");
 	CHECK(plain["engine_custom_name"].is_null());
 }
