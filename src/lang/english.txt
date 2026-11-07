@@ -3297,6 +3297,10 @@ STR_FUND_INDUSTRY_INDUSTRY_BUILD_COST                           :{BLACK}Cost: {Y
 STR_FUND_INDUSTRY_PROSPECT_NEW_INDUSTRY                         :{BLACK}Prospect
 STR_FUND_INDUSTRY_BUILD_NEW_INDUSTRY                            :{BLACK}Build
 STR_FUND_INDUSTRY_FUND_NEW_INDUSTRY                             :{BLACK}Fund
+STR_FUND_INDUSTRY_FUND_TOOLTIP                                  :{BLACK}Click on the map to build one industry of the selected type. Drag to select an area: it is filled with as many industries as fit, packed tightly
+STR_FUND_INDUSTRY_AREA_CAPTION                                  :{WHITE}Fund industries in an area
+STR_FUND_INDUSTRY_AREA_QUERY                                    :{YELLOW}Build {COMMA} × {STRING} in the selected area for {CURRENCY_LONG}?{}{}{WHITE}The "one industry of a type per town" rule does not apply here. If the money runs out, building stops.
+STR_FUND_INDUSTRY_AREA_QUERY_EDITOR                             :{YELLOW}Build {COMMA} × {STRING} in the selected area?
 STR_FUND_INDUSTRY_REMOVE_ALL_INDUSTRIES                         :{BLACK}Remove all industries
 STR_FUND_INDUSTRY_REMOVE_ALL_INDUSTRIES_TOOLTIP                 :{BLACK}Remove all industries currently present on the map
 STR_FUND_INDUSTRY_REMOVE_ALL_INDUSTRIES_CAPTION                 :{WHITE}Remove all industries
@@ -5432,6 +5436,7 @@ STR_ERROR_CAN_T_BUILD_HERE                                      :Can't build {ST
 STR_ERROR_CAN_T_CONSTRUCT_THIS_INDUSTRY                         :Can't construct this industry type here...
 STR_ERROR_CAN_T_PROSPECT_INDUSTRY                               :Can't prospect industry...
 STR_ERROR_INDUSTRY_TOO_CLOSE                                    :too close to another industry
+STR_ERROR_INDUSTRY_AREA_TOO_LARGE                               :area too large (at most 256 × 256 tiles)
 STR_ERROR_MUST_FOUND_TOWN_FIRST                                 :must found town first
 STR_ERROR_ONLY_ONE_ALLOWED_PER_TOWN                             :only one allowed per town
 STR_ERROR_CAN_ONLY_BE_BUILT_IN_TOWNS_WITH_POPULATION_OF_1200    :can only be built in towns with a population of at least 1200

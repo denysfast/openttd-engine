@@ -285,7 +285,7 @@ static constexpr std::initializer_list<NWidgetPart> _nested_build_industry_widge
 	NWidget(NWID_HORIZONTAL),
 		NWidget(WWT_TEXTBTN, Colours::DarkGreen, WID_DPI_DISPLAY_WIDGET), SetFill(1, 0), SetResize(1, 0),
 				SetStringTip(STR_INDUSTRY_DISPLAY_CHAIN, STR_INDUSTRY_DISPLAY_CHAIN_TOOLTIP),
-		NWidget(WWT_TEXTBTN, Colours::DarkGreen, WID_DPI_FUND_WIDGET), SetFill(1, 0), SetResize(1, 0),
+		NWidget(WWT_TEXTBTN, Colours::DarkGreen, WID_DPI_FUND_WIDGET), SetFill(1, 0), SetResize(1, 0), SetToolTip(STR_FUND_INDUSTRY_FUND_TOOLTIP),
 		NWidget(WWT_RESIZEBOX, Colours::DarkGreen),
 	EndContainer(),
 };
@@ -699,7 +699,108 @@ public:
 		this->vscroll->SetCapacityFromWidget(this, WID_DPI_MATRIX_WIDGET);
 	}
 
+	/** A click builds one industry, dragging selects an area to fill. */
 	void OnPlaceObject([[maybe_unused]] Point pt, TileIndex tile) override
+	{
+		VpStartPlaceSizing(tile, VPM_X_AND_Y, DDSP_FUND_INDUSTRY_AREA);
+	}
+
+	void OnPlaceDrag(ViewportPlaceMethod select_method, [[maybe_unused]] ViewportDragDropSelectionProcess select_proc, Point pt) override
+	{
+		VpSelectTilesWithMethod(pt.x, pt.y, select_method);
+	}
+
+	void OnPlaceMouseUp([[maybe_unused]] ViewportPlaceMethod select_method, [[maybe_unused]] ViewportDragDropSelectionProcess select_proc, Point pt, TileIndex start_tile, TileIndex end_tile) override
+	{
+		if (pt.x == -1) return;
+		assert(select_proc == DDSP_FUND_INDUSTRY_AREA);
+
+		if (start_tile == end_tile) {
+			this->PlaceOneIndustry(pt, end_tile);
+			return;
+		}
+		this->PlaceIndustryArea(pt, start_tile, end_tile);
+	}
+
+	/** Area of the pending "fund in area" question. */
+	static inline TileIndex area_start = INVALID_TILE;
+	static inline TileIndex area_end = INVALID_TILE; ///< Other corner of the pending area.
+	static inline IndustryType area_type = IT_INVALID; ///< Industry type of the pending area.
+	static inline uint32_t area_seed = 0; ///< Seed of the pending area.
+
+	/**
+	 * Post the "fund in area" command, with the editor's backups when needed.
+	 * @return Whether it succeeded.
+	 */
+	static bool PostIndustryArea()
+	{
+		if (_game_mode == GameMode::Editor) {
+			AutoRestoreBackup backup_cur_company(_current_company, OWNER_NONE);
+			AutoRestoreBackup backup_generating_world(_generating_world, true);
+			AutoRestoreBackup backup_ignore_industry_restritions(_ignore_industry_restrictions, true);
+			return Command<Commands::BuildIndustryArea>::Post(STR_ERROR_CAN_T_CONSTRUCT_THIS_INDUSTRY, area_end, area_start, area_type, area_seed);
+		}
+		return Command<Commands::BuildIndustryArea>::Post(STR_ERROR_CAN_T_CONSTRUCT_THIS_INDUSTRY, area_end, area_start, area_type, area_seed);
+	}
+
+	static void AskIndustryAreaCallback(Window *w, bool confirmed)
+	{
+		if (!confirmed) return;
+		if (PostIndustryArea() && !_settings_client.gui.persistent_buildingtools && w != nullptr) ResetObjectToPlace();
+	}
+
+	/**
+	 * Plan the industries of an area and ask whether to build them.
+	 * @param pt Point of the mouse, for error messages.
+	 * @param start_tile One corner of the area.
+	 * @param end_tile Opposite corner of the area.
+	 */
+	void PlaceIndustryArea(Point pt, TileIndex start_tile, TileIndex end_tile)
+	{
+		const IndustrySpec *indspec = GetIndustrySpec(this->selected_type);
+		if (_game_mode == GameMode::Editor && Town::GetNumItems() == 0) {
+			ShowErrorMessage(GetEncodedString(STR_ERROR_CAN_T_BUILD_HERE, indspec->name),
+				GetEncodedString(STR_ERROR_MUST_FOUND_TOWN_FIRST), WarningLevel::Info, pt.x, pt.y);
+			return;
+		}
+
+		/* The border tiles of the map are void: keep the corners inside. */
+		auto inside = [](TileIndex t) {
+			return TileXY(std::clamp<uint>(TileX(t), 1, Map::MaxX() - 1), std::clamp<uint>(TileY(t), 1, Map::MaxY() - 1));
+		};
+		start_tile = inside(start_tile);
+		end_tile = inside(end_tile);
+		area_start = start_tile;
+		area_end = end_tile;
+		area_type = this->selected_type;
+		area_seed = InteractiveRandom();
+
+		/* A dry run gives the number and the price; if it fails, the real command reports why. */
+		CommandCost cost;
+		uint32_t count = 0;
+		{
+			AutoRestoreBackup backup_cur_company(_current_company, _game_mode == GameMode::Editor ? OWNER_NONE : _current_company);
+			AutoRestoreBackup backup_generating_world(_generating_world, _game_mode == GameMode::Editor);
+			AutoRestoreBackup backup_ignore_industry_restritions(_ignore_industry_restrictions, _game_mode == GameMode::Editor);
+			std::tie(cost, count) = Command<Commands::BuildIndustryArea>::Do(DoCommandFlag::QueryCost, end_tile, start_tile, this->selected_type, area_seed);
+		}
+		if (cost.Failed() || count == 0) {
+			PostIndustryArea();
+			return;
+		}
+		if (_game_mode == GameMode::Editor) {
+			ShowQuery(GetEncodedString(STR_FUND_INDUSTRY_AREA_CAPTION), GetEncodedString(STR_FUND_INDUSTRY_AREA_QUERY_EDITOR, count, indspec->name), this, AskIndustryAreaCallback);
+		} else {
+			ShowQuery(GetEncodedString(STR_FUND_INDUSTRY_AREA_CAPTION), GetEncodedString(STR_FUND_INDUSTRY_AREA_QUERY, count, indspec->name, cost.GetCost()), this, AskIndustryAreaCallback);
+		}
+	}
+
+	/**
+	 * Build one industry, as a click with the fund tool always did.
+	 * @param pt Point of the mouse, for error messages.
+	 * @param tile Tile to build at.
+	 */
+	void PlaceOneIndustry([[maybe_unused]] Point pt, TileIndex tile)
 	{
 		bool success = true;
 		/* We do not need to protect ourselves against "Random Many Industries" in this mode */

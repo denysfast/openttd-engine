@@ -52,6 +52,8 @@
 #include "company_cmd.h"
 #include "misc_cmd.h"
 #include "industry.h"
+#include "industry_cmd.h"
+#include "core/random_func.hpp"
 #include "town.h"
 #include "town_cmd.h"
 #include "vehicle_cmd.h"
@@ -2405,6 +2407,67 @@ static bool ConDepotClone(std::span<std::string_view> argv)
 	return true;
 }
 
+/** Fund as many industries of a type as fit into an area. @copydoc IConsoleCmdProc */
+static bool ConIndustryArea(std::span<std::string_view> argv)
+{
+	if (argv.empty()) {
+		IConsolePrint(CC_HELP, "Fund as many industries of a type as fit into an area. Usage: 'industry_area <x1> <y1> <x2> <y2> <industry type> [<company>] [estimate]'.");
+		IConsolePrint(CC_HELP, "With a company (1-based) it pays like the fund window does, without one it builds for free. 'estimate' only prints the plan.");
+		return true;
+	}
+	if (argv.size() < 6 || argv.size() > 8) return false;
+	if (_game_mode != GameMode::Normal) {
+		IConsolePrint(CC_ERROR, "There is no game running.");
+		return true;
+	}
+
+	std::array<uint32_t, 5> c{};
+	for (uint i = 0; i < 5; i++) {
+		auto v = ParseInteger(argv[i + 1]);
+		if (!v.has_value()) return false;
+		c[i] = *v;
+	}
+	if (c[0] >= Map::SizeX() || c[2] >= Map::SizeX() || c[1] >= Map::SizeY() || c[3] >= Map::SizeY()) {
+		IConsolePrint(CC_ERROR, "Tile outside the map.");
+		return true;
+	}
+	if (c[4] >= NUM_INDUSTRYTYPES || !GetIndustrySpec(static_cast<IndustryType>(c[4]))->enabled) {
+		IConsolePrint(CC_ERROR, "Unknown industry type '{}'.", argv[5]);
+		return true;
+	}
+
+	bool estimate = argv.back() == "estimate";
+	size_t args = argv.size() - (estimate ? 1 : 0);
+	CompanyID company = OWNER_DEITY;
+	if (args == 7) {
+		auto number = ParseInteger(argv[6]);
+		if (!number.has_value() || *number == 0 || !Company::IsValidID(CompanyID(*number - 1))) {
+			IConsolePrint(CC_ERROR, "Unknown company '{}'.", argv[6]);
+			return true;
+		}
+		company = CompanyID(*number - 1);
+	}
+
+	IndustryType type = static_cast<IndustryType>(c[4]);
+	TileIndex start = TileXY(c[0], c[1]);
+	TileIndex end = TileXY(c[2], c[3]);
+	uint32_t seed = InteractiveRandom();
+	AutoRestoreBackup cur_company(_current_company, company);
+	if (estimate) {
+		auto [cost, count] = Command<Commands::BuildIndustryArea>::Do(DoCommandFlag::QueryCost, end, start, type, seed);
+		if (cost.Failed()) {
+			IConsolePrint(CC_ERROR, "No industry fits: {}", cost.GetErrorMessage() != INVALID_STRING_ID ? GetString(cost.GetErrorMessage()) : std::string{"error"});
+		} else {
+			IConsolePrint(CC_INFO, "Plan: {} industries, cost {}.", count, cost.GetCost());
+		}
+		return true;
+	}
+	if (!Command<Commands::BuildIndustryArea>::Post(STR_ERROR_CAN_T_CONSTRUCT_THIS_INDUSTRY, end, start, type, seed)) {
+		IConsolePrint(CC_ERROR, "Funding the industries failed.");
+	}
+	return true;
+}
+
 /** Invest money into towns, by a company or for free. @copydoc IConsoleCmdProc */
 static bool ConTownInvest(std::span<std::string_view> argv)
 {
@@ -4169,6 +4232,7 @@ void IConsoleStdLibRegister()
 	IConsole::CmdRegister("town_invest",             ConTownInvest);
 	IConsole::CmdRegister("town_delete",             ConTownDelete);
 	IConsole::CmdRegister("depot_clone",             ConDepotClone);
+	IConsole::CmdRegister("industry_area",           ConIndustryArea,     ConHookServerOrNoNetwork);
 	IConsole::CmdRegister("power_grid",              ConPowerGrid);
 	IConsole::CmdRegister("power_add_fuel",          ConPowerAddFuel,     ConHookServerOrNoNetwork);
 	IConsole::CmdRegister("townsim_log",             ConTownSimLog);

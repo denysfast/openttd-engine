@@ -314,6 +314,7 @@ enum class Commands : uint8_t {
 	DestroyTown, ///< destroy a town in a running game
 	CloneDepot, ///< buy copies of all vehicles in another depot
 	SetStationTown, ///< assign a station to one of the towns nearest to it
+	BuildIndustryArea, ///< fund as many industries of a type as fit into an area
 
 	OrderRefit, ///< change the refit information of an order (for "goto depot" )
 	CloneOrder, ///< clone (and share) an order
