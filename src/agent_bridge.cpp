@@ -1345,6 +1345,10 @@ Json WorldInfo()
 			/* The plan's target is a query/batch slice, so the whole batch of one poll is measured too. */
 			{"batches", TimingJson(_state.batch_timing, INLINE_BUDGET_US)},
 			{"deferred", TimingJson(_state.deferred_timing, DEFERRED_BUDGET_US)},
+			/* The chat window's own Send acknowledgement: measured with the same steady clock in
+			 * this process, from the Send handler to the first paint of its feedback, and kept
+			 * apart from the answer latency and from the game-thread slices above. */
+			{"chat_ack", AgentChatAckTimingJson()},
 		}},
 		{"local_company_id", company_id(_local_company)},
 		{"current_company_id", company_id(_current_company)},
@@ -3090,6 +3094,7 @@ Json CoreContracts()
 		{"not_measured", "HTTP latency, poll cadence and queue waiting"},
 		{"budget", "a threshold that counts overruns; nothing is aborted when it is exceeded"},
 		{"ordering", "a world.info answer reports the executions that finished before it"},
+		{"chat_ack", "world.info.timing.chat_ack = {unit, clock, scope, target_us, pending, last_send, chat_id, world_id, epoch, outcome, client_message_id, painted, handler_to_paint_us, ack_to_paint_us, handler_to_ack_us}: the in-game chat window's Send, measured with this process's steady clock; handler_to_paint_us is the feedback the player waits for, ack_to_paint_us and handler_to_ack_us keep the backend's answer latency separate, outcome is painted, accepted, not_sent or uncertain, and every duration is null until it was measured"},
 	};
 
 	return contracts;

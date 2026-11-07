@@ -12,6 +12,210 @@
 
 #include "3rdparty/nlohmann/json.hpp"
 
+#include <chrono>
+#include <cstdint>
+#include <optional>
+#include <string>
+
+/**
+ * State machine of one chat message submission: from the Send handler, through the HTTP
+ * acknowledgement of the backend, to the first paint that draws the pending-send feedback.
+ *
+ * The player has to see that the click did something before the backend answers, so the
+ * feedback is drawn from the next paint on and the answer only ends it. Every duration in here
+ * is measured with std::chrono::steady_clock inside this process: the numbers are comparable
+ * within one run of the game and are never mixed with a clock of the backend process.
+ *
+ * The machine is a plain value with no window, backend or game dependency, so the UI owns one
+ * instance and a test can drive its own.
+ */
+struct AgentChatSendAck {
+	/** One submitted message that is on its way to the backend. */
+	struct Submission {
+		int64_t send = 0;                                ///< Sequence number of this submission, 0 for none.
+		std::string chat_id;                             ///< Chat the message was sent to, empty while it is created.
+		std::string world_id;                            ///< World the message was sent in.
+		std::string epoch;                               ///< Load epoch the message was sent in.
+		std::string payload_id;                          ///< Canonical identity of the composed message, for a retry.
+		std::string client_message_id;                   ///< Id the backend deduplicates the message on.
+		std::chrono::steady_clock::time_point handler{}; ///< When the Send handler ran.
+	};
+
+	/** What the UI does with the composed message when an acknowledgement arrives. */
+	enum class AckResult {
+		Ignored,     ///< A late, foreign or already answered answer; nothing is applied.
+		ClearDraft,  ///< The acknowledged draft is still in the editor, so it can be cleared.
+		KeepDraft,   ///< The player composed something newer while the request was in flight.
+	};
+
+	/** Why a submission ended without an acknowledgement. */
+	enum class FailReason {
+		NotSent,    ///< The request never left, so the backend cannot have the message.
+		Uncertain,  ///< The request left but its answer was lost, so the backend may have the message.
+	};
+
+	/**
+	 * What the last submission did, bounded to one. The `outcome` field is one of "painted" (the
+	 * feedback was on screen, no answer yet), "accepted" (the backend acknowledged the message),
+	 * "not_sent" (the message never left) or "uncertain" (the request failed after it left, so the
+	 * backend may have the message); it is empty until something happened.
+	 */
+	struct Timing {
+		int64_t send = 0;                          ///< Sequence number of that submission, 0 for none.
+		std::string chat_id;                       ///< Chat of that submission, empty when it has none yet.
+		std::string world_id;                      ///< World that submission was made in.
+		std::string epoch;                         ///< Load epoch that submission was made in.
+		std::string outcome;                       ///< What the submission did, see above.
+		std::string payload_id;                    ///< Canonical identity of the composed message; kept for a retry.
+		std::string client_message_id;             ///< Id of the submission, so a retry can be matched.
+		bool painted = false;                      ///< Whether its feedback reached a paint at all.
+		std::optional<int64_t> handler_to_paint_us; ///< Send handler to the first paint of the feedback.
+		std::optional<int64_t> ack_to_paint_us;     ///< HTTP acceptance to the first paint of the accepted state.
+		std::optional<int64_t> handler_to_ack_us;   ///< Send handler to HTTP acceptance, i.e. the answer latency.
+	};
+
+	Submission pending{};                 ///< Submission whose acknowledgement is still on its way.
+	Submission visible{};                 ///< Submission whose pending feedback is still drawn.
+	std::chrono::steady_clock::time_point accepted{}; ///< When the visible submission was acknowledged.
+	bool accepted_known = false;          ///< Whether #accepted belongs to #visible.
+	bool visible_painted = false;         ///< Whether the feedback of #visible was painted already.
+	Timing last{};                        ///< Last painted (or failed) submission, bounded to one.
+	int64_t next_send = 1;                ///< Sequence number handed to the next submission.
+
+	/**
+	 * Start a submission, unless one is already waiting for its acknowledgement.
+	 *
+	 * This is called at the entry of the Send handler, before anything asynchronous: the chat may
+	 * still have to be created, and the time the player waits for feedback starts at the click.
+	 *
+	 * The client message id is reused only for a retry of a message whose acceptance is unknown
+	 * and whose payload identity, chat, world and epoch are exactly the ones that were sent, so a
+	 * changed attachment or another chat is sent under a fresh id instead of being dropped by a
+	 * backend that deduplicates.
+	 * @param chat_id The chat the message goes to, empty while it is still being created.
+	 * @param world_id The world the message is sent in.
+	 * @param epoch The load epoch the message is sent in.
+	 * @param payload_id The canonical identity of the composed message: text and ordered attachments.
+	 * @param now The time the Send handler ran.
+	 * @return The sequence number of the new submission, or 0 when a submission was pending already.
+	 */
+	int64_t Begin(const std::string &chat_id, const std::string &world_id, const std::string &epoch, const std::string &payload_id, std::chrono::steady_clock::time_point now);
+
+	/**
+	 * Bind the chat a submission is sent to, once it exists.
+	 * @param send The sequence number of the submission.
+	 * @param chat_id The id of the chat that was created for it.
+	 * @return \c true when the submission still owns this chat and can be sent, \c false when it
+	 *         was answered, failed or reset in the meantime.
+	 */
+	bool BindChat(int64_t send, const std::string &chat_id);
+
+	/**
+	 * The client message id of the submission that is on its way.
+	 * @return The id, or an empty string when no submission is pending.
+	 */
+	const std::string &PendingClientMessageId() const { return this->pending.client_message_id; }
+
+	/**
+	 * The chat of the submission whose pending feedback is drawn.
+	 * @return The chat id, empty while the chat of that submission is still being created.
+	 */
+	const std::string &VisibleChatId() const { return this->visible.chat_id; }
+
+	/**
+	 * Whether the drawn feedback belongs to a submission the backend has already acknowledged.
+	 * @return \c true when the acknowledged state has to be drawn next.
+	 */
+	bool VisibleAcknowledged() const { return this->visible.send != 0 && this->accepted_known; }
+
+	/**
+	 * The outcome of the last submission, see #Timing::outcome.
+	 * @return The outcome, empty when nothing happened yet.
+	 */
+	const std::string &LastOutcome() const { return this->last.outcome; }
+
+	/**
+	 * The world the last submission was made in.
+	 * @return The world id, empty when nothing was submitted yet.
+	 */
+	const std::string &LastWorldId() const { return this->last.world_id; }
+
+	/**
+	 * The load epoch the last submission was made in.
+	 * @return The epoch, empty when nothing was submitted yet.
+	 */
+	const std::string &LastEpoch() const { return this->last.epoch; }
+
+	/**
+	 * Whether a submitted message still waits for its acknowledgement, i.e. whether a second Send
+	 * would send the same draft twice.
+	 * @return \c true when a submission is pending.
+	 */
+	bool Pending() const { return this->pending.send != 0; }
+
+	/**
+	 * Sequence number of the submission whose pending feedback is still on screen.
+	 * @return The sequence number, or 0 when no pending feedback is drawn.
+	 */
+	int64_t Visible() const { return this->visible.send; }
+
+	/**
+	 * Apply the HTTP acknowledgement of a submission.
+	 * @param send The sequence number the answer belongs to.
+	 * @param world_id The world the request was issued in.
+	 * @param epoch The load epoch the request was issued in.
+	 * @param draft_unchanged Whether the composed message is still the one that was sent.
+	 * @param now The time the answer arrived.
+	 * @return What the caller does with the composed message.
+	 */
+	AckResult Acknowledge(int64_t send, const std::string &world_id, const std::string &epoch, bool draft_unchanged, std::chrono::steady_clock::time_point now);
+
+	/**
+	 * Apply the failure of a submission: the feedback ends and the draft stays for another try.
+	 *
+	 * A timing that was already painted for this submission is true and is kept; only the outcome
+	 * is changed, so a lost answer never hides the feedback the player did get.
+	 * @param send The sequence number the failure belongs to.
+	 * @param world_id The world the request was issued in.
+	 * @param epoch The load epoch the request was issued in.
+	 * @param reason Whether the message can have reached the backend.
+	 */
+	void Fail(int64_t send, const std::string &world_id, const std::string &epoch, FailReason reason);
+
+	/**
+	 * Record that the pending feedback of a submission was actually drawn.
+	 * @param send The sequence number of the feedback that was drawn.
+	 * @param now The time of the paint.
+	 * @return \c true when the feedback of that submission was on screen, \c false for anything else.
+	 */
+	bool Painted(int64_t send, std::chrono::steady_clock::time_point now);
+
+	/** Forget the submissions of the world that was left; the last painted timing keeps its own world. */
+	void Reset();
+
+	/**
+	 * Describe the last acknowledgement for the environment.
+	 * @return The bounded timing object, the same one world.info reports as `timing.chat_ack`.
+	 */
+	nlohmann::json ToJson() const;
+};
+
+/**
+ * Timing of the last chat message acknowledgement of the in-game chat window.
+ *
+ * The object is published at `world.info` under `timing.chat_ack` and, with the same binding, as
+ * `chat_ack` in the description of the chat UI (`ui.inspect`). Its `unit` is "microseconds" and
+ * its `clock` is the game's own steady clock: `handler_to_paint_us` is the time from the Send
+ * handler to the first paint that drew the pending feedback (the 100 ms the player waits for
+ * feedback), `ack_to_paint_us` from the HTTP acceptance to the first paint of the accepted or
+ * task status (never the pending text), and `handler_to_ack_us` the answer latency itself. A
+ * duration is null while it was not measured, and all of them are measured in this process only.
+ * `outcome` says whether the last submission was painted, accepted, not_sent or uncertain.
+ *
+ * @return The timing object, bound to the world and epoch it was measured in.
+ */
+nlohmann::json AgentChatAckTimingJson();
+
 /**
  * Open the in-game agent chat window, or bring it to the front when it is already open.
  * The window is also reachable with the "agent_chat" hotkey (Ctrl+Shift+A by default) and
@@ -67,6 +271,9 @@ void AgentChatGuiTick();
  * in the UI ("(stale)" / "(unverified)") and are still sent, the backend resolves them.
  * - "status_window": object {left, top, text, stop} with the position of the status window and
  *   the screen rectangles of its widgets, or null when it is not open.
+ * - "chat_ack": the timing of the last chat Send acknowledgement, the same object that world.info
+ *   reports as `timing.chat_ack` (see AgentChatSendAck::ToJson()). It is bound to the world and
+ *   epoch it was measured in and is never mixed with a clock of the backend process.
  *
  * A rectangle is an object {left, top, right, bottom} in screen pixels.
  *

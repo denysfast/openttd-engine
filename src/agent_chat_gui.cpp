@@ -121,6 +121,7 @@ struct AgentChatUiState {
 	bool connected = false;                 ///< Whether the game is connected to the backend.
 	bool chats_loaded = false;              ///< Whether the chat list was loaded for this world.
 	std::chrono::steady_clock::time_point next_poll{}; ///< Time of the next poll.
+	AgentChatSendAck send_ack;              ///< Submission of the composed message and its acknowledgement.
 };
 
 static AgentChatUiState _agent_chat;
@@ -761,6 +762,10 @@ static void AgentChatSyncContext()
 		/* A tile of the old world cannot be picked any more, so the window must not stay shaded. */
 		RestoreAgentChatPickingShade();
 		/* The text draft does not refer to the world, so it is kept on purpose. */
+		/* A submission of the world that was left can no longer be answered, and a late answer of
+		 * it must not end the feedback of the new world. The last painted timing keeps the world
+		 * and epoch it was measured in. */
+		_agent_chat.send_ack.Reset();
 	}
 
 	_agent_chat.world_id = world_id;
@@ -850,13 +855,15 @@ static void AgentChatLoadChats()
 
 /**
  * Create a new chat and select it.
- * @param then Called after the chat was created and selected.
+ * @param then Called with the id of the chat that was created and selected.
+ * @param on_failure Called when no chat could be created.
  */
-static void AgentChatCreateChat(std::function<void()> then = {})
+static void AgentChatCreateChat(std::function<void(const std::string &)> then = {}, std::function<void()> on_failure = {})
 {
 	if (!_agent_chat.connected) {
 		_agent_chat.error = GetString(STR_AGENT_CHAT_NOT_CONNECTED);
 		InvalidateAgentChatWindows();
+		if (on_failure) on_failure();
 		return;
 	}
 
@@ -870,9 +877,13 @@ static void AgentChatCreateChat(std::function<void()> then = {})
 	body["title"] = GetString(STR_AGENT_CHAT_DEFAULT_TITLE, static_cast<int32_t>(_agent_chat.chats.size() + 1));
 	body["company_id"] = static_cast<int32_t>(_local_company.base());
 
-	AgentChatRequest("POST", "/v1/chats", body, [then = std::move(then), world_id, epoch](const Json &response) {
-		/* Ignore the answer when the world changed while the request was in flight. */
-		if (world_id != _agent_chat.world_id || epoch != _agent_chat.epoch) return;
+	AgentChatRequest("POST", "/v1/chats", body, [then = std::move(then), on_failure, world_id, epoch](const Json &response) {
+		/* The world changed while the request was in flight, so this chat belongs to the world
+		 * that was left and nothing may be sent to it. */
+		if (world_id != _agent_chat.world_id || epoch != _agent_chat.epoch) {
+			if (on_failure) on_failure();
+			return;
+		}
 
 		const Json &chat_json = response.is_object() && response.contains("chat") ? response["chat"] : response;
 
@@ -880,29 +891,41 @@ static void AgentChatCreateChat(std::function<void()> then = {})
 		chat.id = JsonString(chat_json, "chat_id", JsonString(chat_json, "id"));
 		if (chat.id.empty()) {
 			_agent_chat.error = GetString(STR_AGENT_CHAT_ERROR_UNKNOWN);
+			if (on_failure) on_failure();
 			return;
 		}
 		chat.title = SanitiseBackendText(JsonString(chat_json, "title", GetString(STR_AGENT_CHAT_DEFAULT_TITLE, static_cast<int32_t>(_agent_chat.chats.size() + 1))));
 
+		/* The id of the chat that was created, not whatever is selected when the continuation runs:
+		 * the player can select another chat in between. */
+		const std::string chat_id = chat.id;
 		_agent_chat.chats.push_back(std::move(chat));
 		_agent_chat.active = static_cast<int>(_agent_chat.chats.size() - 1);
 		_agent_chat.chats_loaded = true;
 
-		if (then) then();
+		if (then) then(chat_id);
+	}, [on_failure]() {
+		/* The chat was not created, so there is nothing to send the message to. */
+		if (on_failure) on_failure();
 	});
 }
 
 /**
  * Make sure a chat is selected, creating one when needed.
- * @param then Called after a chat is selected.
+ * @param then Called with the id of the chat to use.
+ * @param on_failure Called when no chat could be selected, so nothing can be sent.
  */
-static void AgentChatEnsureChat(std::function<void()> then)
+static void AgentChatEnsureChat(std::function<void(const std::string &)> then, std::function<void()> on_failure = {})
 {
-	if (GetActiveChat() != nullptr) {
-		then();
+	/* The chat that is selected now is captured here, so a player who selects another chat while
+	 * the message is prepared does not redirect the submission. */
+	const AgentChatEntry *chat = GetActiveChat();
+	if (chat != nullptr) {
+		const std::string chat_id = chat->id;
+		then(chat_id);
 		return;
 	}
-	AgentChatCreateChat(std::move(then));
+	AgentChatCreateChat(std::move(then), std::move(on_failure));
 }
 
 /**
@@ -1116,33 +1139,265 @@ static void AgentChatRefreshChat(const std::string &chat_id)
 	});
 }
 
+/* --- Send acknowledgement --- */
+
+/**
+ * Measure the time between two steady clock points, in microseconds.
+ * @param from The earlier point.
+ * @param to The later point.
+ * @return The duration in microseconds.
+ */
+static int64_t MicrosSince(std::chrono::steady_clock::time_point from, std::chrono::steady_clock::time_point to)
+{
+	return std::chrono::duration_cast<std::chrono::microseconds>(to - from).count();
+}
+
+/** Outcome of a submission whose feedback was drawn but whose answer has not arrived. */
+static const char * const ACK_OUTCOME_PAINTED = "painted";
+/** Outcome of a submission the backend acknowledged. */
+static const char * const ACK_OUTCOME_ACCEPTED = "accepted";
+/** Outcome of a submission that never left, so the backend cannot have the message. */
+static const char * const ACK_OUTCOME_NOT_SENT = "not_sent";
+/** Outcome of a submission whose request failed after it left, so the backend may have the message. */
+static const char * const ACK_OUTCOME_UNCERTAIN = "uncertain";
+
+int64_t AgentChatSendAck::Begin(const std::string &chat_id, const std::string &world_id, const std::string &epoch, const std::string &payload_id, std::chrono::steady_clock::time_point now)
+{
+	/* One submission at a time: the draft of a message that is on its way must not be sent twice,
+	 * and a chat that is still being created for it must not be created a second time either. */
+	if (this->pending.send != 0) return 0;
+
+	/* A retry of a message whose acceptance is unknown keeps its client message id, so a backend
+	 * that deduplicates on it recognises the second attempt instead of taking the message twice.
+	 * Only exactly the same chat and the same payload may reuse it: another attachment, another
+	 * order or another chat is a different message and must not be dropped as a duplicate. */
+	const bool retry = this->last.outcome == ACK_OUTCOME_UNCERTAIN &&
+			this->last.payload_id == payload_id &&
+			this->last.chat_id == chat_id &&
+			this->last.world_id == world_id && this->last.epoch == epoch;
+	const std::string client_message_id = retry ? this->last.client_message_id : fmt::format("{}", now.time_since_epoch().count());
+
+	this->pending = Submission{this->next_send++, chat_id, world_id, epoch, payload_id, client_message_id, now};
+	/* The feedback belongs to the submission the player just made, so it replaces the feedback of
+	 * an earlier submission that never reached a paint. */
+	this->visible = this->pending;
+	this->accepted_known = false;
+	this->visible_painted = false;
+	return this->pending.send;
+}
+
+bool AgentChatSendAck::BindChat(int64_t send, const std::string &chat_id)
+{
+	/* The submission can have been answered, failed or reset while the chat was being created. */
+	if (send == 0 || send != this->pending.send || chat_id.empty()) return false;
+
+	this->pending.chat_id = chat_id;
+	if (this->visible.send == send) this->visible.chat_id = chat_id;
+	return true;
+}
+
+AgentChatSendAck::AckResult AgentChatSendAck::Acknowledge(int64_t send, const std::string &world_id, const std::string &epoch, bool draft_unchanged, std::chrono::steady_clock::time_point now)
+{
+	/* A late answer of an earlier submission, or of one that was never submitted, changes nothing. */
+	if (send == 0 || send != this->pending.send) return AckResult::Ignored;
+	if (world_id != this->pending.world_id || epoch != this->pending.epoch) {
+		/* The world of this submission is gone, so it is not pending any more either. */
+		this->pending = Submission{};
+		if (this->visible.send == send) this->visible = Submission{};
+		return AckResult::Ignored;
+	}
+
+	if (this->visible.send == send) {
+		this->accepted = now;
+		this->accepted_known = true;
+	}
+	/* The accepted outcome belongs to the submission that was painted; an answer that arrives
+	 * before its first paint is recorded by that paint instead. */
+	if (this->last.send == send) this->last.outcome = ACK_OUTCOME_ACCEPTED;
+	/* The answer ends the pending state, so Send is available again right away; the feedback
+	 * stays on screen until the paint that shows the acknowledged state. */
+	this->pending = Submission{};
+	return draft_unchanged ? AckResult::ClearDraft : AckResult::KeepDraft;
+}
+
+void AgentChatSendAck::Fail(int64_t send, const std::string &world_id, const std::string &epoch, FailReason reason)
+{
+	if (send == 0 || send != this->pending.send) return;
+
+	/* A timing that was already painted for this submission is true and stays; only a submission
+	 * that never reached a paint is reported as unpainted. */
+	if (this->last.send != send) {
+		this->last = Timing{};
+		this->last.send = send;
+		this->last.chat_id = this->pending.chat_id;
+		this->last.world_id = world_id;
+		this->last.epoch = epoch;
+		this->last.payload_id = this->pending.payload_id;
+		this->last.client_message_id = this->pending.client_message_id;
+	}
+	this->last.outcome = reason == FailReason::Uncertain ? ACK_OUTCOME_UNCERTAIN : ACK_OUTCOME_NOT_SENT;
+	this->pending = Submission{};
+	if (this->visible.send == send) this->visible = Submission{};
+}
+
+bool AgentChatSendAck::Painted(int64_t send, std::chrono::steady_clock::time_point now)
+{
+	if (send == 0 || send != this->visible.send) return false;
+
+	if (!this->visible_painted) {
+		this->last = Timing{};
+		this->last.send = send;
+		this->last.chat_id = this->visible.chat_id;
+		this->last.world_id = this->visible.world_id;
+		this->last.epoch = this->visible.epoch;
+		this->last.outcome = ACK_OUTCOME_PAINTED;
+		this->last.payload_id = this->visible.payload_id;
+		this->last.client_message_id = this->visible.client_message_id;
+		this->last.painted = true;
+		this->last.handler_to_paint_us = MicrosSince(this->visible.handler, now);
+		this->visible_painted = true;
+	}
+
+	/* The paint that shows the acknowledged state is measured on its own, never mixed into the
+	 * time the player waited for the first feedback. */
+	if (this->accepted_known && this->last.send == send && !this->last.ack_to_paint_us.has_value()) {
+		this->last.ack_to_paint_us = MicrosSince(this->accepted, now);
+		this->last.handler_to_ack_us = MicrosSince(this->visible.handler, this->accepted);
+		this->last.outcome = ACK_OUTCOME_ACCEPTED;
+	}
+
+	/* Once the acknowledged state was painted, the pending feedback has done its job. */
+	if (this->accepted_known) this->visible = Submission{};
+	return true;
+}
+
+void AgentChatSendAck::Reset()
+{
+	this->pending = Submission{};
+	this->visible = Submission{};
+	this->accepted_known = false;
+	this->visible_painted = false;
+}
+
+Json AgentChatSendAck::ToJson() const
+{
+	const auto micros = [](const std::optional<int64_t> &value) -> Json {
+		return value.has_value() ? Json(*value) : Json(nullptr);
+	};
+
+	return {
+		{"unit", "microseconds"},
+		{"clock", "steady_clock"},
+		{"scope", "same process only: in-game chat Send handler -> first paint that draws the pending-send feedback, HTTP acceptance -> first paint of the accepted or task status, and Send handler -> HTTP acceptance; no clock of the backend process is mixed in"},
+		{"target_us", 100000},
+		{"pending", this->Pending()},
+		{"last_send", this->last.send},
+		{"chat_id", this->last.chat_id},
+		{"world_id", this->last.world_id},
+		{"epoch", this->last.epoch},
+		{"outcome", this->last.outcome},
+		{"client_message_id", this->last.client_message_id},
+		{"painted", this->last.painted},
+		{"handler_to_paint_us", micros(this->last.handler_to_paint_us)},
+		{"ack_to_paint_us", micros(this->last.ack_to_paint_us)},
+		{"handler_to_ack_us", micros(this->last.handler_to_ack_us)},
+	};
+}
+
+Json AgentChatAckTimingJson()
+{
+	return _agent_chat.send_ack.ToJson();
+}
+
+/**
+ * Build the message body of a composed message, without the client message id.
+ *
+ * The same function gives the identity of the payload: its canonical JSON is what decides whether
+ * a retry sends the message that may already have arrived, and whether the acknowledgement may
+ * clear the draft. The text and the attachments in their order are part of it, so an edited or
+ * reordered tray is another message.
+ * @param text The composed text.
+ * @param tray The composed attachments, in order.
+ * @return The body of the message.
+ */
+static Json ComposeMessageBody(const std::string &text, const std::vector<AgentChatAttachment> &tray)
+{
+	Json body = Json::object();
+	body["text"] = text;
+	Json attachments = Json::array();
+	for (const AgentChatAttachment &attachment : tray) attachments.push_back(AttachmentToJson(attachment));
+	body["attachments"] = std::move(attachments);
+	return body;
+}
+
 /** Send the composed message to the selected chat. */
 static void AgentChatSend()
 {
 	if (_agent_chat.input.empty() && _agent_chat.tray.empty()) return;
+	/* A second Send while the first one waits for its answer would send the same draft twice, and
+	 * a chat that is still being created for it must not be created twice either. */
+	if (_agent_chat.send_ack.Pending()) return;
 
-	AgentChatEnsureChat([]() {
-		AgentChatEntry *chat = GetActiveChat();
-		if (chat == nullptr) return;
+	/* The submission is captured at the click, before anything asynchronous: creating a chat takes
+	 * a round trip, and the feedback the player waits for starts at the click, not at its answer. */
+	const auto now = std::chrono::steady_clock::now();
+	const std::string world_id = _agent_chat.world_id;
+	const std::string epoch = _agent_chat.epoch;
+	const std::string text = _agent_chat.input;
+	const std::vector<AgentChatAttachment> tray = _agent_chat.tray;
+	const AgentChatEntry *active = GetActiveChat();
+	const std::string chat_id = active != nullptr ? active->id : std::string();
 
-		const std::string chat_id = chat->id;
-		const std::string world_id = _agent_chat.world_id;
-		const std::string epoch = _agent_chat.epoch;
-		const std::string text = _agent_chat.input;
-		const std::vector<AgentChatAttachment> tray = _agent_chat.tray;
+	/* The body of the message and its identity are the same thing, built once here: a retry of a
+	 * message whose acceptance is unknown may only reuse its client message id for exactly this
+	 * chat and exactly this payload, attachments in their order. */
+	const Json message = ComposeMessageBody(text, tray);
+	const std::string payload_id = message.dump();
 
-		Json body = Json::object();
-		body["text"] = text;
-		Json attachments = Json::array();
-		for (const AgentChatAttachment &attachment : tray) attachments.push_back(AttachmentToJson(attachment));
-		body["attachments"] = attachments;
-		body["client_message_id"] = fmt::format("{}", std::chrono::steady_clock::now().time_since_epoch().count());
+	const int64_t send = _agent_chat.send_ack.Begin(chat_id, world_id, epoch, payload_id, now);
+	if (send == 0) return;
+	InvalidateAgentChatWindows();
 
-		AgentChatRequest("POST", "/v1/chats/" + chat_id + "/messages", body, [chat_id, world_id, epoch](const Json &response) {
-			/* Ignore the answer when the world changed while the request was in flight. */
-			if (world_id != _agent_chat.world_id || epoch != _agent_chat.epoch) return;
+	/* Nothing was sent, so the draft and the tray stay and the player can send them again. */
+	const auto not_sent = [send, world_id, epoch]() {
+		_agent_chat.send_ack.Fail(send, world_id, epoch, AgentChatSendAck::FailReason::NotSent);
+		InvalidateAgentChatWindows();
+	};
 
-			AgentChatEntry *chat = FindChatById(chat_id);
+	AgentChatEnsureChat([send, world_id, epoch, message, payload_id](const std::string &send_chat_id) {
+		/* The world can change while a chat is created; the submission then belongs to the world
+		 * that was left and is not sent to the new one. */
+		if (world_id != _agent_chat.world_id || epoch != _agent_chat.epoch) {
+			_agent_chat.send_ack.Fail(send, world_id, epoch, AgentChatSendAck::FailReason::NotSent);
+			InvalidateAgentChatWindows();
+			return;
+		}
+
+		/* The chat this submission was created for, not whatever is selected now: the player can
+		 * select another chat while the chat is created. A submission that is gone by now is not
+		 * sent, and a chat that could not be created ends it as not sent. */
+		if (!_agent_chat.send_ack.BindChat(send, send_chat_id)) {
+			_agent_chat.send_ack.Fail(send, world_id, epoch, AgentChatSendAck::FailReason::NotSent);
+			InvalidateAgentChatWindows();
+			return;
+		}
+
+		Json body = message;
+		/* The id of the submission: a retry of a message whose acceptance is unknown reuses it. */
+		body["client_message_id"] = _agent_chat.send_ack.PendingClientMessageId();
+
+		AgentChatRequest("POST", "/v1/chats/" + send_chat_id + "/messages", body, [send_chat_id, world_id, epoch, send, payload_id](const Json &response) {
+			/* The draft the message was composed from; a newer one must survive the answer. The
+			 * payload identity is compared, so an edited or reordered tray is kept as well. */
+			const bool draft_unchanged = ComposeMessageBody(_agent_chat.input, _agent_chat.tray).dump() == payload_id;
+			/* Both decide: the submission must still own the answer, and the world and epoch it was
+			 * issued in must still be the current ones. */
+			const bool same_context = world_id == _agent_chat.world_id && epoch == _agent_chat.epoch;
+			const AgentChatSendAck::AckResult result = _agent_chat.send_ack.Acknowledge(send, world_id, epoch, draft_unchanged, std::chrono::steady_clock::now());
+			/* Ignore the answer when it is late or belongs to a world that was left. */
+			if (!same_context || result == AgentChatSendAck::AckResult::Ignored) return;
+
+			AgentChatEntry *chat = FindChatById(send_chat_id);
 			if (chat != nullptr) {
 				/* The answer carries the task of the message; a queued task is active as well, so
 				 * the player sees that the turn is waiting and Stop is available. */
@@ -1152,16 +1407,23 @@ static void AgentChatSend()
 				chat->task_status = GetTaskStatusText(JsonString(task, "status"));
 				if (chat->task_status.empty()) chat->task_status = GetString(STR_AGENT_CHAT_STATUS_THINKING);
 			}
-			_agent_chat.input.clear();
-			_agent_chat.caret = 0;
-			_agent_chat.composed_length = 0;
-			_agent_chat.tray.clear();
+			if (result == AgentChatSendAck::AckResult::ClearDraft) {
+				_agent_chat.input.clear();
+				_agent_chat.caret = 0;
+				_agent_chat.composed_length = 0;
+				_agent_chat.tray.clear();
+			}
 			_agent_chat.scroll = INT32_MAX;
 			InvalidateWindowClassesData(WindowClass::AgentChat);
-			AgentChatLoadMessages(chat_id);
-			AgentChatPollEvents(chat_id);
+			AgentChatLoadMessages(send_chat_id);
+			AgentChatPollEvents(send_chat_id);
+		}, [world_id, epoch, send]() {
+			/* The request left but its answer was lost, so the backend may have the message: the
+			 * draft and the tray stay, and the player is told that sending again may repeat it. */
+			_agent_chat.send_ack.Fail(send, world_id, epoch, AgentChatSendAck::FailReason::Uncertain);
+			InvalidateAgentChatWindows();
 		});
-	});
+	}, not_sent);
 }
 
 /**
@@ -1369,7 +1631,10 @@ struct AgentChatWindow : Window {
 		const AgentChatEntry *chat = GetActiveChat();
 		const bool busy = chat != nullptr && chat->task_active;
 
-		this->SetWidgetDisabledState(WID_AC_SEND, !_agent_chat.connected || (_agent_chat.input.empty() && _agent_chat.tray.empty()));
+		/* A submission that waits for its answer keeps Send disabled: the same draft must not be
+		 * sent twice, but the draft itself stays in the editor. */
+		this->SetWidgetDisabledState(WID_AC_SEND, !_agent_chat.connected ||
+				(_agent_chat.input.empty() && _agent_chat.tray.empty()) || _agent_chat.send_ack.Pending());
 		this->SetWidgetDisabledState(WID_AC_STOP, !busy);
 		this->SetWidgetDisabledState(WID_AC_NEW_CHAT, !_agent_chat.connected);
 		this->SetWidgetLoweredState(WID_AC_ADD_POINT, _agent_chat.picking_point);
@@ -1636,16 +1901,42 @@ struct AgentChatWindow : Window {
 		const Rect area = r.Shrink(WidgetDimensions::scaled.framerect);
 		const AgentChatEntry *chat = GetActiveChat();
 
+		/* The feedback of a submission belongs to the chat it was sent to: a player who switched to
+		 * another chat sees that chat's status, and this paint is not stamped for the submission. A
+		 * submission whose chat is still being created has no chat to match yet. */
+		const int64_t pending_send = _agent_chat.send_ack.Visible();
+		const std::string &pending_chat = _agent_chat.send_ack.VisibleChatId();
+		const bool feedback_here = pending_send != 0 && (pending_chat.empty() || (chat != nullptr && chat->id == pending_chat));
+
+		/* Until the answer arrived the feedback is the pending text, drawn from the next paint after
+		 * the Send handler, so the click shows before the backend answers. */
+		if (feedback_here && !_agent_chat.send_ack.VisibleAcknowledged()) {
+			DrawString(area.left, area.right, area.top, GetString(STR_AGENT_CHAT_STATUS_SENDING), TextColour::Grey);
+			_agent_chat.send_ack.Painted(pending_send, std::chrono::steady_clock::now());
+			return;
+		}
+
 		std::string text;
 		if (!_agent_chat.connected) {
 			text = GetString(STR_AGENT_CHAT_NOT_CONNECTED);
+		} else if (pending_send == 0 && _agent_chat.send_ack.LastOutcome() == ACK_OUTCOME_UNCERTAIN &&
+				_agent_chat.send_ack.LastWorldId() == _agent_chat.world_id && _agent_chat.send_ack.LastEpoch() == _agent_chat.epoch) {
+			/* The answer of the last send was lost, so whether the backend took the message is
+			 * unknown: say so instead of letting the player repeat it silently. It outranks the
+			 * generic error text, which describes the request rather than what the player may do. */
+			text = GetString(STR_AGENT_CHAT_SEND_UNCERTAIN);
 		} else if (!_agent_chat.error.empty()) {
 			text = _agent_chat.error;
 		} else if (chat != nullptr) {
 			text = GetChatStatusText(*chat);
 		}
 
-		if (!text.empty()) DrawString(area.left, area.right, area.top, text, _agent_chat.error.empty() ? TextColour::Grey : TextColour::Red);
+		if (!text.empty()) {
+			DrawString(area.left, area.right, area.top, text, _agent_chat.error.empty() ? TextColour::Grey : TextColour::Red);
+			/* The accepted or task status is on screen now, so this is the paint that may be
+			 * recorded as the one after the acceptance; the pending text above never is. */
+			if (feedback_here) _agent_chat.send_ack.Painted(pending_send, std::chrono::steady_clock::now());
+		}
 	}
 
 	void OnClick(Point pt, WidgetID widget, [[maybe_unused]] int click_count) override
@@ -2638,6 +2929,10 @@ nlohmann::json DescribeAgentChatUi()
 	/* Report the actual rectangles of the window and of the targets inside it. Nested widget
 	 * rectangles and #Window::GetInnerRect are window-local, so they are offset by the window
 	 * position; "coordinate_space" names the space of every rectangle in this object. */
+	/* The same object world.info reports as timing.chat_ack, bound to the world and epoch it was
+	 * measured in. */
+	out["chat_ack"] = AgentChatAckTimingJson();
+
 	out["coordinate_space"] = "screen";
 	AgentChatWindow *w = dynamic_cast<AgentChatWindow *>(FindWindowById(WindowClass::AgentChat, 0));
 	out["window_open"] = w != nullptr;
