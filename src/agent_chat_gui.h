@@ -257,6 +257,21 @@ void AgentChatGuiTick();
  *   the task of the chat is queued, running, stopping or settling, i.e. exactly while Stop is
  *   available; "status" is the translated status text of that task.
  * - "messages": array of {seq, role, text, status, attachments}.
+ * - "message_rows": array of {seq, rect, lines} with the screen rectangle of every visible
+ *   message and the rendered lines of its text as {rect, text}. The wrapping, the line height and
+ *   the text of a line are the ones that were drawn, so a real input test can drag from one line
+ *   to another instead of guessing a pixel.
+ * - "selection": object {chat, world_id, epoch, empty, anchor, cursor, from, to, text, focused,
+ *   rects, bounds} that
+ *   describes the selectable transcript text. "anchor" and "cursor" are {message, offset}, i.e.
+ *   byte offsets into the cached transcript (always on a UTF-8 character boundary), "from" and
+ *   "to" are the same two ends in transcript order, and "text" is exactly what Ctrl+C puts on the
+ *   clipboard. "focused" tells whether the transcript owns the selection keys (Ctrl+A selects the
+ *   transcript, Ctrl+C copies it); "rects" and "bounds" are the highlighted screen rectangles, and
+ *   are empty respectively null when nothing is selected. The selection belongs to the transcript
+ *   named by "chat" in the world named by "world_id" and "epoch", and is dropped when another
+ *   chat, world or epoch is shown, so it can never copy the text of a transcript it was not made
+ *   in. The text of the system clipboard itself is not reported, only the selected text.
  * - "tray": array of {type, id, generation, tile, name, world_id, epoch, stale, generation_known,
  *   rect, remove_rect}.
  * - "candidates": array of {type, id, generation, name, world_id, epoch, rect}.

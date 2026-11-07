@@ -11,6 +11,7 @@
 
 #include "agent_chat_gui.h"
 #include "agent_bridge.h"
+#include "agent_chat_selection.h"
 
 #include "company_base.h"
 #include "company_func.h"
@@ -21,6 +22,7 @@
 #include "core/string_consumer.hpp"
 #include "core/utf8.hpp"
 #include "gfx_func.h"
+#include "gfx_layout.h"
 #include "map_func.h"
 #include "string_func.h"
 #include "strings_func.h"
@@ -43,6 +45,17 @@
 
 /** Provided by the OS specific backends, also declared locally in textbuf.cpp. */
 std::optional<std::string> GetClipboardContents();
+
+/**
+ * Put text on the system clipboard.
+ *
+ * The OS backends only had a clipboard reader, which the message box uses to paste; a
+ * selectable transcript needs the writer as well. The text is handed over as UTF-8 and the
+ * backend converts it, so Cyrillic and newlines reach the clipboard unchanged.
+ * @param text The text to copy.
+ * @return \c true when the clipboard took the text.
+ */
+bool SetClipboardContents(const std::string &text);
 
 using Json = nlohmann::json;
 
@@ -122,6 +135,7 @@ struct AgentChatUiState {
 	bool chats_loaded = false;              ///< Whether the chat list was loaded for this world.
 	std::chrono::steady_clock::time_point next_poll{}; ///< Time of the next poll.
 	AgentChatSendAck send_ack;              ///< Submission of the composed message and its acknowledgement.
+	AgentChatSelection selection;           ///< Selected transcript text of the active chat.
 };
 
 static AgentChatUiState _agent_chat;
@@ -599,6 +613,37 @@ static AgentChatEntry *GetActiveChat()
 }
 
 /**
+ * Get the text of every message of a transcript, in transcript order.
+ *
+ * A selection is expressed in byte offsets of these texts, so the same list is used to hit
+ * test, to draw the highlight and to copy, and a selection can never be copied out of a text
+ * that was not the one it was made in.
+ * @param chat The chat, may be \c nullptr.
+ * @return The texts of the messages of that chat.
+ */
+static std::vector<std::string_view> TranscriptTexts(const AgentChatEntry *chat)
+{
+	std::vector<std::string_view> texts;
+	if (chat == nullptr) return texts;
+	texts.reserve(chat->messages.size());
+	for (const AgentChatMessage &message : chat->messages) texts.push_back(message.text);
+	return texts;
+}
+
+/**
+ * Bind the selection to the transcript that is shown now.
+ *
+ * The binding carries the world and the epoch as well as the chat id, so a load that keeps the
+ * same chat id in another world or epoch still drops the selection: the cached transcript it was
+ * made in is gone, and its offsets must not be applied to the new text.
+ * @param chat The chat that is shown, may be \c nullptr.
+ */
+static void BindTranscriptSelection(const AgentChatEntry *chat)
+{
+	_agent_chat.selection.BindChat(chat != nullptr ? chat->id : std::string(), _agent_chat.world_id, _agent_chat.epoch);
+}
+
+/**
  * Find a chat by its backend id.
  * @param id The chat id.
  * @return The chat, or \c nullptr when it is unknown.
@@ -766,6 +811,8 @@ static void AgentChatSyncContext()
 		 * it must not end the feedback of the new world. The last painted timing keeps the world
 		 * and epoch it was measured in. */
 		_agent_chat.send_ack.Reset();
+		/* The transcript of the world that was left is gone, so its selection cannot be copied. */
+		_agent_chat.selection.Clear();
 	}
 
 	_agent_chat.world_id = world_id;
@@ -849,7 +896,11 @@ static void AgentChatLoadChats()
 		}
 		if (_agent_chat.active < 0 && !_agent_chat.chats.empty()) _agent_chat.active = 0;
 
-		if (GetActiveChat() != nullptr) AgentChatLoadMessages(GetActiveChat()->id);
+		/* The selection belongs to the chat it was made in: another chat drops it. */
+		const AgentChatEntry *active = GetActiveChat();
+		BindTranscriptSelection(active);
+
+		if (active != nullptr) AgentChatLoadMessages(active->id);
 	});
 }
 
@@ -902,6 +953,7 @@ static void AgentChatCreateChat(std::function<void(const std::string &)> then = 
 		_agent_chat.chats.push_back(std::move(chat));
 		_agent_chat.active = static_cast<int>(_agent_chat.chats.size() - 1);
 		_agent_chat.chats_loaded = true;
+		_agent_chat.selection.BindChat(chat_id, _agent_chat.world_id, _agent_chat.epoch);
 
 		if (then) then(chat_id);
 	}, [on_failure]() {
@@ -971,6 +1023,8 @@ static void AgentChatLoadMessages(const std::string &chat_id)
 		 * clamped by the scrollbar, so the window has to re-run its layout for it to take effect. */
 		if (any) {
 			_agent_chat.scroll = INT32_MAX;
+			/* A reloaded message may be shorter than the one the selection was made in. */
+			_agent_chat.selection.Clamp(TranscriptTexts(chat));
 			InvalidateWindowClassesData(WindowClass::AgentChat);
 		}
 	});
@@ -1543,6 +1597,95 @@ static std::vector<Rect> LayoutTranscript(const AgentChatEntry *chat, const Rect
 	return result;
 }
 
+/** Measure a prefix of a rendered transcript line with the font that draws it. */
+static int MeasureTextPrefix(std::string_view text)
+{
+	return static_cast<int>(GetStringBoundingBox(text).width);
+}
+
+/**
+ * Lay out the selectable text lines of the transcript.
+ *
+ * The lines come from the same layouter that draws the messages, so wrapping, line height and
+ * the byte offsets of a line are the ones that were rendered, not an estimate of them. A hit
+ * test therefore lands on the glyphs that are on screen.
+ * @param chat The chat, may be \c nullptr.
+ * @param area The transcript area.
+ * @param scroll The scroll offset in pixels.
+ * @return The rendered text lines, in transcript order.
+ */
+static std::vector<AgentChatTextLine> LayoutTranscriptText(const AgentChatEntry *chat, const Rect &area, int scroll)
+{
+	std::vector<AgentChatTextLine> result;
+	if (chat == nullptr) return result;
+
+	int y = area.top - scroll;
+	for (size_t i = 0; i < chat->messages.size(); i++) {
+		const AgentChatMessage &message = chat->messages[i];
+		int top = y + GetCharacterHeight(FontSize::Normal);
+
+		if (!message.text.empty()) {
+			const Layouter layout(message.text, area.Width());
+			size_t previous_end = 0;
+			for (size_t index = 0; index < layout.size(); index++) {
+				const ParagraphLayouter::Line &line = *layout[index];
+
+				AgentChatTextLine text_line;
+				text_line.message = i;
+				text_line.top = top;
+				text_line.leading = line.GetLeading();
+				text_line.left = area.left;
+				text_line.width = line.GetWidth();
+
+				/* The byte offsets come from the glyphs of the line itself, so a line range never
+				 * starts or ends inside a character. A line without a drawable glyph keeps the end
+				 * of the previous line as its start. */
+				const ptrdiff_t begin = layout.GetCharAtPosition(0, index);
+				text_line.begin = begin >= 0 ? static_cast<size_t>(begin) : previous_end;
+				const ptrdiff_t last = layout.GetCharAtPosition(std::max(0, line.GetWidth() - 1), index);
+				text_line.end = last >= 0 ? std::max(text_line.begin, NextUtf8Boundary(message.text, static_cast<size_t>(last))) : text_line.begin;
+				previous_end = text_line.end;
+
+				result.push_back(text_line);
+				top += text_line.leading;
+			}
+		}
+
+		y += GetMessageHeight(message, area.Width());
+	}
+	return result;
+}
+
+/**
+ * Lay out the highlighted part of every rendered line of the transcript.
+ * @param selection The selection.
+ * @param lines The rendered text lines of the transcript.
+ * @param chat The chat, may be \c nullptr.
+ * @return The rectangles to fill behind the text, in screen coordinates.
+ */
+static std::vector<Rect> LayoutSelection(const AgentChatSelection &selection, const std::vector<AgentChatTextLine> &lines, const AgentChatEntry *chat)
+{
+	std::vector<Rect> result;
+	if (chat == nullptr || selection.Empty()) return result;
+
+	for (const AgentChatTextLine &line : lines) {
+		if (line.message >= chat->messages.size()) continue;
+		const std::string_view text = chat->messages[line.message].text;
+		const std::optional<std::pair<size_t, size_t>> range = selection.RangeIn(line.message, text.size());
+		if (!range.has_value()) continue;
+
+		const size_t from = std::max(range->first, line.begin);
+		const size_t to = std::min(range->second, line.end);
+		if (from >= to) continue;
+
+		const std::string_view line_text = text.substr(line.begin, line.end - line.begin);
+		const int left = line.left + WidthForOffset(line_text, from - line.begin, MeasureTextPrefix);
+		const int right = line.left + WidthForOffset(line_text, to - line.begin, MeasureTextPrefix);
+		result.push_back(Rect{left, line.top, std::max(left, right - 1), line.top + line.leading - 1});
+	}
+	return result;
+}
+
 /**
  * Lay out the attachment chips of the tray.
  * @param area The tray area.
@@ -1597,6 +1740,12 @@ static std::vector<Rect> LayoutCandidates(const Rect &area)
 struct AgentChatWindow : Window {
 	Scrollbar *chat_scroll = nullptr;       ///< Scrollbar of the chat list.
 	Scrollbar *transcript_scroll = nullptr; ///< Scrollbar of the transcript.
+
+	/* Transcript selection: the press that starts it, and whether it moved. */
+	bool transcript_focused = false;          ///< The transcript owns the selection keys (Ctrl+A, Ctrl+C).
+	bool selection_pressed = false;           ///< A press in the transcript waits for its release.
+	bool selection_dragged = false;           ///< That press moved, so it selects text instead of clicking.
+	Point selection_press_pt = {0, 0};        ///< Where that press landed, for the click it may still be.
 
 	/* Temporary shade that uncovers the map while a click is awaited. */
 	bool picking_shaded = false;              ///< This window was shaded by StartPicking().
@@ -1729,6 +1878,13 @@ struct AgentChatWindow : Window {
 
 		if (chat->messages.empty()) {
 			DrawStringMultiLine(area, GetString(STR_AGENT_CHAT_EMPTY_TRANSCRIPT), TextColour::Grey);
+		}
+
+		/* The highlight goes behind the text, and is laid out from the selection offsets of the
+		 * cached transcript, so it follows the text when the transcript is scrolled or repainted. */
+		const std::vector<AgentChatTextLine> text_lines = LayoutTranscriptText(chat, area, _agent_chat.scroll);
+		for (const Rect &highlight : LayoutSelection(_agent_chat.selection, text_lines, chat)) {
+			GfxFillRect(highlight, PC_DARK_BLUE);
 		}
 
 		const std::vector<Rect> layout = LayoutTranscript(chat, area, _agent_chat.scroll);
@@ -1941,6 +2097,10 @@ struct AgentChatWindow : Window {
 
 	void OnClick(Point pt, WidgetID widget, [[maybe_unused]] int click_count) override
 	{
+		/* Only the transcript takes the selection keys; any other widget gives them back to the
+		 * message box, so Ctrl+A in the input keeps its own meaning. */
+		this->transcript_focused = widget == WID_AC_TRANSCRIPT;
+
 		switch (widget) {
 			case WID_AC_NEW_CHAT:
 				AgentChatCreateChat();
@@ -1975,7 +2135,7 @@ struct AgentChatWindow : Window {
 				break;
 
 			case WID_AC_TRANSCRIPT:
-				this->ClickTranscript(pt);
+				this->PressTranscript(pt);
 				break;
 
 			case WID_AC_INPUT:
@@ -2073,6 +2233,148 @@ struct AgentChatWindow : Window {
 				}
 			}
 		}
+	}
+
+	/**
+	 * Handle a press in the transcript: start a text selection, or act on the object list.
+	 *
+	 * The click itself, i.e. centering the map on the object of a message, is handled when the
+	 * button is released and nothing was dragged, so selecting text never acts as a click.
+	 * @param pt Press position.
+	 */
+	void PressTranscript(Point pt)
+	{
+		/* The object list is a click target of its own and keeps acting on the press. */
+		if (_agent_chat.candidates_open) {
+			this->ClickTranscript(pt);
+			return;
+		}
+
+		this->selection_pressed = true;
+		this->selection_dragged = false;
+		this->selection_press_pt = pt;
+
+		const AgentChatEntry *chat = GetActiveChat();
+		BindTranscriptSelection(chat);
+
+		const std::vector<AgentChatTextLine> lines = LayoutTranscriptText(chat, this->GetInnerRect(WID_AC_TRANSCRIPT), _agent_chat.scroll);
+		const std::optional<AgentChatSelectionPoint> point = this->SelectionPointAt(lines, pt);
+		if (point.has_value()) {
+			/* A new press replaces the previous selection, like a text cursor does. */
+			_agent_chat.selection.Start(*point);
+		} else {
+			_agent_chat.selection.Clear();
+		}
+		this->SetWidgetDirty(WID_AC_TRANSCRIPT);
+	}
+
+	/**
+	 * Map a point in the transcript to the text under it.
+	 *
+	 * The point is looked up in the rendered lines of the transcript, so the offset is the byte
+	 * of the glyph that is under the pointer; a point outside the transcript selects the nearest
+	 * line, so a drag that leaves the panel keeps selecting.
+	 * @param lines The rendered text lines of the transcript.
+	 * @param pt The point, relative to the window.
+	 * @return The selection point, or nothing when the transcript has no selectable text.
+	 */
+	std::optional<AgentChatSelectionPoint> SelectionPointAt(const std::vector<AgentChatTextLine> &lines, Point pt) const
+	{
+		const AgentChatEntry *chat = GetActiveChat();
+		if (chat == nullptr || lines.empty()) return std::nullopt;
+
+		size_t best = 0;
+		int best_distance = INT32_MAX;
+		for (size_t i = 0; i < lines.size(); i++) {
+			const AgentChatTextLine &line = lines[i];
+			const int distance = pt.y < line.top ? line.top - pt.y : (pt.y > line.top + line.leading - 1 ? pt.y - (line.top + line.leading - 1) : 0);
+			if (distance >= best_distance) continue;
+			best_distance = distance;
+			best = i;
+			if (distance == 0) break;
+		}
+
+		const AgentChatTextLine &line = lines[best];
+		if (line.message >= chat->messages.size()) return std::nullopt;
+
+		const std::string_view text = chat->messages[line.message].text;
+		const std::string_view line_text = text.substr(line.begin, line.end - line.begin);
+		const size_t offset = line.begin + OffsetForX(line_text, pt.x - line.left, MeasureTextPrefix);
+		return AgentChatSelectionPoint{line.message, SnapUtf8Boundary(text, offset)};
+	}
+
+	/** Select the text of the whole transcript of the active chat. */
+	void SelectAllTranscript()
+	{
+		const AgentChatEntry *chat = GetActiveChat();
+		if (chat == nullptr) return;
+		BindTranscriptSelection(chat);
+
+		AgentChatSelectionPoint first{};
+		AgentChatSelectionPoint last{};
+		bool any = false;
+		for (size_t i = 0; i < chat->messages.size(); i++) {
+			const std::string &text = chat->messages[i].text;
+			if (text.empty()) continue;
+			if (!any) first = AgentChatSelectionPoint{i, 0};
+			last = AgentChatSelectionPoint{i, text.size()};
+			any = true;
+		}
+
+		if (!any) {
+			_agent_chat.selection.Clear();
+		} else {
+			_agent_chat.selection.Start(first);
+			_agent_chat.selection.Extend(last);
+		}
+		this->SetWidgetDirty(WID_AC_TRANSCRIPT);
+	}
+
+	/** Copy the selected transcript text to the system clipboard. */
+	void CopyTranscriptSelection()
+	{
+		const std::string text = _agent_chat.selection.GetText(TranscriptTexts(GetActiveChat()));
+		if (text.empty()) return;
+		SetClipboardContents(text);
+	}
+
+	/**
+	 * Follow a press in the transcript until the button is released.
+	 *
+	 * While the button is down the end of the selection follows the mouse; a press that is
+	 * released without moving is the single click the transcript had before, so an objectlink
+	 * still centers the map.
+	 */
+	void OnMouseLoop() override
+	{
+		if (!this->selection_pressed) return;
+
+		if (_left_button_down) {
+			const Point pt = {_cursor.pos.x - this->left, _cursor.pos.y - this->top};
+
+			/* A pointer that left the press point is a drag, also when it is not over text: the
+			 * attachment of a message without text must not center the map after a drag. */
+			const int drag_distance = ScaleGUITrad(2);
+			const int dx = pt.x - this->selection_press_pt.x;
+			const int dy = pt.y - this->selection_press_pt.y;
+			if (dx * dx + dy * dy > drag_distance * drag_distance) this->selection_dragged = true;
+
+			const std::vector<AgentChatTextLine> lines = LayoutTranscriptText(GetActiveChat(), this->GetInnerRect(WID_AC_TRANSCRIPT), _agent_chat.scroll);
+			const std::optional<AgentChatSelectionPoint> point = this->SelectionPointAt(lines, pt);
+			if (!point.has_value()) return;
+
+			if (!point->Same(_agent_chat.selection.anchor)) this->selection_dragged = true;
+			if (this->selection_dragged) {
+				_agent_chat.selection.Extend(*point);
+				this->SetWidgetDirty(WID_AC_TRANSCRIPT);
+			}
+			return;
+		}
+
+		this->selection_pressed = false;
+		if (!this->selection_dragged) this->ClickTranscript(this->selection_press_pt);
+		this->selection_dragged = false;
+		this->SetWidgetDirty(WID_AC_TRANSCRIPT);
 	}
 
 	/**
@@ -2346,6 +2648,20 @@ struct AgentChatWindow : Window {
 		}
 
 		if (!focused) return EventState::NotHandled;
+
+		/* The transcript owns the two selection keys while it has the focus. Taking them here, in
+		 * the focused window, keeps them away from the global hotkeys and from the message box,
+		 * so Ctrl+A selects the transcript text and nothing is sent or centered. */
+		if (this->transcript_focused) {
+			if (keycode == ('A' | WKC_CTRL)) {
+				this->SelectAllTranscript();
+				return EventState::Handled;
+			}
+			if (keycode == ('C' | WKC_CTRL)) {
+				this->CopyTranscriptSelection();
+				return EventState::Handled;
+			}
+		}
 
 		if (keycode == ('V' | WKC_CTRL)) {
 			const std::optional<std::string> contents = GetClipboardContents();
@@ -2926,6 +3242,21 @@ nlohmann::json DescribeAgentChatUi()
 	}
 	out["messages"] = std::move(messages);
 
+	/* The selection is reported read-only: its text, the two ends in transcript order and, when
+	 * the window is open, the rectangles that are highlighted. Nothing here changes the selection. */
+	Json selection = Json::object();
+	selection["chat"] = _agent_chat.selection.ChatId();
+	selection["world_id"] = _agent_chat.selection.world;
+	selection["epoch"] = _agent_chat.selection.epoch;
+	selection["empty"] = _agent_chat.selection.Empty();
+	selection["anchor"] = Json{{"message", _agent_chat.selection.anchor.message}, {"offset", _agent_chat.selection.anchor.offset}};
+	selection["cursor"] = Json{{"message", _agent_chat.selection.cursor.message}, {"offset", _agent_chat.selection.cursor.offset}};
+	const auto [selection_from, selection_to] = _agent_chat.selection.Ordered();
+	selection["from"] = Json{{"message", selection_from.message}, {"offset", selection_from.offset}};
+	selection["to"] = Json{{"message", selection_to.message}, {"offset", selection_to.offset}};
+	selection["text"] = _agent_chat.selection.GetText(TranscriptTexts(active));
+	out["selection"] = std::move(selection);
+
 	/* Report the actual rectangles of the window and of the targets inside it. Nested widget
 	 * rectangles and #Window::GetInnerRect are window-local, so they are offset by the window
 	 * position; "coordinate_space" names the space of every rectangle in this object. */
@@ -2997,16 +3328,44 @@ nlohmann::json DescribeAgentChatUi()
 		}
 		out["chat_rows"] = std::move(chat_rows);
 
+		out["selection"]["focused"] = w->transcript_focused;
+
 		Json message_rows = Json::array();
 		if (active != nullptr) {
 			const Rect area = w->GetInnerRect(WID_AC_TRANSCRIPT);
 			const std::vector<Rect> layout = LayoutTranscript(active, area, _agent_chat.scroll);
+			const std::vector<AgentChatTextLine> text_lines = LayoutTranscriptText(active, area, _agent_chat.scroll);
 			for (size_t i = 0; i < layout.size(); i++) {
 				Json entry = Json::object();
 				entry["seq"] = active->messages[i].seq;
 				entry["rect"] = RectToJson(ToScreenRect(*w, layout[i]));
+
+				/* The rendered lines of the message text, so a real input test can drag from one
+				 * of them to another instead of guessing a pixel. */
+				Json lines = Json::array();
+				for (const AgentChatTextLine &line : text_lines) {
+					if (line.message != i) continue;
+					Json line_entry = Json::object();
+					line_entry["rect"] = RectToJson(ToScreenRect(*w, Rect{line.left, line.top, line.left + line.width - 1, line.top + line.leading - 1}));
+					line_entry["text"] = active->messages[i].text.substr(line.begin, line.end - line.begin);
+					lines.push_back(std::move(line_entry));
+				}
+				entry["lines"] = std::move(lines);
 				message_rows.push_back(std::move(entry));
 			}
+
+			/* The highlight of the selection, exactly as it is painted, and its bounds. */
+			Json rects = Json::array();
+			Rect bounds = {0, 0, -1, -1};
+			bool any = false;
+			for (const Rect &highlight : LayoutSelection(_agent_chat.selection, text_lines, active)) {
+				rects.push_back(RectToJson(ToScreenRect(*w, highlight)));
+				bounds = any ? Rect{std::min(bounds.left, highlight.left), std::min(bounds.top, highlight.top),
+						std::max(bounds.right, highlight.right), std::max(bounds.bottom, highlight.bottom)} : highlight;
+				any = true;
+			}
+			out["selection"]["rects"] = std::move(rects);
+			out["selection"]["bounds"] = any ? RectToJson(ToScreenRect(*w, bounds)) : Json();
 		}
 		out["message_rows"] = std::move(message_rows);
 

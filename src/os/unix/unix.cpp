@@ -217,6 +217,17 @@ std::optional<std::string> GetClipboardContents()
 
 	return std::nullopt;
 }
+
+bool SetClipboardContents([[maybe_unused]] const std::string &text)
+{
+#ifdef WITH_SDL2
+	/* SDL copies the text, so the string stays owned by the caller. */
+	return SDL_SetClipboardText(text.c_str()) == 0;
+#else
+	/* A build without SDL2 has no clipboard to write to, just as it has none to read. */
+	return false;
+#endif
+}
 #endif
 
 

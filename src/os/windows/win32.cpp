@@ -345,6 +345,19 @@ void DetermineBasePaths(std::string_view exe)
 }
 
 
+/**
+ * Remember the first visible top level window of this thread.
+ * @param window The window to look at.
+ * @param param The \c HWND the first visible window is written to.
+ * @return \c FALSE to stop enumerating once a window was found.
+ */
+static BOOL CALLBACK FindOwnedWindow(HWND window, LPARAM param)
+{
+	if (!IsWindowVisible(window)) return TRUE;
+	*reinterpret_cast<HWND *>(param) = window;
+	return FALSE;
+}
+
 std::optional<std::string> GetClipboardContents()
 {
 	if (!IsClipboardFormatAvailable(CF_UNICODETEXT)) return std::nullopt;
@@ -358,6 +371,66 @@ std::optional<std::string> GetClipboardContents()
 
 	if (result.empty()) return std::nullopt;
 	return result;
+}
+
+/**
+ * Find a window of this process that can own the clipboard.
+ *
+ * The clipboard has to have an owner: with a NULL owner EmptyClipboard() makes SetClipboardData()
+ * fail. The foreground window is used when it belongs to this process, and otherwise the first
+ * visible top level window of this thread, so the clipboard is never owned by another
+ * application.
+ * @return The window, or \c nullptr when this process has none.
+ */
+static HWND GetClipboardOwnerWindow()
+{
+	HWND foreground = GetForegroundWindow();
+	DWORD process_id = 0;
+	if (foreground != nullptr && GetWindowThreadProcessId(foreground, &process_id) != 0 && process_id == GetCurrentProcessId()) {
+		return foreground;
+	}
+
+	HWND found = nullptr;
+	EnumThreadWindows(GetCurrentThreadId(), FindOwnedWindow, reinterpret_cast<LPARAM>(&found));
+	return found;
+}
+
+bool SetClipboardContents(const std::string &text)
+{
+	/* Without a window of this process the clipboard would be opened with a NULL owner, which
+	 * makes SetClipboardData() fail after EmptyClipboard() already dropped the old content. */
+	HWND owner = GetClipboardOwnerWindow();
+	if (owner == nullptr) owner = GetActiveWindow();
+	if (owner == nullptr) return false;
+
+	if (!OpenClipboard(owner)) return false;
+
+	bool success = false;
+	if (EmptyClipboard()) {
+		/* The clipboard takes UTF-16, so the UTF-8 text is converted with the same pair of
+		 * conversions the reader above uses in the other direction. */
+		const std::wstring wide = OTTD2FS(text);
+		const size_t size = (wide.size() + 1) * sizeof(wchar_t);
+		HGLOBAL cbuf = GlobalAlloc(GMEM_MOVEABLE, size);
+		if (cbuf != nullptr) {
+			void *dst = GlobalLock(cbuf);
+			if (dst != nullptr) {
+				memcpy(dst, wide.c_str(), size);
+				GlobalUnlock(cbuf);
+				/* The clipboard owns the block once it took it; until then this side frees it. */
+				if (SetClipboardData(CF_UNICODETEXT, cbuf) != nullptr) {
+					success = true;
+				} else {
+					GlobalFree(cbuf);
+				}
+			} else {
+				GlobalFree(cbuf);
+			}
+		}
+	}
+
+	CloseClipboard();
+	return success;
 }
 
 
