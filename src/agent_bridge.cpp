@@ -2965,9 +2965,9 @@ void HandlePollResponse(bool ok, const Json &body)
 	/*
 	 * A healthy poll repeats on the idle cadence; the heartbeat stays a separate, slower signal.
 	 * A batch that carried requests means the backend may already have queued the next request while
-	 * this batch ran, so poll again in this game loop iteration instead of waiting a whole interval.
-	 * That cannot spin: Tick() sends at most one poll per game loop iteration and only one poll is
-	 * ever in flight. A failed batch keeps its backoff.
+	 * this batch ran, so poll again as soon as the shared HTTP layer is free instead of waiting a whole
+	 * interval. That cannot spin: Tick() sends at most one request per game loop iteration and only one
+	 * bridge request is ever in flight. A failed batch keeps its backoff.
 	 */
 	if (!complete) {
 		_state.next_poll = Clock::now() + POLL_RETRY;
@@ -3373,11 +3373,14 @@ void SendPoll()
 	Send(RequestKind::Poll, "/v1/engine/poll", body.dump(), _state.engine_token, _state.epoch, nullptr);
 }
 
-/** Deliver the next queued result, if any. */
-void SendNextResult()
+/**
+ * Deliver the next queued result, if any.
+ * @return True iff a result was handed to the HTTP layer.
+ */
+bool SendNextResult()
 {
-	if (_state.results.empty() || _state.result_in_flight) return;
-	if (Clock::now() < _state.next_result) return;
+	if (_state.results.empty() || _state.result_in_flight) return false;
+	if (Clock::now() < _state.next_result) return false;
 
 	_state.inflight_result = _state.results.front();
 	_state.results.pop_front();
@@ -3392,6 +3395,7 @@ void SendNextResult()
 	};
 
 	Send(RequestKind::Result, "/v1/engine/result", body.dump(), _state.engine_token, _state.epoch, nullptr);
+	return true;
 }
 
 } // namespace
@@ -3428,12 +3432,22 @@ void Tick()
 	const Clock::time_point now = Clock::now();
 
 	if (!_state.connected) {
-		if (!_state.hello_in_flight && now >= _state.next_hello) SendHello();
+		/* Same gate as below: one request of ours at a time on the shared HTTP layer. */
+		const bool transport_free = !_state.hello_in_flight && !_state.poll_in_flight && !_state.result_in_flight;
+		if (transport_free && now >= _state.next_hello) SendHello();
 		return;
 	}
 
-	if (!_state.poll_in_flight && now >= _state.next_poll) SendPoll();
-	SendNextResult();
+	/*
+	 * The shared HTTP layer runs one request at a time and waits for this thread to drain a completion
+	 * before it starts the next one, so a request costs about one game-loop tick and every request
+	 * queued behind it costs that much again. The bridge therefore keeps at most one of its own
+	 * requests in flight, and it sends the answer the backend is waiting for before the poll that looks
+	 * for the next request: a poll can wait a tick, an answer should not.
+	 */
+	if (_state.hello_in_flight || _state.poll_in_flight || _state.result_in_flight) return;
+	if (SendNextResult()) return;
+	if (now >= _state.next_poll) SendPoll();
 }
 
 /**
