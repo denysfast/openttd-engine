@@ -24,6 +24,7 @@
 #include "network/network.h"
 #include "openttd.h"
 #include "rev.h"
+#include "signs_base.h"
 #include "station_base.h"
 #include "station_cmd.h"
 #include "strings_func.h"
@@ -33,6 +34,7 @@
 #include "tile_map.h"
 #include "town.h"
 #include "town_cmd.h"
+#include "vehicle_base.h"
 
 #include "3rdparty/fmt/format.h"
 
@@ -40,6 +42,7 @@
 #include <chrono>
 #include <cstdlib>
 #include <deque>
+#include <fstream>
 #include <map>
 #include <memory>
 #include <optional>
@@ -73,6 +76,8 @@ constexpr int DEFAULT_QUERY_LIMIT = 50;
 constexpr int MAX_QUERY_LIMIT = 500;
 /** Maximum number of tiles a single world.query may cover. */
 constexpr int MAX_QUERY_TILES = 4096;
+/** Maximum number of references a single world.objects or expected_refs may carry. */
+constexpr size_t MAX_OBJECT_REFS = 64;
 
 /**
  * Generate a random (version 4) UUID.
@@ -288,6 +293,46 @@ void ResolveWorldId()
 }
 
 /**
+ * Read a credential from an environment variable, or from the file named by
+ * the matching `*_FILE` variable.
+ *
+ * The file variant keeps the secret out of the process environment, which is
+ * world readable on most systems. The value is never logged.
+ * @param env_name Name of the environment variable holding the credential.
+ * @param file_env_name Name of the environment variable holding a file name.
+ * @param credential Receives the credential.
+ * @return True iff a non-empty credential was found.
+ */
+bool ReadCredential(const char *env_name, const char *file_env_name, std::string &credential)
+{
+	const char *value = std::getenv(env_name);
+	if (value != nullptr && *value != '\0') {
+		credential = value;
+		return true;
+	}
+
+	const char *path = std::getenv(file_env_name);
+	if (path == nullptr || *path == '\0') return false;
+
+	std::ifstream file(path, std::ios::binary);
+	if (!file) {
+		Debug(Facility::Net, Severity::Warning, "In-game agent bridge: cannot read the file named by {}", file_env_name);
+		return false;
+	}
+
+	std::string contents(4096, '\0');
+	file.read(contents.data(), static_cast<std::streamsize>(contents.size()));
+	contents.resize(static_cast<size_t>(file.gcount()));
+
+	/* A credential file usually ends with a newline; strip the surrounding whitespace. */
+	const size_t begin = contents.find_first_not_of(" \t\r\n");
+	if (begin == std::string::npos) return false;
+	const size_t end = contents.find_last_not_of(" \t\r\n");
+	credential = contents.substr(begin, end - begin + 1);
+	return !credential.empty();
+}
+
+/**
  * Read the runtime configuration, once.
  * @return True iff a backend is configured.
  */
@@ -305,11 +350,14 @@ bool EnsureInitialised()
 	_state.base_url = url;
 	while (!_state.base_url.empty() && _state.base_url.back() == '/') _state.base_url.pop_back();
 
-	const char *engine_token = std::getenv("AGENT_ENGINE_TOKEN");
-	const char *ui_token = std::getenv("AGENT_UI_TOKEN");
+	/* A configured backend is only talked to with credentials; never send an unauthenticated request. */
+	if (!ReadCredential("AGENT_ENGINE_TOKEN", "AGENT_ENGINE_TOKEN_FILE", _state.engine_token) ||
+			!ReadCredential("AGENT_UI_TOKEN", "AGENT_UI_TOKEN_FILE", _state.ui_token)) {
+		Debug(Facility::Net, Severity::Warning, "In-game agent bridge: AGENT_ENGINE_TOKEN(_FILE) and AGENT_UI_TOKEN(_FILE) are required; bridge disabled");
+		return false;
+	}
+
 	const char *engine_id = std::getenv("AGENT_ENGINE_ID");
-	_state.engine_token = engine_token != nullptr ? engine_token : "";
-	_state.ui_token = ui_token != nullptr ? ui_token : "";
 	_state.engine_id = (engine_id != nullptr && *engine_id != '\0') ? engine_id : GenerateUuid();
 
 	if (_state.epoch.empty()) _state.epoch = GenerateUuid();
@@ -493,16 +541,113 @@ Json WorldInfo()
 }
 
 /**
- * Implement world.query for towns, companies, stations and tiles.
+ * Map a query kind onto its canonical plural name, accepting the legacy
+ * singular aliases of the first kernel version.
+ * @param kind The kind as requested.
+ * @return The canonical kind, or an empty view when the kind is not implemented.
+ */
+std::string_view CanonicalQueryKind(std::string_view kind)
+{
+	if (kind == "towns" || kind == "town") return "towns";
+	if (kind == "companies" || kind == "company") return "companies";
+	if (kind == "stations" || kind == "station") return "stations";
+	if (kind == "industries" || kind == "industry") return "industries";
+	if (kind == "vehicles" || kind == "vehicle") return "vehicles";
+	if (kind == "signs" || kind == "sign") return "signs";
+	if (kind == "tiles" || kind == "tile") return "tiles";
+	return {};
+}
+
+/** A rectangular tile filter, as used by world.query. */
+struct TileRange {
+	bool active = false; ///< Whether the filter was given at all.
+	int x0 = 0;          ///< First column.
+	int y0 = 0;          ///< First row.
+	int x1 = 0;          ///< Last column.
+	int y1 = 0;          ///< Last row.
+
+	/**
+	 * Test whether a tile is inside the range.
+	 * @param tile The tile to test.
+	 * @return True iff the tile is inside the range, or the filter is inactive.
+	 */
+	bool Contains(TileIndex tile) const
+	{
+		if (!this->active) return true;
+		const int x = TileX(tile);
+		const int y = TileY(tile);
+		return x >= this->x0 && x <= this->x1 && y >= this->y0 && y <= this->y1;
+	}
+};
+
+/**
+ * Read the spatial filter of a query.
+ * @param filters The filters of the query.
+ * @return The tile range; inactive when no bound was given.
+ */
+TileRange ReadTileRange(const Json &filters)
+{
+	TileRange range;
+	if (!filters.contains("x0") && !filters.contains("y0") && !filters.contains("x1") && !filters.contains("y1")) return range;
+
+	range.active = true;
+	range.x0 = Clamp(JsonInt(filters, "x0", 0), 0, static_cast<int>(Map::MaxX()));
+	range.y0 = Clamp(JsonInt(filters, "y0", 0), 0, static_cast<int>(Map::MaxY()));
+	range.x1 = Clamp(JsonInt(filters, "x1", static_cast<int>(Map::MaxX())), range.x0, static_cast<int>(Map::MaxX()));
+	range.y1 = Clamp(JsonInt(filters, "y1", static_cast<int>(Map::MaxY())), range.y0, static_cast<int>(Map::MaxY()));
+	return range;
+}
+
+/**
+ * Read the name filter of a query, accepting the canonical `name_contains` and
+ * the legacy `name` alias.
+ * @param filters The filters of the query.
+ * @return The lower cased needle; empty when no name filter was given.
+ */
+std::string ReadNameFilter(const Json &filters)
+{
+	std::string name = JsonString(filters, "name_contains");
+	if (name.empty()) name = JsonString(filters, "name");
+	return LowerAscii(name);
+}
+
+/**
+ * The world and epoch the bridge is bound to, as included in read results.
+ * @return {world_id, epoch}.
+ */
+Json WorldBinding()
+{
+	ResolveWorldId();
+	return {{"world_id", _state.world_id}, {"epoch", _state.epoch}};
+}
+
+/**
+ * Implement world.query for towns, companies, stations, industries, vehicles,
+ * signs and tiles.
+ *
+ * The canonical kind names are plural, as advertised by the backend registry;
+ * the singular names of the first kernel version are accepted as aliases. The
+ * filters are applied before pagination, so `total` is the number of matching
+ * objects and not the number of returned rows.
  * @param params The parameters of the method.
  * @return The result of the method.
  */
 Json WorldQuery(const Json &params)
 {
-	const std::string kind = JsonString(params, "kind");
+	const std::string requested = JsonString(params, "kind");
+	const std::string_view kind = CanonicalQueryKind(requested);
+	if (kind.empty()) return Error("unsupported_query_kind", requested);
+
 	const Json filters = params.contains("filters") && params["filters"].is_object() ? params["filters"] : Json::object();
 	const int limit = Clamp(JsonInt(params, "limit", DEFAULT_QUERY_LIMIT), 1, MAX_QUERY_LIMIT);
 	const int offset = std::max(0, JsonInt(params, "offset", 0));
+
+	const std::string name = ReadNameFilter(filters);
+	const int id = JsonInt(filters, "id", -1);
+	/* The registry advertises company_id both as a filter and as a top level parameter. */
+	const int company_id = filters.contains("company_id") ? JsonInt(filters, "company_id", -1) : JsonInt(params, "company_id", -1);
+	const int town_id = JsonInt(filters, "town_id", -1);
+	const TileRange range = ReadTileRange(filters);
 
 	Json rows = Json::array();
 	int total = 0;
@@ -512,40 +657,7 @@ Json WorldQuery(const Json &params)
 		total++;
 	};
 
-	if (kind == "town") {
-		const std::string name = LowerAscii(JsonString(filters, "name"));
-		for (const Town *t : Town::Iterate()) {
-			if (!ContainsAsciiCI(t->GetCachedName(), name)) continue;
-			add_row({
-				{"id", t->index.base()},
-				{"name", t->GetCachedName()},
-				{"tile", {TileX(t->xy), TileY(t->xy)}},
-				{"population", t->cache.population},
-			});
-		}
-	} else if (kind == "company") {
-		const int id = JsonInt(filters, "id", -1);
-		for (const Company *c : Company::Iterate()) {
-			if (id >= 0 && static_cast<int>(c->index.base()) != id) continue;
-			add_row({
-				{"id", c->index.base()},
-				{"name", c->name.empty() ? GetString(STR_COMPANY_NAME, c->index) : c->name},
-				{"is_ai", c->is_ai},
-				{"money", static_cast<int64_t>(c->money)},
-			});
-		}
-	} else if (kind == "station") {
-		const int id = JsonInt(filters, "id", -1);
-		for (const Station *st : Station::Iterate()) {
-			if (id >= 0 && static_cast<int>(st->index.base()) != id) continue;
-			add_row({
-				{"id", st->index.base()},
-				{"name", st->GetCachedName()},
-				{"tile", {TileX(st->xy), TileY(st->xy)}},
-				{"owner", st->owner.base()},
-			});
-		}
-	} else if (kind == "tile") {
+	if (kind == "tiles") {
 		const int x = JsonInt(filters, "x", -1);
 		const int y = JsonInt(filters, "y", -1);
 		if (x >= 0 && y >= 0) {
@@ -569,11 +681,233 @@ Json WorldQuery(const Json &params)
 				}
 			}
 		}
-	} else {
-		return Error("unsupported_query_kind", kind);
+	} else if (kind == "towns") {
+		for (const Town *t : Town::Iterate()) {
+			if (id >= 0 && static_cast<int>(t->index.base()) != id) continue;
+			if (!ContainsAsciiCI(t->GetCachedName(), name)) continue;
+			if (!range.Contains(t->xy)) continue;
+			add_row({
+				{"id", t->index.base()},
+				{"generation", t->generation},
+				{"name", t->GetCachedName()},
+				{"tile", {TileX(t->xy), TileY(t->xy)}},
+				{"population", t->cache.population},
+			});
+		}
+	} else if (kind == "companies") {
+		for (const Company *c : Company::Iterate()) {
+			if (id >= 0 && static_cast<int>(c->index.base()) != id) continue;
+			if (company_id >= 0 && static_cast<int>(c->index.base()) != company_id) continue;
+			const std::string company_name = c->name.empty() ? GetString(STR_COMPANY_NAME, c->index) : c->name;
+			if (!ContainsAsciiCI(company_name, name)) continue;
+			add_row({
+				{"id", c->index.base()},
+				{"generation", c->generation},
+				{"name", company_name},
+				{"is_ai", c->is_ai},
+				{"money", static_cast<int64_t>(c->money)},
+			});
+		}
+	} else if (kind == "stations") {
+		for (const Station *st : Station::Iterate()) {
+			if (id >= 0 && static_cast<int>(st->index.base()) != id) continue;
+			if (company_id >= 0 && static_cast<int>(st->owner.base()) != company_id) continue;
+			if (town_id >= 0 && (st->town == nullptr || static_cast<int>(st->town->index.base()) != town_id)) continue;
+			if (!ContainsAsciiCI(st->GetCachedName(), name)) continue;
+			if (!range.Contains(st->xy)) continue;
+			add_row({
+				{"id", st->index.base()},
+				{"generation", st->generation},
+				{"name", st->GetCachedName()},
+				{"tile", {TileX(st->xy), TileY(st->xy)}},
+				{"owner", st->owner.base()},
+				{"town_id", st->town != nullptr ? st->town->index.base() : -1},
+			});
+		}
+	} else if (kind == "industries") {
+		for (const Industry *ind : Industry::Iterate()) {
+			if (id >= 0 && static_cast<int>(ind->index.base()) != id) continue;
+			if (town_id >= 0 && (ind->town == nullptr || static_cast<int>(ind->town->index.base()) != town_id)) continue;
+			if (!ContainsAsciiCI(ind->GetCachedName(), name)) continue;
+			if (!range.Contains(ind->location.tile)) continue;
+			add_row({
+				{"id", ind->index.base()},
+				{"generation", ind->generation},
+				{"name", ind->GetCachedName()},
+				{"tile", {TileX(ind->location.tile), TileY(ind->location.tile)}},
+				{"town_id", ind->town != nullptr ? ind->town->index.base() : -1},
+			});
+		}
+	} else if (kind == "vehicles") {
+		for (const Vehicle *v : Vehicle::Iterate()) {
+			if (id >= 0 && static_cast<int>(v->index.base()) != id) continue;
+			if (company_id >= 0 && static_cast<int>(v->owner.base()) != company_id) continue;
+			if (!ContainsAsciiCI(v->name, name)) continue;
+			if (!range.Contains(v->tile)) continue;
+			add_row({
+				{"id", v->index.base()},
+				{"generation", v->generation},
+				{"name", v->name},
+				{"owner", v->owner.base()},
+				{"tile", {TileX(v->tile), TileY(v->tile)}},
+			});
+		}
+	} else if (kind == "signs") {
+		for (const Sign *sign : Sign::Iterate()) {
+			if (id >= 0 && static_cast<int>(sign->index.base()) != id) continue;
+			if (company_id >= 0 && static_cast<int>(sign->owner.base()) != company_id) continue;
+			if (!ContainsAsciiCI(sign->name, name)) continue;
+			const TileIndex tile = TileVirtXY(static_cast<uint>(std::max(0, sign->x)), static_cast<uint>(std::max(0, sign->y)));
+			if (!range.Contains(tile)) continue;
+			add_row({
+				{"id", sign->index.base()},
+				{"generation", sign->generation},
+				{"name", sign->name},
+				{"owner", sign->owner.base()},
+				{"tile", {TileX(tile), TileY(tile)}},
+			});
+		}
 	}
 
-	return Ok({{"rows", rows}, {"total", total}});
+	Json value = {{"rows", rows}, {"total", total}};
+	value.update(WorldBinding());
+	return Ok(std::move(value));
+}
+
+/**
+ * Describe a resolved pool item, or report why the reference is stale.
+ * @tparam T The pool item type.
+ * @tparam F Type of the function that adds the type specific fields.
+ * @param type The protocol name of the type.
+ * @param item The item, or nullptr when no such object exists.
+ * @param generation The generation the reference was made for, or 0 when it carried none.
+ * @param fill Adds the type specific fields of \a item to the row.
+ * @return The resolution of the reference.
+ */
+template <typename T, typename F>
+Json ResolvePoolItem(std::string_view type, const T *item, uint64_t generation, F fill)
+{
+	Json row = {{"type", std::string(type)}};
+	if (item == nullptr) {
+		row["found"] = false;
+		row["error"] = "stale_ref";
+		row["reason"] = "deleted";
+		return row;
+	}
+
+	row["found"] = true;
+	row["id"] = item->index.base();
+	row["generation"] = item->generation;
+	fill(row, *item);
+
+	/* A reference that names a generation is only current while it is the same lifetime of the object. */
+	if (generation != 0 && generation != item->generation) {
+		row["found"] = false;
+		row["error"] = "stale_ref";
+		row["reason"] = "generation_mismatch";
+	}
+	return row;
+}
+
+/**
+ * Resolve one typed object reference against the current world.
+ *
+ * A reference is {type, id?, generation?, tile?}. When it carries a
+ * generation, an object that was deleted and recreated at the same id is
+ * reported as stale instead of being silently resolved to the new object.
+ * @param ref The reference to resolve.
+ * @return The resolved object, or a stale_ref / unsupported_ref_type entry.
+ */
+Json ResolveRef(const Json &ref)
+{
+	const std::string type = JsonString(ref, "type");
+	const int id = JsonInt(ref, "id", -1);
+	const bool has_generation = ref.contains("generation") && (ref["generation"].is_number_unsigned() || ref["generation"].is_number_integer());
+	const uint64_t generation = has_generation ? ref["generation"].get<uint64_t>() : 0;
+
+	if (type == "town") {
+		return ResolvePoolItem("town", id >= 0 ? Town::GetIfValid(static_cast<TownID>(id)) : nullptr, generation, [](Json &row, const Town &t) {
+			row["name"] = t.GetCachedName();
+			row["tile"] = {TileX(t.xy), TileY(t.xy)};
+			row["population"] = t.cache.population;
+		});
+	}
+	if (type == "company") {
+		return ResolvePoolItem("company", id >= 0 ? Company::GetIfValid(static_cast<CompanyID>(id)) : nullptr, generation, [](Json &row, const Company &c) {
+			row["name"] = c.name.empty() ? GetString(STR_COMPANY_NAME, c.index) : c.name;
+			row["is_ai"] = c.is_ai;
+			row["money"] = static_cast<int64_t>(c.money);
+		});
+	}
+	if (type == "station") {
+		return ResolvePoolItem("station", id >= 0 ? Station::GetIfValid(static_cast<StationID>(id)) : nullptr, generation, [](Json &row, const Station &st) {
+			row["name"] = st.GetCachedName();
+			row["tile"] = {TileX(st.xy), TileY(st.xy)};
+			row["owner"] = st.owner.base();
+			row["town_id"] = st.town != nullptr ? st.town->index.base() : -1;
+		});
+	}
+	if (type == "industry") {
+		return ResolvePoolItem("industry", id >= 0 ? Industry::GetIfValid(static_cast<IndustryID>(id)) : nullptr, generation, [](Json &row, const Industry &ind) {
+			row["name"] = ind.GetCachedName();
+			row["tile"] = {TileX(ind.location.tile), TileY(ind.location.tile)};
+			row["town_id"] = ind.town != nullptr ? ind.town->index.base() : -1;
+		});
+	}
+	if (type == "vehicle") {
+		return ResolvePoolItem("vehicle", id >= 0 ? Vehicle::GetIfValid(static_cast<VehicleID>(id)) : nullptr, generation, [](Json &row, const Vehicle &v) {
+			row["name"] = v.name;
+			row["owner"] = v.owner.base();
+			row["tile"] = {TileX(v.tile), TileY(v.tile)};
+		});
+	}
+	if (type == "sign") {
+		return ResolvePoolItem("sign", id >= 0 ? Sign::GetIfValid(static_cast<SignID>(id)) : nullptr, generation, [](Json &row, const Sign &sign) {
+			row["name"] = sign.name;
+			row["owner"] = sign.owner.base();
+			const TileIndex tile = TileVirtXY(static_cast<uint>(std::max(0, sign.x)), static_cast<uint>(std::max(0, sign.y)));
+			row["tile"] = {TileX(tile), TileY(tile)};
+		});
+	}
+	if (type == "tile") {
+		const Json location = ref.contains("tile") && ref["tile"].is_object() ? ref["tile"] : Json::object();
+		const int x = JsonInt(location, "x", -1);
+		const int y = JsonInt(location, "y", -1);
+		if (x < 0 || y < 0 || x > static_cast<int>(Map::MaxX()) || y > static_cast<int>(Map::MaxY())) {
+			return {{"type", "tile"}, {"found", false}, {"error", "stale_ref"}, {"reason", "deleted"}};
+		}
+		Json row = TileRow(TileXY(static_cast<uint>(x), static_cast<uint>(y)));
+		/* TileRow names the tile type in `type`; a reference is typed `tile`, so the tile type moves to `what`. */
+		row["what"] = row["type"];
+		row["type"] = "tile";
+		row["found"] = true;
+		return row;
+	}
+
+	/* Types the kernel does not resolve yet are an explicit gap, never a silent success. */
+	return {{"type", type}, {"found", false}, {"error", "unsupported_ref_type"}};
+}
+
+/**
+ * Implement world.objects: resolve typed references to current state.
+ * @param params The parameters of the method.
+ * @return The result of the method.
+ */
+Json WorldObjects(const Json &params)
+{
+	if (!params.contains("refs") || !params["refs"].is_array()) return Error("invalid_params", "refs must be an array");
+	const Json &refs = params["refs"];
+	if (refs.empty() || refs.size() > MAX_OBJECT_REFS) return Error("invalid_params", "refs must contain 1 to 64 references");
+
+	Json objects = Json::array();
+	for (const Json &ref : refs) {
+		if (!ref.is_object()) return Error("invalid_params", "every ref must be an object");
+		objects.push_back(ResolveRef(ref));
+	}
+
+	Json value = {{"objects", objects}};
+	value.update(WorldBinding());
+	return Ok(std::move(value));
 }
 
 /**
@@ -633,6 +967,34 @@ Json WorldRename(const Json &params, CompanyID request_company)
 }
 
 /**
+ * Validate the references a mutation expects to still be current.
+ *
+ * The check is atomic: every reference is resolved before anything is applied,
+ * so a mutation never runs against a world in which one of its objects was
+ * deleted and its id reused.
+ * @param params The parameters of the request.
+ * @return An error result when a reference is stale, nothing when all are current.
+ */
+std::optional<Json> CheckExpectedRefs(const Json &params)
+{
+	if (!params.contains("expected_refs")) return std::nullopt;
+	const Json &refs = params["expected_refs"];
+	if (!refs.is_array()) return Error("invalid_params", "expected_refs must be an array");
+	if (refs.size() > MAX_OBJECT_REFS) return Error("invalid_params", "expected_refs must contain at most 64 references");
+
+	for (const Json &ref : refs) {
+		if (!ref.is_object()) return Error("invalid_params", "every expected ref must be an object");
+		Json resolved = ResolveRef(ref);
+		if (!resolved.value("found", false)) {
+			Json error = Error("stale_ref", "an expected object is no longer the one the request was made for");
+			error["detail"] = std::move(resolved);
+			return error;
+		}
+	}
+	return std::nullopt;
+}
+
+/**
  * Check that a request belongs to the world and epoch the bridge is bound to.
  * @param request The request, as received from the backend.
  * @return An error result when the request is stale, nothing when it may be applied.
@@ -687,8 +1049,14 @@ Json ExecuteRequest(const Json &request)
 		return Error("task_stopped", "the task has been stopped");
 	}
 
+	/* A mutation may only run when the objects it was planned for are still the same objects. */
+	if (IsMutation(method)) {
+		if (const std::optional<Json> stale = CheckExpectedRefs(params); stale.has_value()) return *stale;
+	}
+
 	if (method == "world.info") return WorldInfo();
 	if (method == "world.query") return WorldQuery(params);
+	if (method == "world.objects") return WorldObjects(params);
 	if (method == "world.pause") return WorldPause(params);
 	if (method == "world.rename") return WorldRename(params, RequestCompanyId(request));
 
@@ -835,8 +1203,14 @@ void ProcessCompletions()
 				break;
 
 			case RequestKind::Ui:
-				/* The UI gets whatever the backend answered, even when the world changed meanwhile. */
-				if (request.callback) request.callback(ok, body);
+				/* A late answer of an older epoch must not look like current data: the UI would act on a world that is gone. */
+				if (request.callback) {
+					if (current) {
+						request.callback(ok, body);
+					} else {
+						request.callback(false, Error("stale_epoch", "the world changed while the request was in flight"));
+					}
+				}
 				break;
 		}
 	}
@@ -853,7 +1227,7 @@ void SendHello()
 		{"world_id", _state.world_id},
 		{"epoch", _state.epoch},
 		{"build", std::string(_openttd_revision)},
-		{"capabilities", Json::array({"world.info", "world.query", "world.pause", "world.rename", "task.barrier"})},
+		{"capabilities", Json::array({"world.info", "world.query", "world.objects", "world.pause", "world.rename", "task.barrier"})},
 	};
 
 	Send(RequestKind::Hello, "/v1/engine/hello", body.dump(), _state.engine_token, _state.epoch, nullptr);
@@ -973,8 +1347,12 @@ Json Context()
 
 /**
  * Describe the objects attached to a tile, as typed attachment candidates.
+ *
+ * Every entry carries the generation of the object and the world/epoch it was
+ * read in, so a later request can name the exact object it was planned for and
+ * a reused id is detected instead of silently resolved.
  * @param tile The tile to inspect.
- * @return Array of {type, id?, name?, tile?} entries, most specific first.
+ * @return Array of {type, id?, generation?, name?, tile?, world_id, epoch} entries, most specific first.
  */
 Json PickObjects(TileIndex tile)
 {
@@ -983,25 +1361,31 @@ Json PickObjects(TileIndex tile)
 
 	const TileType type = GetTileType(tile);
 	const Json location = {TileX(tile), TileY(tile)};
+	const Json binding = WorldBinding();
+
+	auto add = [&](Json entry) {
+		entry.update(binding);
+		objects.push_back(std::move(entry));
+	};
 
 	if (type == TileType::Station) {
 		const Station *st = Station::GetByTile(tile);
 		if (st != nullptr) {
-			objects.push_back({{"type", "station"}, {"id", st->index.base()}, {"name", st->GetCachedName()}, {"tile", location}});
+			add({{"type", "station"}, {"id", st->index.base()}, {"generation", st->generation}, {"name", st->GetCachedName()}, {"tile", location}});
 		}
 	} else if (type == TileType::Industry) {
 		const Industry *ind = Industry::GetByTile(tile);
 		if (ind != nullptr) {
-			objects.push_back({{"type", "industry"}, {"id", ind->index.base()}, {"tile", location}});
+			add({{"type", "industry"}, {"id", ind->index.base()}, {"generation", ind->generation}, {"tile", location}});
 		}
 	} else if (type == TileType::House) {
 		const Town *town = Town::GetByTile(tile);
 		if (town != nullptr) {
-			objects.push_back({{"type", "town"}, {"id", town->index.base()}, {"name", town->GetCachedName()}, {"tile", location}});
+			add({{"type", "town"}, {"id", town->index.base()}, {"generation", town->generation}, {"name", town->GetCachedName()}, {"tile", location}});
 		}
 	}
 
-	objects.push_back({{"type", "tile"}, {"tile", location}, {"what", std::string(TileTypeName(type))}});
+	add({{"type", "tile"}, {"tile", location}, {"what", std::string(TileTypeName(type))}});
 	return objects;
 }
 

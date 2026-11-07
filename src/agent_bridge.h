@@ -47,8 +47,11 @@ Json Context();
 
 /**
  * Describe the objects attached to a tile, as typed attachment candidates.
+ *
+ * Every entry carries the generation of the object and the world/epoch it was
+ * read in, so a later request can name the exact object it was planned for.
  * @param tile The tile to inspect.
- * @return Array of {type, id?, name?, tile?} entries, most specific first.
+ * @return Array of {type, id?, generation?, name?, tile?, world_id, epoch} entries, most specific first.
  */
 Json PickObjects(TileIndex tile);
 
