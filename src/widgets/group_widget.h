@@ -35,6 +35,7 @@ enum GroupListWidgets : WidgetID {
 	WID_GL_LIVERY_GROUP,             ///< Group livery button.
 	WID_GL_REPLACE_PROTECTION,       ///< Replace protection button.
 	WID_GL_INFO,                     ///< Group info.
+	WID_GL_SELECT_AREA,              ///< Select the vehicles in an area of the map into a new group.
 };
 
 #endif /* WIDGETS_GROUP_WIDGET_H */

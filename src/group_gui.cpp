@@ -20,6 +20,7 @@
 #include "company_func.h"
 #include "dropdown_func.h"
 #include "tilehighlight_func.h"
+#include "viewport_func.h"
 #include "vehicle_gui_base.h"
 #include "core/geometry_func.hpp"
 #include "company_base.h"
@@ -97,6 +98,8 @@ static constexpr std::initializer_list<NWidgetPart> _nested_group_widgets = {
 			NWidget(NWID_HORIZONTAL),
 				NWidget(WWT_PUSHTXTBTN, Colours::Grey, WID_GL_AVAILABLE_VEHICLES), SetMinimalSize(106, 12),
 						SetToolTip(STR_VEHICLE_LIST_AVAILABLE_ENGINES_TOOLTIP),
+				NWidget(WWT_TEXTBTN, Colours::Grey, WID_GL_SELECT_AREA), SetMinimalSize(0, 12),
+						SetStringTip(STR_GROUP_SELECT_AREA, STR_GROUP_SELECT_AREA_TOOLTIP),
 				NWidget(WWT_PANEL, Colours::Grey), SetMinimalSize(0, 12), SetFill(1, 0), SetResize(1, 0), EndContainer(),
 				NWidget(WWT_DROPDOWN, Colours::Grey, WID_GL_MANAGE_VEHICLES_DROPDOWN), SetMinimalSize(118, 12),
 						SetStringTip(STR_VEHICLE_LIST_MANAGE_LIST, STR_VEHICLE_LIST_MANAGE_LIST_TOOLTIP),
@@ -620,7 +623,8 @@ public:
 		 */
 		this->SetWidgetsDisabledState(_local_company != this->vli.company,
 				WID_GL_CREATE_GROUP,
-				WID_GL_AVAILABLE_VEHICLES);
+				WID_GL_AVAILABLE_VEHICLES,
+				WID_GL_SELECT_AREA);
 
 		/* If not a default group and the group has replace protection, show an enabled replace sprite. */
 		uint16_t protect_sprite = SPR_GROUP_REPLACE_OFF_TRAIN;
@@ -894,6 +898,10 @@ public:
 				ShowBuildVehicleWindow(INVALID_TILE, this->vli.vtype);
 				break;
 
+			case WID_GL_SELECT_AREA: // Drag a rectangle on the map, its vehicles go into a new group
+				HandlePlacePushButton(this, WID_GL_SELECT_AREA, SPR_CURSOR_MOUSE, HT_RECT);
+				break;
+
 			case WID_GL_MANAGE_VEHICLES_DROPDOWN: {
 				ShowDropDownList(this, this->BuildActionDropdownList(true, Group::IsValidID(this->vli.ToGroupID()), IsDefaultGroupID(this->vli.ToGroupID())), -1, WID_GL_MANAGE_VEHICLES_DROPDOWN);
 				break;
@@ -1093,8 +1101,33 @@ public:
 		}
 	}
 
+	void OnPlaceObject([[maybe_unused]] Point pt, TileIndex tile) override
+	{
+		VpStartPlaceSizing(tile, VPM_X_AND_Y, DDSP_GROUP_VEHICLES);
+	}
+
+	void OnPlaceDrag(ViewportPlaceMethod select_method, [[maybe_unused]] ViewportDragDropSelectionProcess select_proc, Point pt) override
+	{
+		VpSelectTilesWithMethod(pt.x, pt.y, select_method);
+	}
+
+	void OnPlaceMouseUp([[maybe_unused]] ViewportPlaceMethod select_method, ViewportDragDropSelectionProcess select_proc, Point pt, TileIndex start_tile, TileIndex end_tile) override
+	{
+		if (pt.x == -1 || select_proc != DDSP_GROUP_VEHICLES) return;
+
+		Command<Commands::GroupVehiclesInArea>::Post(STR_ERROR_GROUP_CAN_T_CREATE, CcGroupVehiclesInArea, this->vli.vtype, start_tile, end_tile, _ctrl_pressed);
+		ResetObjectToPlace();
+	}
+
 	void OnPlaceObjectAbort() override
 	{
+		if (this->IsWidgetLowered(WID_GL_SELECT_AREA)) {
+			/* End of the area selection; a vehicle drag & drop may be starting right now, so leave its state alone. */
+			this->RaiseWidget(WID_GL_SELECT_AREA);
+			this->SetWidgetDirty(WID_GL_SELECT_AREA);
+			return;
+		}
+
 		/* abort drag & drop */
 		this->vehicle_sel = VehicleID::Invalid();
 		this->DirtyHighlightedGroupWidget();
@@ -1304,6 +1337,20 @@ void CcAddVehicleNewGroup(Commands, const CommandCost &result, GroupID new_group
 
 	const Group *g = Group::Get(new_group);
 	CcCreateGroup(new_group, g->vehicle_type);
+}
+
+/**
+ * Open the group window on the group made from the vehicles of an area.
+ * @param result Did command succeed?
+ * @param new_group ID of the created group.
+ * @param vt Vehicle type.
+ * @see CmdGroupVehiclesInArea
+ */
+void CcGroupVehiclesInArea(Commands, const CommandCost &result, GroupID new_group, VehicleType vt, TileIndex, TileIndex, bool)
+{
+	if (result.Failed() || !Group::IsValidID(new_group)) return;
+
+	ShowCompanyGroup(_current_company, vt, new_group);
 }
 
 /**

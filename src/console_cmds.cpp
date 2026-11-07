@@ -55,6 +55,8 @@
 #include "town.h"
 #include "town_cmd.h"
 #include "vehicle_cmd.h"
+#include "group_cmd.h"
+#include "group_gui.h"
 #include "depot_func.h"
 #include "depot_map.h"
 #include "town_growth.h"
@@ -2405,6 +2407,75 @@ static bool ConDepotClone(std::span<std::string_view> argv)
 	return true;
 }
 
+/** Put the vehicles of a company in an area into a new group. @copydoc IConsoleCmdProc */
+static bool ConGroupArea(std::span<std::string_view> argv)
+{
+	if (argv.empty()) {
+		IConsolePrint(CC_HELP, "Put all vehicles of a type with any part in an area into a new group. Usage: 'group_area <x1> <y1> <x2> <y2> [<train|road|ship|aircraft> [<company> [shared]]]'.");
+		IConsolePrint(CC_HELP, "The type defaults to train, the company (1-based) to the local one; 'shared' also adds the vehicles sharing their orders.");
+		return true;
+	}
+	if (argv.size() < 5 || argv.size() > 8) return false;
+	if (_game_mode != GameMode::Normal) {
+		IConsolePrint(CC_ERROR, "There is no game running.");
+		return true;
+	}
+
+	std::array<uint32_t, 4> c{};
+	for (uint i = 0; i < 4; i++) {
+		auto v = ParseInteger(argv[i + 1]);
+		if (!v.has_value()) return false;
+		c[i] = *v;
+	}
+	if (c[0] >= Map::SizeX() || c[2] >= Map::SizeX() || c[1] >= Map::SizeY() || c[3] >= Map::SizeY()) {
+		IConsolePrint(CC_ERROR, "Tile outside the map.");
+		return true;
+	}
+
+	VehicleType vt = VehicleType::Train;
+	if (argv.size() >= 6) {
+		if (argv[5] == "train") {
+			vt = VehicleType::Train;
+		} else if (argv[5] == "road") {
+			vt = VehicleType::Road;
+		} else if (argv[5] == "ship") {
+			vt = VehicleType::Ship;
+		} else if (argv[5] == "aircraft") {
+			vt = VehicleType::Aircraft;
+		} else {
+			IConsolePrint(CC_ERROR, "Unknown vehicle type '{}'.", argv[5]);
+			return true;
+		}
+	}
+
+	CompanyID company = _local_company;
+	if (argv.size() >= 7) {
+		auto number = ParseInteger(argv[6]);
+		if (!number.has_value() || *number == 0 || !Company::IsValidID(CompanyID(*number - 1))) {
+			IConsolePrint(CC_ERROR, "Unknown company '{}'.", argv[6]);
+			return true;
+		}
+		company = CompanyID(*number - 1);
+		if (_networking && !_network_server && company != _local_company) {
+			IConsolePrint(CC_ERROR, "A client groups only the vehicles of its own company.");
+			return true;
+		}
+	}
+	if (!Company::IsValidID(company)) {
+		IConsolePrint(CC_ERROR, "Give the company that owns the vehicles.");
+		return true;
+	}
+	bool shared = argv.size() == 8 && argv[7] == "shared";
+
+	AutoRestoreBackup cur_company(_current_company, company);
+	if (!Command<Commands::GroupVehiclesInArea>::Post(STR_ERROR_GROUP_CAN_T_CREATE, CcGroupVehiclesInArea, vt, TileXY(c[0], c[1]), TileXY(c[2], c[3]), shared)) {
+		IConsolePrint(CC_ERROR, "Grouping the vehicles failed.");
+	} else if (_networking) {
+		IConsolePrint(CC_INFO, "Sent; the group is made with the next tick.");
+	}
+	return true;
+}
+
 /** Invest money into towns, by a company or for free. @copydoc IConsoleCmdProc */
 static bool ConTownInvest(std::span<std::string_view> argv)
 {
@@ -3882,7 +3953,7 @@ static bool ConRailRouteWindow(std::span<std::string_view> argv)
 static bool ConOpenWindow(std::span<std::string_view> argv)
 {
 	if (argv.empty()) {
-		IConsolePrint(CC_HELP, "Open a window. Usage: 'open_window town <town id> [supply|invest|destroy]' or 'open_window station <station id>' or 'open_window depot <x> <y>'.");
+		IConsolePrint(CC_HELP, "Open a window. Usage: 'open_window town <town id> [supply|invest|destroy]' or 'open_window station <station id>' or 'open_window depot <x> <y>' or 'open_window group <company> [train|road|ship|aircraft]'.");
 		return true;
 	}
 	if (argv.size() < 3 || argv.size() > 4) return false;
@@ -3910,6 +3981,19 @@ static bool ConOpenWindow(std::span<std::string_view> argv)
 			return true;
 		}
 		ShowStationViewWindow(*id);
+		return true;
+	}
+	if (argv[1] == "group") {
+		auto number = ParseInteger(argv[2]);
+		if (!number.has_value() || *number == 0 || !Company::IsValidID(CompanyID(*number - 1))) {
+			IConsolePrint(CC_ERROR, "Unknown company '{}'.", argv[2]);
+			return true;
+		}
+		VehicleType vt = VehicleType::Train;
+		if (argv.size() == 4 && argv[3] == "road") vt = VehicleType::Road;
+		if (argv.size() == 4 && argv[3] == "ship") vt = VehicleType::Ship;
+		if (argv.size() == 4 && argv[3] == "aircraft") vt = VehicleType::Aircraft;
+		ShowCompanyGroup(CompanyID(*number - 1), vt);
 		return true;
 	}
 	if (argv[1] == "depot" && argv.size() == 4) {
@@ -4169,6 +4253,7 @@ void IConsoleStdLibRegister()
 	IConsole::CmdRegister("town_invest",             ConTownInvest);
 	IConsole::CmdRegister("town_delete",             ConTownDelete);
 	IConsole::CmdRegister("depot_clone",             ConDepotClone);
+	IConsole::CmdRegister("group_area",              ConGroupArea);
 	IConsole::CmdRegister("power_grid",              ConPowerGrid);
 	IConsole::CmdRegister("power_add_fuel",          ConPowerAddFuel,     ConHookServerOrNoNetwork);
 	IConsole::CmdRegister("townsim_log",             ConTownSimLog);

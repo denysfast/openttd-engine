@@ -90,7 +90,8 @@ static constexpr auto _callback_tuple = std::make_tuple(
 	&CcPasteBlueprint,
 	&CcPrepareRailRoute,
 	&CcUpgradeStationCatchment,
-	&CcCloneDepot
+	&CcCloneDepot,
+	&CcGroupVehiclesInArea
 );
 
 #ifdef SILENCE_GCC_FUNCTION_POINTER_CAST

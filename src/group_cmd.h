@@ -11,6 +11,7 @@
 #define GROUP_CMD_H
 
 #include "command_type.h"
+#include "tile_type.h"
 #include "group_type.h"
 #include "vehicle_type.h"
 #include "vehiclelist.h"
@@ -33,6 +34,7 @@ CommandCost CmdAddSharedVehicleGroup(DoCommandFlags flags, GroupID id_g, Vehicle
 CommandCost CmdRemoveAllVehiclesGroup(DoCommandFlags flags, GroupID group_id);
 CommandCost CmdSetGroupFlag(DoCommandFlags flags, GroupID group_id, GroupFlag flag, bool value, bool recursive);
 CommandCost CmdSetGroupLivery(DoCommandFlags flags, GroupID group_id, bool primary, Colours colour);
+std::tuple<CommandCost, GroupID> CmdGroupVehiclesInArea(DoCommandFlags flags, VehicleType vt, TileIndex start_tile, TileIndex end_tile, bool add_shared);
 
 DEF_CMD_TRAIT(Commands::CreateGroup, CmdCreateGroup, {}, CommandType::RouteManagement)
 DEF_CMD_TRAIT(Commands::DeleteGroup, CmdDeleteGroup, {}, CommandType::RouteManagement)
@@ -42,8 +44,10 @@ DEF_CMD_TRAIT(Commands::AddSharedVehiclesToGroup, CmdAddSharedVehicleGroup, {}, 
 DEF_CMD_TRAIT(Commands::RemoveAllVehiclesGroup, CmdRemoveAllVehiclesGroup, {}, CommandType::RouteManagement)
 DEF_CMD_TRAIT(Commands::SetGroupFlag, CmdSetGroupFlag, {}, CommandType::RouteManagement)
 DEF_CMD_TRAIT(Commands::SetGroupLivery, CmdSetGroupLivery, {}, CommandType::RouteManagement)
+DEF_CMD_TRAIT(Commands::GroupVehiclesInArea, CmdGroupVehiclesInArea, {}, CommandType::RouteManagement)
 
 void CcCreateGroup(Commands, const CommandCost &result, GroupID new_group, VehicleType vt, GroupID);
 void CcAddVehicleNewGroup(Commands, const CommandCost &result, GroupID new_group, GroupID, VehicleID, bool, const VehicleListIdentifier &);
+void CcGroupVehiclesInArea(Commands, const CommandCost &result, GroupID new_group, VehicleType vt, TileIndex, TileIndex, bool);
 
 #endif /* GROUP_CMD_H */

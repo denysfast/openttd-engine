@@ -4432,6 +4432,8 @@ STR_GROUP_COUNT_WITH_SUBGROUP                                   :{TINY_FONT}{COM
 
 STR_GROUPS_CLICK_ON_GROUP_FOR_TOOLTIP                           :{BLACK}Groups - click on a group to list all vehicles of this group. Drag and drop groups to arrange hierarchy
 STR_GROUP_CREATE_TOOLTIP                                        :{BLACK}Click to create a group
+STR_GROUP_SELECT_AREA                                           :{BLACK}Select on map
+STR_GROUP_SELECT_AREA_TOOLTIP                                   :{BLACK}Drag a rectangle on the map: all your vehicles of this type with any part inside it are put into a new group, which is then opened. Ctrl+drag also adds the vehicles sharing their orders
 STR_GROUP_DELETE_TOOLTIP                                        :{BLACK}Delete the selected group
 STR_GROUP_RENAME_TOOLTIP                                        :{BLACK}Rename the selected group
 STR_GROUP_LIVERY_TOOLTIP                                        :{BLACK}Change livery of the selected group
@@ -5648,6 +5650,7 @@ STR_ERROR_BUILD_OBJECT_LIMIT_REACHED                            :object construc
 
 # Group related errors
 STR_ERROR_GROUP_CAN_T_CREATE                                    :Can't create group...
+STR_ERROR_GROUP_NO_VEHICLES_IN_AREA                             :{WHITE}... none of your vehicles of this type are in the selected area
 STR_ERROR_GROUP_CAN_T_DELETE                                    :Can't delete this group...
 STR_ERROR_GROUP_CAN_T_RENAME                                    :Can't rename group...
 STR_ERROR_GROUP_CAN_T_SET_PARENT                                :Can't set parent group...

@@ -4607,6 +4607,8 @@ STR_GROUP_COUNT_WITH_SUBGROUP                                   :{TINY_FONT}{COM
 
 STR_GROUPS_CLICK_ON_GROUP_FOR_TOOLTIP                           :{BLACK}Щёлкните по имени группы для отображения списка транспорта. Можно создавать вложенные группы с помощью перетаскивания.
 STR_GROUP_CREATE_TOOLTIP                                        :{BLACK}Создать группу
+STR_GROUP_SELECT_AREA                                           :{BLACK}Выбрать на карте
+STR_GROUP_SELECT_AREA_TOOLTIP                                   :{BLACK}Обведите прямоугольник на карте: весь ваш транспорт этого вида, хоть частью стоящий в нём, попадёт в новую группу, и она откроется. Ctrl+обвести — добавить и транспорт с общими с ним приказами
 STR_GROUP_DELETE_TOOLTIP                                        :{BLACK}Удалить выбранную группу
 STR_GROUP_RENAME_TOOLTIP                                        :{BLACK}Переименовать выбранную группу
 STR_GROUP_LIVERY_TOOLTIP                                        :{BLACK}Изменить цвет выбранной группы
@@ -5835,6 +5837,7 @@ STR_ERROR_BUILD_OBJECT_LIMIT_REACHED                            :достигн�
 
 # Group related errors
 STR_ERROR_GROUP_CAN_T_CREATE                                    :Невозможно создать группу...
+STR_ERROR_GROUP_NO_VEHICLES_IN_AREA                             :{WHITE}... в выбранной области нет вашего транспорта этого вида
 STR_ERROR_GROUP_CAN_T_DELETE                                    :Невозможно удалить эту группу...
 STR_ERROR_GROUP_CAN_T_RENAME                                    :Невозможно переименовать группу...
 STR_ERROR_GROUP_CAN_T_SET_PARENT                                :Невозможно установить корректное вложение групп...

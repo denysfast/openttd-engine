@@ -20,6 +20,7 @@
 #include "core/pool_func.hpp"
 #include "order_backup.h"
 #include "group_cmd.h"
+#include "map_func.h"
 
 #include "table/strings.h"
 
@@ -616,6 +617,76 @@ std::tuple<CommandCost, GroupID> CmdAddVehicleGroup(DoCommandFlags flags, GroupI
 		SetWindowDirty(WindowClass::ReplaceVehicle, vtype);
 		InvalidateWindowData(GetWindowClassForVehicleType(vtype), VehicleListIdentifier(VehicleListType::Group, vtype, _current_company).ToWindowNumber());
 	}
+
+	return { CommandCost(), new_g };
+}
+
+/**
+ * Whether a vehicle stands with any of its parts on a tile of a rectangle.
+ * @param v Primary vehicle.
+ * @param x1 Smallest tile x of the rectangle.
+ * @param y1 Smallest tile y of the rectangle.
+ * @param x2 Largest tile x of the rectangle.
+ * @param y2 Largest tile y of the rectangle.
+ * @return True if a part of the vehicle is inside the rectangle.
+ */
+static bool IsVehicleInTileRect(const Vehicle *v, uint x1, uint y1, uint x2, uint y2)
+{
+	/* The shadow and rotor of an aircraft are not where the aircraft is: only the aircraft counts. */
+	for (const Vehicle *u = v; u != nullptr; u = (v->type == VehicleType::Aircraft) ? nullptr : u->Next()) {
+		if (u->x_pos < 0 || u->y_pos < 0) continue;
+		uint x = static_cast<uint>(u->x_pos) / TILE_SIZE;
+		uint y = static_cast<uint>(u->y_pos) / TILE_SIZE;
+		if (x >= x1 && x <= x2 && y >= y1 && y <= y2) return true;
+	}
+	return false;
+}
+
+/**
+ * Put all vehicles of the current company of a type that stand (with any part) in an area into a new group.
+ * @param flags type of operation
+ * @param vt Type of the vehicles.
+ * @param start_tile One corner of the area.
+ * @param end_tile The opposite corner of the area.
+ * @param add_shared Also add the vehicles that share orders with the vehicles in the area.
+ * @return the cost of this operation or an error, and the new group
+ */
+std::tuple<CommandCost, GroupID> CmdGroupVehiclesInArea(DoCommandFlags flags, VehicleType vt, TileIndex start_tile, TileIndex end_tile, bool add_shared)
+{
+	if (!IsCompanyBuildableVehicleType(vt)) return { CMD_ERROR, GroupID::Invalid() };
+	if (start_tile >= Map::Size() || end_tile >= Map::Size()) return { CMD_ERROR, GroupID::Invalid() };
+
+	uint x1 = std::min(TileX(start_tile), TileX(end_tile));
+	uint x2 = std::max(TileX(start_tile), TileX(end_tile));
+	uint y1 = std::min(TileY(start_tile), TileY(end_tile));
+	uint y2 = std::max(TileY(start_tile), TileY(end_tile));
+
+	std::vector<Vehicle *> list;
+	for (Vehicle *v : Vehicle::Iterate()) {
+		if (v->type != vt || !v->IsPrimaryVehicle() || v->owner != _current_company) continue;
+		if (IsVehicleInTileRect(v, x1, y1, x2, y2)) list.push_back(v);
+	}
+	if (list.empty()) return { CommandCost(STR_ERROR_GROUP_NO_VEHICLES_IN_AREA), GroupID::Invalid() };
+
+	auto [ret, new_g] = CmdCreateGroup(flags, vt, GroupID::Invalid());
+	if (ret.Failed() || !flags.Test(DoCommandFlag::Execute)) return { ret, new_g };
+
+	for (Vehicle *v : list) {
+		if (v->group_id != new_g) AddVehicleToGroup(v, new_g);
+
+		if (add_shared) {
+			for (Vehicle *v2 = v->FirstShared(); v2 != nullptr; v2 = v2->NextShared()) {
+				if (v2->group_id != new_g) AddVehicleToGroup(v2, new_g);
+			}
+		}
+
+		SetWindowDirty(WindowClass::VehicleDepot, v->tile);
+	}
+
+	GroupStatistics::UpdateAutoreplace(_current_company);
+
+	SetWindowDirty(WindowClass::ReplaceVehicle, vt);
+	InvalidateWindowData(GetWindowClassForVehicleType(vt), VehicleListIdentifier(VehicleListType::Group, vt, _current_company).ToWindowNumber());
 
 	return { CommandCost(), new_g };
 }
