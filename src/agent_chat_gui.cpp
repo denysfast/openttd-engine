@@ -2214,20 +2214,36 @@ struct AgentChatWindow : Window {
 	 */
 	void DrawInput(const Rect &r) const
 	{
+		/* The message box keeps its own buffer, so its edit box widget has no QueryString and draws
+		 * nothing by itself: the frame and the background are drawn here, with the theme of a
+		 * standard edit box. The background is filled on every paint, so a character that was
+		 * deleted cannot stay on screen as a ghost of the previous text. */
+		const NWidgetLeaf *leaf = this->GetWidget<NWidgetLeaf>(WID_AC_INPUT);
+		DrawFrameRect(r, leaf->colour, {FrameFlag::Lowered, FrameFlag::Darkened});
+		GfxFillRect(r.Shrink(WidgetDimensions::scaled.bevel), PC_BLACK);
+
+		/* The text area is the one the hit test, the caret and the IME rects use. */
 		const Rect area = r.Shrink(WidgetDimensions::scaled.framerect);
 		const int line_height = GetCharacterHeight(FontSize::Normal);
 		const InputLayout layout = this->LayoutInput(area);
 
+		/* Clip the text and the caret to the box, like the standard edit box does. */
+		DrawPixelInfo dpi;
+		if (!FillDrawPixelInfo(&dpi, area)) return;
+		dpi.left += area.left;
+		dpi.top += area.top;
+		AutoRestoreBackup dpi_backup(_cur_dpi, &dpi);
+
 		int y = area.top;
 		for (size_t i = layout.first_line; i < layout.lines.size() && y + line_height - 1 <= area.bottom; i++) {
-			DrawString(area.left, area.right, y, layout.lines[i], TextColour::Black);
+			DrawString(area.left, area.right, y, layout.lines[i], TextColour::Yellow);
 			y += line_height;
 		}
 
 		/* Draw the caret. */
 		if (layout.caret_line >= layout.first_line && layout.caret_line - layout.first_line < static_cast<size_t>(layout.visible_lines)) {
 			const Point caret = this->GetInputCaretPoint(area, layout);
-			GfxFillRect(Rect{caret.x, caret.y, caret.x + 1, caret.y + line_height - 1}, PC_BLACK);
+			GfxFillRect(Rect{caret.x, caret.y, std::min(caret.x + 1, area.right), caret.y + line_height - 1}, PC_WHITE);
 		}
 	}
 
