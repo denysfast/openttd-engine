@@ -60,6 +60,46 @@ Json Context();
 Json PickObjects(TileIndex tile);
 
 /**
+ * Describe the typed objects the tile itself carries, most specific first.
+ *
+ * A tile object is identified by the tile and by a state fingerprint derived from the native tile
+ * data, not by a pool index: `terrain`, `water`, `tree`, `rail`, `signal`, `road`, `tram`,
+ * `bridge`, `tunnel`, `mapobject` and `house`. Every row carries `type`, `what`, `subtype`,
+ * `identity` ("tile"), `tile`, `owner` and `fingerprint`. `owner` is the owner the engine records
+ * for that category (rail, signal, bridge, tunnel, water and mapobject: the tile owner; road and
+ * tram: the owner of their own transport type; terrain, tree and house: null). A house also
+ * carries `town_id` and `town_generation` (the lifetime of its town is part of its identity, and a
+ * house has no pool generation of its own), a map object carries `object_id` and
+ * `object_generation` (the pooled object behind the tile). Only the requested tile is read, so a
+ * call is bounded and never scans the map.
+ *
+ * The fingerprint is FNV-1a over the values the engine stores for the object (tile type and
+ * height, the recorded owner, both halves of every 64 bit pool lifetime, plus the subtype specific
+ * fields listed at the implementation), not over the bytes of the map array and not over an
+ * address, so it is stable across runs for the same state. Signal states change with passing
+ * traffic, so a signal reference can go stale without anyone building anything.
+ * @param tile The tile to describe.
+ * @return Array of typed tile object rows.
+ */
+Json DescribeTileObjects(TileIndex tile);
+
+/**
+ * Resolve one typed reference against the current world, as `world.objects` does.
+ *
+ * A reference is `{type, id?, tile?, generation?, fingerprint?, what?, town_generation?,
+ * object_generation?, world_id?, epoch?}`. A read resolves the object as it is now and reports its
+ * identity; a write (`require_identity`) additionally rejects a pooled reference without a
+ * generation, a tile object without a fingerprint (or, for a house, without the generation of its
+ * town, or for a map object without the generation of the pooled object behind it) and any
+ * reference whose recorded state is no longer current. A `point` reference names a location only
+ * and has no identity to check.
+ * @param ref The reference.
+ * @param require_identity True for a write's `expected_refs`.
+ * @return The resolved object, or a stale_ref entry with `reason`.
+ */
+Json ResolveObjectRef(const Json &ref, bool require_identity);
+
+/**
  * Send a request to the backend on behalf of the native UI. The UI token is
  * used for authentication, and the callback is always invoked on the main
  * thread.

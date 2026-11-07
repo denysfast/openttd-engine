@@ -16,6 +16,8 @@
 #include "agent_command_catalog.h"
 #include "agent_game_tools.h"
 #include "agent_transport_tools.h"
+#include "bridge_map.h"
+#include "clear_map.h"
 #include "command_func.h"
 #include "company_base.h"
 #include "company_cmd.h"
@@ -33,9 +35,13 @@
 #include "misc_cmd.h"
 #include "network/core/http.h"
 #include "network/network.h"
+#include "object_base.h"
+#include "object_map.h"
 #include "openttd.h"
 #include "progress.h"
+#include "rail_map.h"
 #include "rev.h"
+#include "road_map.h"
 #include "signs_base.h"
 #include "signs_cmd.h"
 #include "station_base.h"
@@ -48,9 +54,14 @@
 #include "tile_map.h"
 #include "town.h"
 #include "town_cmd.h"
+#include "town_map.h"
+#include "tree_map.h"
+#include "tunnel_map.h"
+#include "tunnelbridge_map.h"
 #include "vehicle_base.h"
 #include "vehicle_cmd.h"
 #include "video/video_driver.hpp"
+#include "water_map.h"
 #include "waypoint_base.h"
 #include "waypoint_cmd.h"
 
@@ -626,6 +637,464 @@ bool QueueResult(const std::string &request_id, const Json &result)
 	return true;
 }
 
+/** The typed category of an object a tile carries, as the protocol names it. */
+enum class TileObjectKind : uint8_t {
+	Terrain,   ///< Clear landscape: grass, rough, rocks, fields, snow or desert.
+	Water,     ///< Water, coast, river, canal or lock.
+	Tree,      ///< Trees on the tile.
+	Rail,      ///< Plain rail track.
+	Signal,    ///< A signal on a rail tile.
+	Road,      ///< Road.
+	Tram,      ///< Tram track.
+	Bridge,    ///< A bridge head or ramp tile.
+	Tunnel,    ///< A tunnel portal tile.
+	MapObject, ///< A NewGRF map object.
+	House,     ///< A house of a town.
+};
+
+/**
+ * Get the protocol name of a typed tile object category.
+ * @param kind The category.
+ * @return The name used in references and rows.
+ */
+std::string_view TileObjectKindName(TileObjectKind kind)
+{
+	switch (kind) {
+		case TileObjectKind::Terrain: return "terrain";
+		case TileObjectKind::Water: return "water";
+		case TileObjectKind::Tree: return "tree";
+		case TileObjectKind::Rail: return "rail";
+		case TileObjectKind::Signal: return "signal";
+		case TileObjectKind::Road: return "road";
+		case TileObjectKind::Tram: return "tram";
+		case TileObjectKind::Bridge: return "bridge";
+		case TileObjectKind::Tunnel: return "tunnel";
+		case TileObjectKind::MapObject: return "mapobject";
+		case TileObjectKind::House: return "house";
+	}
+	return "unknown";
+}
+
+/**
+ * Map a protocol name onto a typed tile object category.
+ *
+ * The plural and legacy spellings the protocol already used are accepted, so a reference built
+ * from an older answer still resolves.
+ * @param name The requested name.
+ * @return The category, or nothing when the name is not a typed tile category.
+ */
+std::optional<TileObjectKind> TileObjectKindFromName(std::string_view name)
+{
+	if (name == "terrain" || name == "landscape" || name == "clear") return TileObjectKind::Terrain;
+	if (name == "water") return TileObjectKind::Water;
+	if (name == "tree" || name == "trees") return TileObjectKind::Tree;
+	if (name == "rail" || name == "railway" || name == "track") return TileObjectKind::Rail;
+	if (name == "signal" || name == "signals") return TileObjectKind::Signal;
+	if (name == "road") return TileObjectKind::Road;
+	if (name == "tram") return TileObjectKind::Tram;
+	if (name == "bridge") return TileObjectKind::Bridge;
+	if (name == "tunnel") return TileObjectKind::Tunnel;
+	if (name == "mapobject" || name == "map_object" || name == "object") return TileObjectKind::MapObject;
+	if (name == "house") return TileObjectKind::House;
+	return std::nullopt;
+}
+
+/** Start value of the FNV-1a fingerprint of a tile object. */
+constexpr uint32_t FINGERPRINT_SEED = 2166136261u;
+
+/**
+ * Mix one native value into a state fingerprint.
+ *
+ * The fingerprint is FNV-1a over the values the engine stores for the object, not over the bytes
+ * of the map array and not over an address, so it is stable across runs and builds for the same
+ * state and changes when the state the object is drawn from changes.
+ * @param hash The fingerprint so far.
+ * @param value The value to mix in.
+ */
+void MixFingerprint(uint32_t &hash, uint32_t value)
+{
+	hash = (hash ^ value) * 16777619u;
+}
+
+/**
+ * Mix a 64 bit lifetime into the fingerprint, both halves.
+ *
+ * Pool generations are 64 bit and only their low half would collide after 2^32 lifetimes, so both
+ * halves are mixed in.
+ * @param hash The fingerprint so far.
+ * @param value The value to mix in.
+ */
+void MixFingerprint64(uint32_t &hash, uint64_t value)
+{
+	MixFingerprint(hash, static_cast<uint32_t>(value & 0xFFFFFFFFu));
+	MixFingerprint(hash, static_cast<uint32_t>(value >> 32));
+}
+
+/**
+ * Readable name of a clear-land subtype.
+ * @param ground The clear ground.
+ * @return The protocol name.
+ */
+std::string_view ClearGroundName(ClearGround ground)
+{
+	switch (ground) {
+		case ClearGround::Grass: return "grass";
+		case ClearGround::Rough: return "rough";
+		case ClearGround::Rocks: return "rocks";
+		case ClearGround::Fields: return "fields";
+		case ClearGround::Desert: return "desert";
+		default: return "clear";
+	}
+}
+
+/**
+ * Readable name of a water subtype.
+ * @param tile The water tile.
+ * @return The protocol name.
+ */
+std::string_view WaterSubtypeName(TileIndex tile)
+{
+	if (IsCoastTile(tile)) return "coast";
+	if (IsCanal(tile)) return "canal";
+	if (IsRiver(tile)) return "river";
+	switch (GetWaterTileType(tile)) {
+		case WaterTileType::Lock: return "lock";
+		case WaterTileType::Depot: return "depot";
+		case WaterTileType::ClearRocks: return "clear_rocks";
+		case WaterTileType::CoastRocks: return "coast_rocks";
+		default: return "water";
+	}
+}
+
+/**
+ * Readable name of the ground trees stand on.
+ * @param ground The tree ground.
+ * @return The protocol name.
+ */
+std::string_view TreeGroundName(TreeGround ground)
+{
+	switch (ground) {
+		case TreeGround::Grass: return "grass";
+		case TreeGround::Rough: return "rough";
+		case TreeGround::SnowOrDesert: return "snow_or_desert";
+		case TreeGround::Shore: return "shore";
+		case TreeGround::RoughSnow: return "rough_snow";
+		default: return "unknown";
+	}
+}
+
+/**
+ * Readable name of the track bits of a plain rail tile.
+ * @param bits The track bits.
+ * @return The protocol name.
+ */
+std::string_view TrackBitsName(TrackBits bits)
+{
+	if (bits == TrackBits{Track::X}) return "x";
+	if (bits == TrackBits{Track::Y}) return "y";
+	if (bits == TrackBits{Track::Upper}) return "upper";
+	if (bits == TrackBits{Track::Lower}) return "lower";
+	if (bits == TrackBits{Track::Left}) return "left";
+	if (bits == TrackBits{Track::Right}) return "right";
+	if (bits == TRACK_BIT_CROSS) return "cross";
+	if (bits == TRACK_BIT_HORZ) return "horizontal";
+	if (bits == TRACK_BIT_VERT) return "vertical";
+	if (bits == TRACK_BIT_ALL) return "all";
+	return "mixed";
+}
+
+/**
+ * Readable name of a transport type, as used by a bridge or a tunnel.
+ * @param type The transport type.
+ * @return The protocol name.
+ */
+std::string_view TransportTypeName(TransportType type)
+{
+	switch (type) {
+		case TransportType::Rail: return "rail";
+		case TransportType::Road: return "road";
+		case TransportType::Water: return "water";
+		case TransportType::Air: return "air";
+		case TransportType::Invalid: return "invalid";
+	}
+	return "unknown";
+}
+
+/**
+ * The owner a tile object reports, if the engine records one for it.
+ *
+ * Road and tram are reported with the owner of their own transport type, because the road and the
+ * tram on one tile can belong to different companies; water and map objects report the tile owner
+ * the engine stores for them (a canal, lock or ship depot has one, open sea does not). Houses,
+ * trees and terrain carry no company owner, so they report none instead of a made up company.
+ * @param tile The tile.
+ * @param kind The category of the object.
+ * @return The owner, or INVALID_OWNER when the category has none.
+ */
+Owner TileObjectOwner(TileIndex tile, TileObjectKind kind)
+{
+	switch (kind) {
+		case TileObjectKind::Rail:
+		case TileObjectKind::Signal:
+		case TileObjectKind::Bridge:
+		case TileObjectKind::Tunnel:
+		case TileObjectKind::Water:
+		case TileObjectKind::MapObject: return GetTileOwner(tile);
+		case TileObjectKind::Road: return GetRoadOwner(tile, RoadTramType::Road);
+		case TileObjectKind::Tram: return GetRoadOwner(tile, RoadTramType::Tram);
+		default: return INVALID_OWNER;
+	}
+}
+
+/**
+ * Compute the state fingerprint of a typed tile object.
+ *
+ * Only the native values that identify the object and its state are mixed in, per category:
+ * - every category: the tile type and the tile height;
+ * - every category the engine records an owner for: that owner (road and tram use the owner of
+ *   their own transport type, water and map objects the tile owner), because an ownership change
+ *   is part of the precondition a caller observed;
+ * - terrain: clear ground, clear density and slope;
+ * - water: water tile type and water class (the coast, canal and river flags are part of it);
+ * - tree: ground, density and tree type;
+ * - rail: rail tile type, rail type and, for plain rail, the track bits;
+ * - signal: the signal variant of every track, the present signals and the signal states (traffic
+ *   can change these, so a signal reference may go stale without anyone building anything);
+ * - road and tram: the road type and the road bits of that tram type;
+ * - bridge and tunnel: transport type and direction, plus the bridge type for a bridge;
+ * - mapobject: the object type, the pooled object id and the full 64 bit generation of that
+ *   object, so replacing an object with one of the same type is a different identity;
+ * - house: the house type, its random bits, the town it belongs to and the full 64 bit generation
+ *   of that town. A house has no pool generation of its own: a same-type reconstruction on the
+ *   same tile in the same town with the same random bits is not distinguishable, and the row says
+ *   so by carrying no house generation.
+ * @param kind The category of the object.
+ * @param tile The tile.
+ * @return The fingerprint.
+ */
+uint32_t TileObjectFingerprint(TileObjectKind kind, TileIndex tile)
+{
+	uint32_t hash = FINGERPRINT_SEED;
+	MixFingerprint(hash, to_underlying(GetTileType(tile)));
+	MixFingerprint(hash, TileHeight(tile));
+
+	/* Ownership is part of the observed precondition, not only the type, height and bits. */
+	switch (kind) {
+		case TileObjectKind::Rail:
+		case TileObjectKind::Signal:
+		case TileObjectKind::Bridge:
+		case TileObjectKind::Tunnel:
+		case TileObjectKind::Water:
+		case TileObjectKind::MapObject:
+			MixFingerprint(hash, to_underlying(GetTileOwner(tile)));
+			break;
+
+		case TileObjectKind::Road:
+			/* The road and the tram on one tile can belong to different companies. */
+			MixFingerprint(hash, to_underlying(GetTileOwner(tile)));
+			MixFingerprint(hash, to_underlying(GetRoadOwner(tile, RoadTramType::Road)));
+			break;
+
+		case TileObjectKind::Tram:
+			MixFingerprint(hash, to_underlying(GetTileOwner(tile)));
+			MixFingerprint(hash, to_underlying(GetRoadOwner(tile, RoadTramType::Tram)));
+			break;
+
+		default:
+			/* Terrain, trees and houses carry no company owner on the tile. */
+			break;
+	}
+
+	switch (kind) {
+		case TileObjectKind::Terrain:
+			MixFingerprint(hash, to_underlying(GetClearGround(tile)));
+			MixFingerprint(hash, GetClearDensity(tile));
+			MixFingerprint(hash, to_underlying(GetTileSlope(tile)));
+			break;
+
+		case TileObjectKind::Water:
+			MixFingerprint(hash, to_underlying(GetWaterTileType(tile)));
+			MixFingerprint(hash, to_underlying(GetWaterClass(tile)));
+			break;
+
+		case TileObjectKind::Tree:
+			MixFingerprint(hash, to_underlying(GetTreeGround(tile)));
+			MixFingerprint(hash, GetTreeDensity(tile));
+			MixFingerprint(hash, to_underlying(GetTreeType(tile)));
+			break;
+
+		case TileObjectKind::Rail: {
+			const RailTileType rail_type = GetRailTileType(tile);
+			MixFingerprint(hash, to_underlying(rail_type));
+			MixFingerprint(hash, to_underlying(GetRailType(tile)));
+			if (rail_type == RailTileType::Normal) MixFingerprint(hash, GetTrackBits(tile).base());
+			break;
+		}
+
+		case TileObjectKind::Signal:
+			for (const Track track : {Track::X, Track::Y, Track::Upper, Track::Lower, Track::Left, Track::Right}) {
+				MixFingerprint(hash, to_underlying(GetSignalVariant(tile, track)));
+			}
+			MixFingerprint(hash, GetPresentSignals(tile));
+			MixFingerprint(hash, GetSignalStates(tile));
+			break;
+
+		case TileObjectKind::Road:
+		case TileObjectKind::Tram: {
+			const RoadTramType tram_type = kind == TileObjectKind::Tram ? RoadTramType::Tram : RoadTramType::Road;
+			MixFingerprint(hash, to_underlying(GetRoadType(tile, tram_type)));
+			MixFingerprint(hash, GetRoadBits(tile, tram_type).base());
+			break;
+		}
+
+		case TileObjectKind::Bridge:
+		case TileObjectKind::Tunnel:
+			MixFingerprint(hash, to_underlying(GetTunnelBridgeTransportType(tile)));
+			MixFingerprint(hash, to_underlying(GetTunnelBridgeDirection(tile)));
+			if (kind == TileObjectKind::Bridge) MixFingerprint(hash, GetBridgeType(tile));
+			break;
+
+		case TileObjectKind::MapObject: {
+			const Object *object = Object::GetByTile(tile);
+			/* ObjectType is a plain integer type, not an enum, so it is cast, not unwrapped. */
+			MixFingerprint(hash, object == nullptr ? static_cast<uint32_t>(INVALID_OBJECT_TYPE) : static_cast<uint32_t>(object->type));
+			MixFingerprint(hash, object == nullptr ? 0 : object->index.base());
+			MixFingerprint64(hash, object == nullptr ? 0 : object->generation);
+			break;
+		}
+
+		case TileObjectKind::House: {
+			MixFingerprint(hash, GetHouseType(tile));
+			MixFingerprint(hash, GetHouseRandomBits(tile));
+			const Town *town = Town::GetIfValid(GetTownIndex(tile));
+			MixFingerprint(hash, town == nullptr ? 0 : town->index.base());
+			MixFingerprint64(hash, town == nullptr ? 0 : town->generation);
+			break;
+		}
+	}
+
+	return hash;
+}
+
+/**
+ * Build the row of one typed tile object.
+ *
+ * The identity of a tile object is the tile and its state fingerprint. A house also carries the
+ * lifetime of its town, and a map object the lifetime of the pooled object behind it, because those
+ * are part of the identity and neither is a house's own pool generation.
+ * @param tile The tile.
+ * @param kind The category.
+ * @param subtype The readable subtype.
+ * @return The row: type, what, subtype, identity, tile, owner, fingerprint (+ town_* / object_*).
+ */
+Json TileObjectRow(TileIndex tile, TileObjectKind kind, std::string_view subtype)
+{
+	const Owner owner = TileObjectOwner(tile, kind);
+	Json row = {
+		{"type", std::string(TileObjectKindName(kind))},
+		{"what", std::string(TileObjectKindName(kind))},
+		{"subtype", std::string(subtype)},
+		/* The identity of this object is the tile and its fingerprint, not a pool index. */
+		{"identity", "tile"},
+		{"tile", Json{{"x", TileX(tile)}, {"y", TileY(tile)}}},
+		/* OWNER_WATER is what the engine stores for open sea, not a company; report no owner. */
+		{"owner", (owner == INVALID_OWNER || owner == OWNER_NONE || owner == OWNER_WATER) ? Json(nullptr) : Json(owner.base())},
+		{"fingerprint", TileObjectFingerprint(kind, tile)},
+	};
+
+	/* A house belongs to a town; the town's lifetime is part of the house's identity. */
+	if (kind == TileObjectKind::House) {
+		const Town *town = Town::GetIfValid(GetTownIndex(tile));
+		row["town_id"] = town == nullptr ? Json(nullptr) : Json(town->index.base());
+		row["town_generation"] = town == nullptr ? Json(nullptr) : Json(town->generation);
+	}
+
+	/* A map object is a pooled object: its id and full generation are part of the identity, so a
+	 * same-type replacement is not mistaken for the object the caller planned for. */
+	if (kind == TileObjectKind::MapObject) {
+		const Object *object = Object::GetByTile(tile);
+		row["object_id"] = object == nullptr ? Json(nullptr) : Json(object->index.base());
+		row["object_generation"] = object == nullptr ? Json(nullptr) : Json(object->generation);
+	}
+
+	return row;
+}
+
+/**
+ * Describe the typed objects the tile itself carries, most specific first.
+ *
+ * Only the requested tile is read, so this is bounded per call and never scans the map. A rail
+ * tile with signals carries a `signal` object besides its `rail` object; a tile that carries both
+ * road and tram carries both objects. A station, industry or void tile carries no typed landscape
+ * object of its own: the pooled objects of `PickObjects()` describe it.
+ * @param tile The tile.
+ * @return Array of typed tile object rows.
+ */
+Json BuildTileObjectRows(TileIndex tile)
+{
+	Json objects = Json::array();
+	if (!IsValidTile(tile)) return objects;
+
+	switch (GetTileType(tile)) {
+		case TileType::Clear:
+			objects.push_back(TileObjectRow(tile, TileObjectKind::Terrain, ClearGroundName(GetClearGround(tile))));
+			break;
+
+		case TileType::Water:
+			objects.push_back(TileObjectRow(tile, TileObjectKind::Water, WaterSubtypeName(tile)));
+			break;
+
+		case TileType::Trees:
+			objects.push_back(TileObjectRow(tile, TileObjectKind::Tree, TreeGroundName(GetTreeGround(tile))));
+			break;
+
+		case TileType::Railway: {
+			const RailTileType rail_type = GetRailTileType(tile);
+			if (rail_type == RailTileType::Signals) {
+				/* A signal is a sub-object of the rail tile, so it is the more specific answer. */
+				objects.push_back(TileObjectRow(tile, TileObjectKind::Signal,
+						GetSignalVariant(tile, Track::X) == SignalVariant::Semaphore ? "semaphore" : "electric"));
+			}
+			const std::string_view subtype = rail_type == RailTileType::Normal
+					? TrackBitsName(GetTrackBits(tile))
+					: (rail_type == RailTileType::Depot ? "depot" : "signals");
+			objects.push_back(TileObjectRow(tile, TileObjectKind::Rail, subtype));
+			break;
+		}
+
+		case TileType::Road:
+			if (GetRoadType(tile, RoadTramType::Road) != INVALID_ROADTYPE) {
+				objects.push_back(TileObjectRow(tile, TileObjectKind::Road, "road"));
+			}
+			if (GetRoadType(tile, RoadTramType::Tram) != INVALID_ROADTYPE) {
+				objects.push_back(TileObjectRow(tile, TileObjectKind::Tram, "tram"));
+			}
+			break;
+
+		case TileType::TunnelBridge:
+			objects.push_back(TileObjectRow(tile, IsBridgeTile(tile) ? TileObjectKind::Bridge : TileObjectKind::Tunnel,
+					TransportTypeName(GetTunnelBridgeTransportType(tile))));
+			break;
+
+		case TileType::Object: {
+			const Object *object = Object::GetByTile(tile);
+			const std::string subtype = object == nullptr ? std::string("object") : fmt::format("type_{}", object->type);
+			objects.push_back(TileObjectRow(tile, TileObjectKind::MapObject, subtype));
+			break;
+		}
+
+		case TileType::House:
+			objects.push_back(TileObjectRow(tile, TileObjectKind::House, fmt::format("house_{}", GetHouseType(tile))));
+			break;
+
+		default:
+			/* Station, industry and void tiles carry no typed landscape object of their own. */
+			break;
+	}
+
+	return objects;
+}
+
 /**
  * Get the name of a tile type, as used in the protocol.
  * @param type The tile type.
@@ -748,8 +1217,32 @@ Json WorldInfo()
 		});
 	}
 
+	/*
+	 * The company the player is acting as and the company the engine is scoped to, exactly as they
+	 * are: `null` when there is none (spectator, menu, deity scope), never a made up company 0, so
+	 * the backend can bind the acting company without guessing.
+	 */
+	const auto company_id = [](CompanyID id) -> Json {
+		return Company::IsValidID(id) ? Json(id.base()) : Json(nullptr);
+	};
+
+	/* The same moment as a human reads it; the raw day counter stays below for compatibility. */
+	const TimerGameCalendar::YearMonthDay ymd = TimerGameCalendar::ConvertDateToYMD(TimerGameCalendar::date);
+
 	Json value = {
 		{"date", TimerGameCalendar::date.base()},
+		/*
+		 * A model that is only given the day ordinal answers with a number no player recognises, so
+		 * the calendar is reported next to it. `date_iso` is the engine's own ISO rendering, so the
+		 * text and the numbers cannot disagree; `month` is 1..12 and `day` 1..31, as a player reads
+		 * them, and `year` is the engine's calendar year (the one the status bar shows).
+		 */
+		{"calendar", {
+			{"year", ymd.year.base()},
+			{"month", static_cast<int>(ymd.month) + 1},
+			{"day", static_cast<int>(ymd.day)},
+			{"date_iso", GetString(STR_JUST_DATE_ISO, TimerGameCalendar::date)},
+		}},
 		{"ticks", TimerGameTick::counter},
 		{"paused", _pause_mode.Any()},
 		/*
@@ -783,6 +1276,8 @@ Json WorldInfo()
 			{"batches", TimingJson(_state.batch_timing, INLINE_BUDGET_US)},
 			{"deferred", TimingJson(_state.deferred_timing, DEFERRED_BUDGET_US)},
 		}},
+		{"local_company_id", company_id(_local_company)},
+		{"current_company_id", company_id(_current_company)},
 		{"map", {{"width", Map::SizeX()}, {"height", Map::SizeY()}}},
 		{"companies", companies},
 		{"build", std::string(_openttd_revision)},
@@ -1122,7 +1617,8 @@ Json ResolvePoolItem(std::string_view type, const T *item, std::optional<uint64_
 	 */
 	if (require_identity && !generation.has_value()) return RefFailure(type, "generation_required");
 
-	Json row = {{"type", std::string(type)}, {"found", true}, {"id", item->index.base()}, {"generation", item->generation}};
+	Json row = {{"type", std::string(type)}, {"found", true}, {"identity", "pool"},
+			{"id", item->index.base()}, {"generation", item->generation}};
 	fill(row, *item);
 
 	/* A reference that names a generation is only current while it is the same lifetime of the object. */
@@ -1193,6 +1689,160 @@ std::string_view StationKindName(StationType type)
 		case StationType::RoadWaypoint: return "road_waypoint";
 		default: return "unknown";
 	}
+}
+
+/**
+ * Resolve a reference to an object the tile itself carries.
+ *
+ * A reference is `{type, tile, fingerprint?, what?, town_generation?, world_id?, epoch?}`. `type`
+ * is one of the typed tile categories (`terrain`, `water`, `tree`, `rail`, `signal`, `road`,
+ * `tram`, `bridge`, `tunnel`, `mapobject`, `house`), the generic `tile` spelling — then `what`
+ * names the category, or the most specific object of the tile is used — or `point`, which names a
+ * location only.
+ *
+ * A read resolves whatever the tile carries now and reports the current fingerprint, so a caller
+ * can build a strict reference from the answer. A write (`require_identity`) has to name the
+ * fingerprint, for a house also the generation of its town and for a map object the generation of
+ * the pooled object behind it, so a command never runs against a tile whose object changed after
+ * the caller looked at it. The pool lifetime is checked before the fingerprint, so a replaced
+ * object reports that lifetime instead of a generic state change.
+ * @param ref_type The reference type as requested.
+ * @param ref The reference.
+ * @param require_identity True for a write's `expected_refs`.
+ * @return The resolved tile object, or a stale_ref entry.
+ */
+Json ResolveTileObjectRef(std::string_view ref_type, const Json &ref, bool require_identity)
+{
+	TileIndex tile = INVALID_TILE;
+	if (!ReadRefTile(ref, tile) || !IsValidTile(tile)) return RefFailure(ref_type, "invalid_tile", "invalid_params");
+
+	const Json location = {{"x", TileX(tile)}, {"y", TileY(tile)}};
+
+	/* A point names a location and nothing else: it has no identity, so it is never stale. */
+	if (ref_type == "point") {
+		Json row = TileRow(tile);
+		row["what"] = row["type"];
+		row["type"] = "point";
+		row["identity"] = "point";
+		row["tile"] = location;
+		row["found"] = true;
+		return row;
+	}
+
+	/* The category the reference names; the generic `tile` spelling may leave it to the answer. */
+	std::optional<TileObjectKind> requested;
+	if (ref_type != "tile") {
+		requested = TileObjectKindFromName(ref_type);
+		if (!requested.has_value()) return RefFailure(ref_type, "unknown_type", "unsupported_ref_type");
+	} else {
+		const std::string what = JsonString(ref, "what");
+		if (!what.empty()) {
+			requested = TileObjectKindFromName(what);
+			if (!requested.has_value()) return RefFailure(ref_type, "unknown_what", "invalid_params");
+		}
+	}
+
+	const Json objects = BuildTileObjectRows(tile);
+	const Json *found = nullptr;
+	for (const Json &object : objects) {
+		if (requested.has_value()) {
+			if (object["type"] == std::string(TileObjectKindName(*requested))) {
+				found = &object;
+				break;
+			}
+		} else if (found == nullptr) {
+			/* The generic spelling without `what` names the most specific object of the tile. */
+			found = &object;
+		}
+	}
+
+	if (found == nullptr) {
+		/* The tile no longer carries that kind of object, so the reference is stale, not invalid. */
+		Json row = RefFailure(ref_type, "tile_type_mismatch");
+		row["tile"] = location;
+		row["what"] = Json::array();
+		for (const Json &object : objects) row["what"].push_back(object["type"]);
+		return row;
+	}
+
+	Json row = *found;
+	row["found"] = true;
+
+	/*
+	 * The pool lifetime a tile object may have is part of its identity, and it is checked before the
+	 * fingerprint so that replacing the object behind the tile reports the lifetime that changed
+	 * instead of a generic state change. A house has no generation of its own; its lifetime is the
+	 * lifetime of its town.
+	 */
+	const auto check_lifetime = [&](const char *key, const char *missing_reason, const char *mismatch_reason) -> std::optional<Json> {
+		if (!row.contains(key) || row[key].is_null()) return std::nullopt;
+
+		std::optional<uint64_t> named;
+		if (ref.contains(key) && !ref[key].is_null()) {
+			int64_t value = 0;
+			if (!ReadBoundedInteger(ref, key, std::numeric_limits<int64_t>::max(), value)) {
+				return RefFailure(ref_type, "invalid_generation", "invalid_params");
+			}
+			named = static_cast<uint64_t>(value);
+		}
+		/* A read reports the lifetime the object has now; only a write has to match it. */
+		if (!require_identity) return std::nullopt;
+		if (!named.has_value()) {
+			row["found"] = false;
+			row["error"] = "stale_ref";
+			row["reason"] = missing_reason;
+			return row;
+		}
+		if (*named != row[key].get<uint64_t>()) {
+			row["found"] = false;
+			row["error"] = "stale_ref";
+			row["reason"] = mismatch_reason;
+			row["generation_now"] = row[key];
+			return row;
+		}
+		return std::nullopt;
+	};
+
+	if (row["type"] == "house") {
+		if (const std::optional<Json> stale = check_lifetime("town_generation", "town_generation_required", "town_lifetime_mismatch"); stale.has_value()) return *stale;
+	}
+	if (row["type"] == "mapobject") {
+		if (const std::optional<Json> stale = check_lifetime("object_generation", "object_generation_required", "object_lifetime_mismatch"); stale.has_value()) return *stale;
+	}
+
+	std::optional<uint32_t> fingerprint;
+	if (ref.contains("fingerprint") && !ref["fingerprint"].is_null()) {
+		int64_t value = 0;
+		if (!ReadBoundedInteger(ref, "fingerprint", std::numeric_limits<uint32_t>::max(), value)) {
+			return RefFailure(ref_type, "invalid_fingerprint", "invalid_params");
+		}
+		fingerprint = static_cast<uint32_t>(value);
+	}
+
+	/*
+	 * A read resolves whatever the tile carries now and reports the fingerprint it has now, so a
+	 * caller can see the current state and build a strict reference from it. A write has to name
+	 * the state it was planned for and match it.
+	 */
+	if (!require_identity) return row;
+
+	if (!fingerprint.has_value()) {
+		row["found"] = false;
+		row["error"] = "stale_ref";
+		row["reason"] = "fingerprint_required";
+		return row;
+	}
+
+	const uint32_t current = row["fingerprint"].get<uint32_t>();
+	if (*fingerprint != current) {
+		row["found"] = false;
+		row["error"] = "stale_ref";
+		row["reason"] = "tile_state_changed";
+		row["fingerprint_now"] = current;
+		return row;
+	}
+
+	return row;
 }
 
 /**
@@ -1308,34 +1958,9 @@ Json ResolveRef(const Json &ref, bool require_identity)
 			row["owner"] = g.owner.base();
 		});
 	}
-	if (type == "house") {
-		/*
-		 * A house is tile data without a pool of its own, so its lifetime is the lifetime of the
-		 * town it belongs to: the row carries the town id and the town's generation, and a write
-		 * must name that generation like any other pooled reference.
-		 */
-		TileIndex tile = INVALID_TILE;
-		if (!ReadRefTile(ref, tile)) return RefFailure(type, "invalid_tile", "invalid_params");
-		const Town *town = Town::GetByTile(tile);
-		if (town == nullptr) return RefFailure(type, "deleted");
-		Json row = ResolvePoolItem("house", town, generation, require_identity, [&](Json &r, const Town &t) {
-			r["town_id"] = t.index.base();
-			r["tile"] = Json{{"x", TileX(tile)}, {"y", TileY(tile)}};
-		});
-		row["generation_of"] = "town";
-		return row;
-	}
-	if (type == "tile" || type == "point") {
-		TileIndex tile = INVALID_TILE;
-		if (!ReadRefTile(ref, tile)) return RefFailure(type, "invalid_tile", "invalid_params");
-
-		Json row = TileRow(tile);
-		/* TileRow names the tile type in `type`; a reference is typed `tile`/`point`, so the tile type moves to `what`. */
-		row["what"] = row["type"];
-		row["type"] = type;
-		row["tile"] = Json{{"x", TileX(tile)}, {"y", TileY(tile)}};
-		row["found"] = true;
-		return row;
+	/* The objects a tile itself carries: typed categories, the generic `tile` and `point`. */
+	if (type == "tile" || type == "point" || TileObjectKindFromName(type).has_value()) {
+		return ResolveTileObjectRef(type, ref, require_identity);
 	}
 
 	/*
@@ -2189,6 +2814,28 @@ Json Capabilities()
 		{"restore", "for a temporary pause: keep previous.normal and the revision your own successful pause returned, then restore previous.normal with expected_revision set to that returned revision; never refresh the guard before restoring, so a newer player decision is rejected instead of undone"},
 		{"epoch", "the world_id/epoch of the request is the real protection across a load; a revision below revision_at_epoch_start is only an additional check, and an equal revision can also be the previous epoch's when no pause command ran since"},
 	};
+	contracts["calendar"] = {
+		{"read", "world.info.calendar = {year, month, day, date_iso}"},
+		{"source", "the engine's own TimerGameCalendar::ConvertDateToYMD() and STR_JUST_DATE_ISO, so the text and the numbers cannot disagree"},
+		{"fields", "`year` is the engine's calendar year (what the status bar shows), `month` is 1..12 and `day` is 1..31"},
+		{"legacy", "world.info.date stays the raw day counter; it is not a date a player recognises, so do not show it"},
+	};
+	contracts["refs"] = {
+		{"identity_kinds", "pool (id + generation), tile (tile + fingerprint, plus town_id/town_generation for a house), point (location only, never stale)"},
+		{"tile_types", "terrain, water, tree, rail, signal, road, tram, bridge, tunnel, mapobject, house; `tile` is the generic spelling and takes `what`"},
+		{"tile_fields", "type, what, subtype, identity, tile, owner, fingerprint"},
+		{"owner", "the owner the engine records for that category: rail, signal, bridge, tunnel, water and mapobject use the tile owner; road and tram use the owner of their own transport type, so the road and the tram on one tile can report different owners; terrain, tree and house report null; OWNER_WATER (open sea) and OWNER_NONE report null"},
+		{"house_fields", "a house adds town_id and town_generation: the identity is the tile (house type and random bits) plus the lifetime of its town, never the whole town. A house has no pool generation of its own, so a same-type reconstruction on the same tile in the same town with the same random bits is not distinguishable"},
+		{"mapobject_fields", "a map object adds object_id and object_generation: the pooled object behind the tile is part of the identity, so replacing it with one of the same type is a different identity"},
+		{"point_fields", "type=point, identity=point, tile; no fingerprint, so a point names a location and can never be stale"},
+		{"fingerprint", "FNV-1a over the native tile values that identify the object and its state (tile type, height, the category fields, the recorded owner and both halves of every 64 bit pool lifetime), not over map-array bytes and not over an address"},
+		{"signal_note", "signal states are changed by passing trains, so a signal reference can go stale without anyone building anything: inspect again instead of treating it as an error"},
+		{"write_rule", "expected_refs of a write must name a generation for a pooled type, and a fingerprint plus town_generation (house) or object_generation (map object) for a tile object; a point needs nothing"},
+		{"stale", "a stale reference answers found=false with error=stale_ref and a reason: world_mismatch, epoch_mismatch, deleted, generation_required, generation_mismatch, tile_type_mismatch, tile_state_changed, fingerprint_required, town_generation_required, town_lifetime_mismatch, object_generation_required, object_lifetime_mismatch"},
+		{"invalid", "error=invalid_params with reason=invalid_ref, missing_type, invalid_id, invalid_tile, invalid_fingerprint, invalid_generation or unknown_what"},
+		{"unsupported", "a type the kernel cannot resolve answers error=unsupported_ref_type with reason=unknown_type or not_a_pooled_object (a cargo has no lifetime)"},
+		{"bounded", "a tile reference reads only the requested tile: no map scan and no render"},
+	};
 	contracts["timing"] = {
 		{"read", "world.info.timing = {unit, clock, scope, enforced, since_epoch, queries, commands, batches, deferred}"},
 		{"measured", "game-thread slices: one inline request execution (reads and writes separately), one poll's whole request batch, or one deferred draw-tick job"},
@@ -2367,32 +3014,26 @@ Json PickObjects(TileIndex tile)
 		objects.push_back(std::move(entry));
 	};
 
-	/* The object the tile itself carries, most specific first. */
+	/* Pooled objects the tile carries, most specific first. Their identity is the pool lifetime. */
 	if (type == TileType::Station) {
 		/* A waypoint, a buoy and a station share the station pool but are separate protocol types. */
 		if (const Waypoint *wp = Waypoint::GetByTile(tile); wp != nullptr) {
-			add({{"type", "waypoint"}, {"id", wp->index.base()}, {"generation", wp->generation},
+			add({{"type", "waypoint"}, {"identity", "pool"}, {"id", wp->index.base()}, {"generation", wp->generation},
 					{"name", wp->GetCachedName()}, {"what", std::string(StationKindName(GetStationType(tile)))}, {"tile", location}});
 		} else if (const Station *st = Station::GetByTile(tile); st != nullptr) {
-			add({{"type", "station"}, {"id", st->index.base()}, {"generation", st->generation},
+			add({{"type", "station"}, {"identity", "pool"}, {"id", st->index.base()}, {"generation", st->generation},
 					{"name", st->GetCachedName()}, {"what", std::string(StationKindName(GetStationType(tile)))}, {"tile", location}});
 		}
 	} else if (type == TileType::Industry) {
 		if (const Industry *ind = Industry::GetByTile(tile); ind != nullptr) {
-			add({{"type", "industry"}, {"id", ind->index.base()}, {"generation", ind->generation}, {"tile", location}});
-		}
-	} else if (type == TileType::House) {
-		/* A house is tile data without a pool of its own, so the town is the lifetime it belongs to. */
-		if (const Town *town = Town::GetByTile(tile); town != nullptr) {
-			add({{"type", "town"}, {"id", town->index.base()}, {"generation", town->generation},
-					{"name", town->GetCachedName()}, {"what", "house"}, {"tile", location}});
+			add({{"type", "industry"}, {"identity", "pool"}, {"id", ind->index.base()}, {"generation", ind->generation}, {"tile", location}});
 		}
 	}
 
 	/* A rail, road or ship depot is a pool object of its own. A hangar is not: see the gap below. */
 	if (IsRailDepotTile(tile) || IsRoadDepotTile(tile) || IsShipDepotTile(tile)) {
 		if (const Depot *depot = Depot::GetByTile(tile); depot != nullptr) {
-			add({{"type", "depot"}, {"id", depot->index.base()}, {"generation", depot->generation},
+			add({{"type", "depot"}, {"identity", "pool"}, {"id", depot->index.base()}, {"generation", depot->generation},
 					{"name", depot->name}, {"what", std::string(TileTypeName(GetTileType(depot->xy)))}, {"tile", location}});
 		}
 	}
@@ -2400,7 +3041,7 @@ Json PickObjects(TileIndex tile)
 	/* Every vehicle standing on the tile: it is a pool object with its own lifetime. */
 	for (const Vehicle *v : Vehicle::Iterate()) {
 		if (v->tile != tile) continue;
-		add({{"type", "vehicle"}, {"id", v->index.base()}, {"generation", v->generation},
+		add({{"type", "vehicle"}, {"identity", "pool"}, {"id", v->index.base()}, {"generation", v->generation},
 				{"name", v->name}, {"what", std::string(VehicleKindName(v->type))}, {"tile", location}});
 	}
 
@@ -2408,18 +3049,52 @@ Json PickObjects(TileIndex tile)
 	for (const Sign *sign : Sign::Iterate()) {
 		const TileIndex sign_tile = TileVirtXY(static_cast<uint>(std::max(0, sign->x)), static_cast<uint>(std::max(0, sign->y)));
 		if (sign_tile != tile) continue;
-		add({{"type", "sign"}, {"id", sign->index.base()}, {"generation", sign->generation},
+		add({{"type", "sign"}, {"identity", "pool"}, {"id", sign->index.base()}, {"generation", sign->generation},
 				{"name", sign->name}, {"tile", location}});
 	}
 
 	/*
-	 * The tile itself is always selectable, and is the honest answer for what has no type of its
-	 * own in the protocol: a NewGRF object (the pool exists, the schema has no `object` type), a
-	 * hangar (an air depot has no Depot object) and plain landscape. `cargo` is never offered: a
+	 * The objects the tile itself carries, as typed categories with a state fingerprint: a house
+	 * (with the lifetime of its town), rail, signal, road, tram, bridge, tunnel, mapobject, tree,
+	 * water or terrain. Each is identified by the tile and its fingerprint, not by a pool index.
+	 */
+	const Json tile_objects = BuildTileObjectRows(tile);
+	for (const Json &object : tile_objects) {
+		Json entry = object;
+		add(std::move(entry));
+	}
+
+	/*
+	 * A tile that carries no typed landscape object of its own (a station, an industry, the void at
+	 * the map edge) stays selectable as a location, which is the honest answer for it: the tile is
+	 * not an object, and a point reference names the location only. `cargo` is never offered: a
 	 * cargo packet is not attached to a tile but to a vehicle or a station.
 	 */
-	add({{"type", "tile"}, {"what", std::string(TileTypeName(type))}, {"tile", location}});
+	if (tile_objects.empty()) {
+		add({{"type", "point"}, {"identity", "point"}, {"what", std::string(TileTypeName(type))}, {"tile", location}});
+	}
 	return objects;
+}
+
+/**
+ * Describe the typed objects a tile carries, for the native UI and for tests.
+ * @param tile The tile to describe.
+ * @return Array of typed tile object rows.
+ */
+Json DescribeTileObjects(TileIndex tile)
+{
+	return BuildTileObjectRows(tile);
+}
+
+/**
+ * Resolve one typed reference against the current world, as `world.objects` does.
+ * @param ref The reference.
+ * @param require_identity True for a write's `expected_refs`.
+ * @return The resolved object, or a stale_ref entry.
+ */
+Json ResolveObjectRef(const Json &ref, bool require_identity)
+{
+	return ResolveRef(ref, require_identity);
 }
 
 /**
