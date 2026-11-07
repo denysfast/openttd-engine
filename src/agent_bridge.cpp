@@ -90,6 +90,19 @@ constexpr auto POLL_RETRY = std::chrono::milliseconds(2000);
  * the loop from turning into a busy poll of the HTTP layer.
  */
 constexpr auto POLL_IDLE = std::chrono::milliseconds(150);
+/**
+ * Budget of the plan for one ordinary query/batch main-thread slice, in microseconds:
+ * "no individual ordinary query/batch main-thread slice above 5 ms on the named reference map"
+ * (docs/in-game-agent-plan.md, E16). It is a measurement threshold only; nothing aborts a slow
+ * request, and a synchronous command may exceed it.
+ */
+constexpr uint64_t INLINE_BUDGET_US = 5000;
+/**
+ * Budget for one deferred job on the draw tick (a capture or a camera operation), in microseconds:
+ * one 60 Hz frame. The plan measures screenshots separately and bounds them by size, so this is not
+ * the 5 ms query target; it is a measurement threshold only.
+ */
+constexpr uint64_t DEFERRED_BUDGET_US = 16000;
 /** Delay before retrying a failed result delivery. */
 constexpr auto RESULT_RETRY = std::chrono::seconds(1);
 /** Maximum number of results kept while the backend is unreachable. */
@@ -255,6 +268,21 @@ struct Receipt {
 	bool acknowledged = false; ///< Whether the backend acknowledged delivery of the result.
 };
 
+/**
+ * Measured duration of one class of game-thread work.
+ *
+ * The numbers are the time the bridge itself spent inside the execution, on the game thread, and
+ * not the time a request waited for its answer: the HTTP round trip and the poll cadence are
+ * deliberately outside of them.
+ */
+struct TimingStats {
+	uint64_t count = 0;    ///< Number of measured executions.
+	uint64_t last = 0;     ///< Duration of the last execution, in microseconds.
+	uint64_t max = 0;      ///< Longest execution since the epoch started, in microseconds.
+	uint64_t total = 0;    ///< Sum of all measured executions, in microseconds.
+	uint64_t overruns = 0; ///< Executions that took longer than the budget of their class.
+};
+
 /** All state of the bridge. */
 struct BridgeState {
 	bool initialised = false; ///< Whether the runtime configuration has been read.
@@ -283,12 +311,52 @@ struct BridgeState {
 	std::map<std::string, Receipt> receipts; ///< Results of executed requests, by request id.
 	std::deque<std::string> receipt_order; ///< Order in which receipts were stored.
 	std::set<std::string> barrier_tasks;   ///< Tasks whose barrier has been acknowledged.
+
+	uint32_t pause_revision_at_epoch = 0; ///< Pause revision the current epoch started with.
+	TimingStats query_timing;             ///< Inline reads answered on the game thread.
+	TimingStats command_timing;           ///< Inline writes executed on the game thread.
+	TimingStats batch_timing;             ///< One poll's request batch on the game thread.
+	TimingStats deferred_timing;          ///< Capture and camera jobs run on the draw tick.
 };
 
 BridgeState _state;                                        ///< The bridge state.
 uint64_t _next_request_id = 0;                             ///< Identifier of the next request.
 std::map<uint64_t, PendingRequest> _pending;               ///< Requests that are in flight.
 std::map<uint64_t, std::unique_ptr<BridgeHTTPCallback>> _callbacks; ///< Callbacks of the requests in flight.
+
+/**
+ * Record one measured execution on the game thread.
+ * @param stats The class of work the execution belongs to.
+ * @param micros How long the execution took, in microseconds.
+ * @param budget The budget of that class, in microseconds.
+ */
+void RecordExecution(TimingStats &stats, uint64_t micros, uint64_t budget)
+{
+	stats.count++;
+	stats.last = micros;
+	stats.max = std::max(stats.max, micros);
+	stats.total += micros;
+	if (micros > budget) stats.overruns++;
+}
+
+/**
+ * Describe one measured class of work.
+ * @param stats The measured class.
+ * @param budget The budget of that class, in microseconds.
+ * @return The read-only description of the class.
+ */
+Json TimingJson(const TimingStats &stats, uint64_t budget)
+{
+	return {
+		{"count", stats.count},
+		{"last", stats.last},
+		{"max", stats.max},
+		{"total", stats.total},
+		{"average", stats.count == 0 ? 0 : stats.total / stats.count},
+		{"overruns", stats.overruns},
+		{"budget", budget},
+	};
+}
 
 /** A request that waits for the next draw tick to be executed. */
 struct DeferredRequest {
@@ -684,6 +752,37 @@ Json WorldInfo()
 		{"date", TimerGameCalendar::date.base()},
 		{"ticks", TimerGameTick::counter},
 		{"paused", _pause_mode.Any()},
+		/*
+		 * The pause revision moves with every accepted pause decision, whoever made it. It is not
+		 * bound to the epoch by itself: an epoch that starts while the pause state is left alone
+		 * begins with the revision of the previous epoch, so an equal revision can come from either
+		 * side of a load. The world/epoch of the request is what actually separates them; a
+		 * revision below `revision_at_epoch_start` is only an additional stale check.
+		 */
+		{"pause", {
+			{"paused", _pause_mode.Any()},
+			{"normal", _pause_mode.Test(PauseMode::Normal)},
+			{"revision", PauseRevision()},
+			{"revision_at_epoch_start", _state.pause_revision_at_epoch},
+			{"epoch", _state.epoch},
+		}},
+		/*
+		 * Measured game-thread work, not HTTP latency: one inline request execution for reads and
+		 * writes, one draw-tick job for captures and camera operations. `enforced` is false, so the
+		 * budgets are thresholds that count overruns and never abort anything.
+		 */
+		{"timing", {
+			{"unit", "microseconds"},
+			{"clock", "steady_clock"},
+			{"scope", "game thread: one inline request execution, one poll's request batch, or one deferred draw-tick job"},
+			{"enforced", false},
+			{"since_epoch", _state.epoch},
+			{"queries", TimingJson(_state.query_timing, INLINE_BUDGET_US)},
+			{"commands", TimingJson(_state.command_timing, INLINE_BUDGET_US)},
+			/* The plan's target is a query/batch slice, so the whole batch of one poll is measured too. */
+			{"batches", TimingJson(_state.batch_timing, INLINE_BUDGET_US)},
+			{"deferred", TimingJson(_state.deferred_timing, DEFERRED_BUDGET_US)},
+		}},
 		{"map", {{"width", Map::SizeX()}, {"height", Map::SizeY()}}},
 		{"companies", companies},
 		{"build", std::string(_openttd_revision)},
@@ -708,6 +807,8 @@ std::string_view CanonicalQueryKind(std::string_view kind)
 	if (kind == "vehicles" || kind == "vehicle") return "vehicles";
 	if (kind == "engines" || kind == "engine") return "engines";
 	if (kind == "orders" || kind == "order") return "orders";
+	if (kind == "groups" || kind == "group") return "groups";
+	if (kind == "cargos" || kind == "cargo") return "cargos";
 	if (kind == "signs" || kind == "sign") return "signs";
 	if (kind == "tiles" || kind == "tile") return "tiles";
 	return {};
@@ -1275,11 +1376,62 @@ Json WorldObjects(const Json &params)
 Json WorldPause(const Json &params)
 {
 	if (!params.contains("paused") || !params["paused"].is_boolean()) return Error("invalid_params", "paused must be a boolean");
-
 	const bool paused = params["paused"].get<bool>();
-	if (!Command<Commands::Pause>::Post(PauseMode::Normal, paused)) return Error("command_failed", "pause");
 
-	return Ok({{"paused", _pause_mode.Any()}});
+	const uint32_t revision = PauseRevision();
+	const bool normal_now = _pause_mode.Test(PauseMode::Normal);
+	const bool previous_paused = _pause_mode.Any();
+
+	/*
+	 * An optional revision guard: the caller observed the pause state at `expected_revision` and
+	 * only wants to change it while that is still the decision in force. A newer decision of the
+	 * player (or of another task) is reported as stale before anything is posted, so a temporary
+	 * agent pause is never restored over a pause the player made afterwards.
+	 *
+	 * The world/epoch of the request is the real protection across a load: an epoch that starts
+	 * while the pause state is left alone begins with the revision of the previous epoch, so an
+	 * equal revision alone cannot tell the two epochs apart. The epoch comparison below is only an
+	 * additional check for a revision that is older than the current epoch.
+	 */
+	std::optional<uint32_t> expected;
+	if (params.contains("expected_revision") && !params["expected_revision"].is_null()) {
+		int64_t value = 0;
+		if (!ReadBoundedInteger(params, "expected_revision", std::numeric_limits<uint32_t>::max(), value)) {
+			return Error("invalid_params", "`expected_revision` must be a pause revision");
+		}
+		expected = static_cast<uint32_t>(value);
+	}
+
+	const PauseRequestDecision decision = DecidePauseRequest(normal_now, paused, expected, revision, _state.pause_revision_at_epoch);
+	if (decision.guard == PauseGuardResult::EpochChanged) {
+		Json error = Error("stale_pause_revision", "the revision was read before the current epoch");
+		error["reason"] = "epoch_changed";
+		error["expected_revision"] = *expected;
+		error["revision"] = revision;
+		error["revision_at_epoch_start"] = _state.pause_revision_at_epoch;
+		return error;
+	}
+	if (decision.guard == PauseGuardResult::RevisionMismatch) {
+		Json error = Error("stale_pause_revision", "the pause state changed after the revision was read");
+		error["reason"] = "revision_mismatch";
+		error["expected_revision"] = *expected;
+		error["revision"] = revision;
+		error["paused"] = previous_paused;
+		error["normal"] = normal_now;
+		return error;
+	}
+
+	/* The command only runs when it would really change the pause mode the tool controls, so a
+	 * revision only moves on a real decision and a no-op request is answered without one. */
+	if (decision.post && !Command<Commands::Pause>::Post(PauseMode::Normal, paused)) return Error("command_failed", "pause");
+
+	return Ok({
+		{"paused", _pause_mode.Any()},
+		{"normal", _pause_mode.Test(PauseMode::Normal)},
+		{"revision", PauseRevision()},
+		{"changed", decision.post},
+		{"previous", {{"paused", previous_paused}, {"normal", normal_now}, {"revision", revision}}},
+	});
 }
 
 /**
@@ -1421,6 +1573,9 @@ void AddRowGenerations(std::string_view kind, Json &rows)
 		} else if (kind == "engines") {
 			if (id >= static_cast<int64_t>(EngineID::End().base())) continue;
 			if (const Engine *e = Engine::GetIfValid(static_cast<EngineID>(id)); e != nullptr) row["generation"] = e->generation;
+		} else if (kind == "groups") {
+			if (id >= static_cast<int64_t>(GroupID::End().base())) continue;
+			if (const Group *g = Group::GetIfValid(static_cast<GroupID>(id)); g != nullptr) row["generation"] = g->generation;
 		}
 	}
 }
@@ -1552,7 +1707,12 @@ void FinishDeferredRequest(const std::string &request_id)
 		return;
 	}
 
+	const Clock::time_point started = Clock::now();
 	const Json result = RunDeferred(deferred);
+	/* The draw-tick job is measured on its own, apart from the inline reads and writes. */
+	RecordExecution(_state.deferred_timing,
+			static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(Clock::now() - started).count()),
+			DEFERRED_BUDGET_US);
 
 	StoreReceipt(request_id, result);
 	/*
@@ -1616,7 +1776,7 @@ Json ScheduleDeferred(std::string_view method, const Json &request, const std::s
  * @param deferred Set to true iff the request answers later, from the draw tick.
  * @return The result of the request; a placeholder when the request was deferred.
  */
-Json ExecuteRequest(const Json &request, bool &deferred)
+Json ExecuteRequestInner(const Json &request, bool &deferred)
 {
 	deferred = false;
 	const std::string method = JsonString(request, "method");
@@ -1760,6 +1920,36 @@ void HandleHelloResponse(bool ok, const Json &body)
 }
 
 /**
+ * Run one request on the game thread and record how long it took.
+ *
+ * An inline request is measured as a read or as a write, whichever it is; a deferred one is
+ * measured where it really runs, on the draw tick, so its scheduling is not counted as execution
+ * time. The measurement covers the execution only: the poll that delivered the request and the
+ * delivery of the answer are outside of it.
+ * @param request The request, as received from the backend.
+ * @param deferred Set to true iff the request answers later.
+ * @return The result of the request.
+ */
+Json ExecuteRequest(const Json &request, bool &deferred)
+{
+	deferred = false;
+	const Clock::time_point started = Clock::now();
+	Json result = ExecuteRequestInner(request, deferred);
+
+	if (!deferred) {
+		const uint64_t micros = static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(Clock::now() - started).count());
+		const std::string method = JsonString(request, "method");
+		const Json params = request.contains("params") && request["params"].is_object() ? request["params"] : Json::object();
+		if (IsMutation(method, params)) {
+			RecordExecution(_state.command_timing, micros, INLINE_BUDGET_US);
+		} else {
+			RecordExecution(_state.query_timing, micros, INLINE_BUDGET_US);
+		}
+	}
+	return result;
+}
+
+/**
  * Handle the response to a poll: execute the requests, in order, on the main thread.
  * @param ok Whether the request succeeded.
  * @param body The parsed response.
@@ -1771,6 +1961,7 @@ void HandlePollResponse(bool ok, const Json &body)
 		return;
 	}
 
+	const Clock::time_point batch_started = Clock::now();
 	bool complete = true;
 	if (body.contains("requests") && body["requests"].is_array()) {
 		for (const Json &request : body["requests"]) {
@@ -1805,6 +1996,11 @@ void HandlePollResponse(bool ok, const Json &body)
 			}
 		}
 	}
+
+	/* One poll's requests are one game-thread slice, which is what the plan's batch target bounds. */
+	RecordExecution(_state.batch_timing,
+			static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(Clock::now() - batch_started).count()),
+			INLINE_BUDGET_US);
 
 	/* Only advance the cursor when the whole batch was handled; otherwise the backend replays it. */
 	if (complete && body.contains("cursor") && body["cursor"].is_number_integer()) {
@@ -1976,7 +2172,32 @@ Json Capabilities()
 
 	Json advertised = Json::array();
 	for (const std::string &method : methods) advertised.push_back(method);
-	return {{"methods", std::move(advertised)}, {"modules", std::move(modules)}};
+
+	/*
+	 * The contracts of the methods whose answer is more than the data: how to guard a pause against
+	 * a newer decision, and what the timing numbers actually measure. They are sent with the
+	 * capability document so the environment does not have to guess either of them.
+	 */
+	Json contracts = Json::object();
+	contracts["pause"] = {
+		{"revision_source", "every accepted change through Commands::Pause, whoever posted it"},
+		{"read", "world.info.pause = {paused, normal, revision, revision_at_epoch_start, epoch}"},
+		{"write", "world.pause {paused, expected_revision?} = {paused, normal, revision, changed, previous{paused, normal, revision}}"},
+		{"fields", "`paused` is any pause reason, `normal` is the pause this tool controls, `changed` says whether a pause command actually ran"},
+		{"stale", "world.pause answers error=stale_pause_revision with reason=revision_mismatch or epoch_changed, before anything is posted"},
+		{"no_attribution", "the revision does not say who paused; do not infer a player or agent source from it"},
+		{"restore", "for a temporary pause: keep previous.normal and the revision your own successful pause returned, then restore previous.normal with expected_revision set to that returned revision; never refresh the guard before restoring, so a newer player decision is rejected instead of undone"},
+		{"epoch", "the world_id/epoch of the request is the real protection across a load; a revision below revision_at_epoch_start is only an additional check, and an equal revision can also be the previous epoch's when no pause command ran since"},
+	};
+	contracts["timing"] = {
+		{"read", "world.info.timing = {unit, clock, scope, enforced, since_epoch, queries, commands, batches, deferred}"},
+		{"measured", "game-thread slices: one inline request execution (reads and writes separately), one poll's whole request batch, or one deferred draw-tick job"},
+		{"not_measured", "HTTP latency, poll cadence and queue waiting"},
+		{"budget", "a threshold that counts overruns; nothing is aborted when it is exceeded"},
+		{"ordering", "a world.info answer reports the executions that finished before it"},
+	};
+
+	return {{"methods", std::move(advertised)}, {"modules", std::move(modules)}, {"contracts", std::move(contracts)}};
 }
 
 /** Send a hello for the current world and epoch. */
@@ -2077,6 +2298,12 @@ void ResetWorld()
 {
 	_state.world_id.clear();
 	_state.epoch = GenerateUuid();
+	/* A pause revision read in another epoch can never guard a pause in this one. */
+	_state.pause_revision_at_epoch = PauseRevision();
+	_state.query_timing = TimingStats{};
+	_state.command_timing = TimingStats{};
+	_state.batch_timing = TimingStats{};
+	_state.deferred_timing = TimingStats{};
 	_state.connection_id.clear();
 	_state.connected = false;
 	_state.cursor = 0;

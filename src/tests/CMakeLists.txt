@@ -24,6 +24,7 @@ add_test_files(
     test_agent_capture.cpp
     test_agent_command_catalog.cpp
     test_agent_game_tools.cpp
+    test_agent_pause_contract.cpp
     test_main.cpp
     test_network_crypto.cpp
     test_network_http.cpp
