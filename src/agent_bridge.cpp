@@ -121,6 +121,8 @@ constexpr int DEFAULT_QUERY_LIMIT = 50;
 constexpr int MAX_QUERY_LIMIT = 500;
 /** Maximum number of tiles a single world.query may cover. */
 constexpr int MAX_QUERY_TILES = 4096;
+/** The most hangars a single airport can report, so one station can never flood a row. */
+constexpr uint MAX_AIRPORT_HANGARS = 256;
 /** Maximum number of references a single world.objects or expected_refs may carry. */
 constexpr size_t MAX_OBJECT_REFS = 64;
 
@@ -1465,6 +1467,40 @@ Json StationFacilitiesJson(const StationFacilities &facilities)
 }
 
 /**
+ * The airport of a station, as the engine recorded it.
+ *
+ * A station with the airport facility is not necessarily an airport with hangars: a heliport has
+ * the facility and no hangar at all, so its list is empty. The hangar tiles come from the engine's
+ * own layout (#Airport::GetHangarTile), which applies the airport rotation, so a rotated airport
+ * reports the tiles that are really on the map and no offset is computed here. The airport is
+ * reported as part of the station, never as an object of its own: it has no id and no lifetime
+ * apart from the station it belongs to.
+ * @param st The station.
+ * @return The airport object of an airport station, or \c nullptr for any other station.
+ */
+Json StationAirportJson(const Station &st)
+{
+	if (!st.facilities.Test(StationFacility::Airport)) return Json();
+
+	/* The engine's own hangar count is the list length; the constant only bounds a broken spec. */
+	const uint num_hangars = st.airport.GetNumHangars();
+	const uint listed = std::min<uint>(num_hangars, MAX_AIRPORT_HANGARS);
+	Json hangars = Json::array();
+	for (uint i = 0; i < listed; i++) {
+		const TileIndex tile = st.airport.GetHangarTile(i);
+		hangars.push_back({{"x", TileX(tile)}, {"y", TileY(tile)}});
+	}
+
+	return {
+		{"type", st.airport.type},
+		{"layout", st.airport.layout},
+		{"total", num_hangars},
+		{"truncated", num_hangars > listed},
+		{"hangars", std::move(hangars)},
+	};
+}
+
+/**
  * Implement world.query for towns, companies, stations, waypoints, depots, industries, vehicles,
  * signs and tiles.
  *
@@ -1558,7 +1594,7 @@ Json WorldQuery(const Json &params)
 			if (town_id >= 0 && (st->town == nullptr || static_cast<int>(st->town->index.base()) != town_id)) continue;
 			if (!ContainsAsciiCI(st->GetCachedName(), name)) continue;
 			if (!range.Contains(st->xy)) continue;
-			add_row({
+			Json row = {
 				{"id", st->index.base()},
 				{"generation", st->generation},
 				{"name", st->GetCachedName()},
@@ -1566,7 +1602,12 @@ Json WorldQuery(const Json &params)
 				{"owner", st->owner.base()},
 				{"town_id", st->town != nullptr ? st->town->index.base() : -1},
 				{"facilities", StationFacilitiesJson(st->facilities)},
-			});
+			};
+			/* The same additive airport object as the resolved station below, and the same omission
+			 * for a station that has no airport at all. */
+			const Json airport = StationAirportJson(*st);
+			if (!airport.is_null()) row["airport"] = airport;
+			add_row(std::move(row));
 		}
 	} else if (kind == "waypoints") {
 		/* A waypoint is a station pool item with its own lifetime, so it carries its own generation. */
@@ -2046,6 +2087,10 @@ Json ResolveRef(const Json &ref, bool require_identity)
 			row["owner"] = st.owner.base();
 			row["town_id"] = st.town != nullptr ? st.town->index.base() : -1;
 			row["facilities"] = StationFacilitiesJson(st.facilities);
+			/* The same airport object the station row carries, so a caller that keeps the ref does
+			 * not have to look the station up again; a station without an airport omits it. */
+			const Json airport = StationAirportJson(st);
+			if (!airport.is_null()) row["airport"] = airport;
 		});
 	}
 	if (type == "waypoint") {
