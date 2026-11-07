@@ -50,13 +50,16 @@ std::optional<Json> DispatchTransportTool(std::string_view method, const Json &p
 
 /*
  * Command callback. `Command<Tcmd>::Post` only accepts callbacks that are registered for the
- * network command dispatch, so this is declared here and listed in network_command.cpp. It
- * captures the actual result of the command that was just posted; in single player the callback
- * runs synchronously, before `Post` returns.
+ * network command dispatch, so this is declared here and registered in `network_command.cpp`:
+ * `_callback_tuple` has to list `&InGameAgent::CcAgentTransportCommand` next to the engine's own
+ * callbacks, and that file has to include this header. It captures the actual result of the
+ * command that was just posted; in single player the callback runs synchronously, before `Post`
+ * returns.
  *
  * One `CommandCallbackData` callback serves every command this module posts: it receives the
  * command id and the real `CommandCost`, which is all the receipts need. Generated ids (station,
- * depot) are read back from the map after the command, not decoded from the argument buffer.
+ * depot, waypoint) are read back from the map after the command, not decoded from the argument
+ * buffer. Every op added here reuses that one callback, so no further registration is needed.
  */
 
 /**
