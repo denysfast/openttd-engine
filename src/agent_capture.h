@@ -50,6 +50,12 @@ using Json = nlohmann::json;
  *                  largest PNG that still fits the backend's 8MiB request body after base64
  *                  and JSON overhead, about 5.9MiB).
  * - "include_png": whether to include the base64 PNG in the result (default true).
+ * - "hide_agent_ui": move the in-game agent windows (WindowClass::AgentChat and
+ *                  WindowClass::AgentChatStatus) off screen for the copy, so the pixels show the
+ *                  map that the chat was covering. Only those two windows are touched, only their
+ *                  position, and they are put back exactly where they were before the call
+ *                  returns - also when the capture fails. Default false, which keeps the whole
+ *                  screen frame (chat included) as before.
  *
  * On success the result contains:
  * - "ok": true, "kind", "width", "height", "tick" (the game tick the pixels were rendered
@@ -57,6 +63,9 @@ using Json = nlohmann::json;
  *   (redrawn/tick), "hash" (MD5 of the PNG bytes), "hash_algorithm", "parent_hash" (hash of
  *   the previous capture in this process, or null), "png_bytes" and, unless disabled,
  *   "png_base64". The backend derives its own SHA-256 from the decoded bytes.
+ *   "hide_agent_ui" is true only when agent windows were really hidden for this copy,
+ *   "hidden_window_count" says how many, and "agent_ui_restored" is false only when a hidden
+ *   window was gone before it could be put back.
  *
  * On failure the result contains "ok": false, "error" and "tick". Possible errors are
  * "headless_unavailable" (no video driver, blitter or frame buffer), "invalid_params",
@@ -68,6 +77,28 @@ using Json = nlohmann::json;
  * @return The JSON result describing the capture.
  */
 Json CaptureGameFrame(const Json &params);
+
+/**
+ * Read the optional "hide_agent_ui" parameter of a capture.
+ *
+ * The field is optional and defaults to false. A present but non-boolean value is a caller error
+ * and is reported instead of being silently ignored (a string "false" is not false).
+ *
+ * @param params The capture parameters.
+ * @param hide   Receives the requested value; set to false when the field is absent.
+ * @return True iff the field is absent or a boolean.
+ */
+inline bool ReadHideAgentUi(const Json &params, bool &hide)
+{
+	const auto field = params.find("hide_agent_ui");
+	if (field == params.end()) {
+		hide = false;
+		return true;
+	}
+	if (!field->is_boolean()) return false;
+	hide = field->get<bool>();
+	return true;
+}
 
 /**
  * Screen position of a world point in a viewport.

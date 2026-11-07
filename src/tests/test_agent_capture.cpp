@@ -82,6 +82,49 @@ TEST_CASE("Agent capture: WorldToScreen puts the viewport centre in the middle")
 	}
 }
 
+TEST_CASE("Agent capture: hide_agent_ui is read strictly")
+{
+	SECTION("absent means false") {
+		bool hide = true;
+		CHECK(InGameAgent::ReadHideAgentUi(InGameAgent::Json::object(), hide));
+		CHECK(hide == false);
+	}
+
+	SECTION("a boolean is taken as it is") {
+		bool hide = false;
+		CHECK(InGameAgent::ReadHideAgentUi(InGameAgent::Json{{"hide_agent_ui", true}}, hide));
+		CHECK(hide == true);
+		CHECK(InGameAgent::ReadHideAgentUi(InGameAgent::Json{{"hide_agent_ui", false}}, hide));
+		CHECK(hide == false);
+	}
+
+	SECTION("a non-boolean is rejected, never read as truthy") {
+		for (const InGameAgent::Json &value : {InGameAgent::Json("true"), InGameAgent::Json("false"),
+				InGameAgent::Json(1), InGameAgent::Json(0), InGameAgent::Json(nullptr),
+				InGameAgent::Json::array(), InGameAgent::Json::object()}) {
+			bool hide = false;
+			CHECK(InGameAgent::ReadHideAgentUi(InGameAgent::Json{{"hide_agent_ui", value}}, hide) == false);
+		}
+	}
+}
+
+TEST_CASE("Agent capture: a wrongly typed hide_agent_ui is a capture error")
+{
+	/* The type is checked before the video driver, so a caller error is reported as such even
+	 * when there is nothing to capture (as in this windowless test binary). */
+	CHECK(FindWindowById(WindowClass::MainWindow, 0) == nullptr);
+
+	const InGameAgent::Json wrong = InGameAgent::CaptureGameFrame(InGameAgent::Json{{"hide_agent_ui", "yes"}});
+	CHECK(wrong["ok"] == false);
+	CHECK(wrong["error"] == "invalid_params");
+	CHECK(wrong.contains("tick"));
+
+	/* A correctly typed field gets past the validation and fails on the missing frame instead. */
+	const InGameAgent::Json accepted = InGameAgent::CaptureGameFrame(InGameAgent::Json{{"hide_agent_ui", true}});
+	CHECK(accepted["ok"] == false);
+	CHECK(accepted["error"] == "headless_unavailable");
+}
+
 TEST_CASE("Agent capture: camera queries without a main window")
 {
 	/* The test binary has no window system, so there is no main viewport. */
