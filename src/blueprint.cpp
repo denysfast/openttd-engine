@@ -1047,6 +1047,10 @@ static void OnConstructionJobResult(const CommandCost &result, Money extra_money
 	if (result.Succeeded()) _paste_status.cost += result.GetCost();
 	if (last_error != INVALID_STRING_ID) _paste_status.last_error = last_error;
 	if (result.Failed() && result.GetErrorMessage() != INVALID_STRING_ID && result.GetErrorMessage() != STR_NULL) _paste_status.last_error = result.GetErrorMessage();
+	if (_paste_is_route && (failed != 0 || result.Failed())) {
+		_paste_status.aborted = true;
+		_paste_queue.clear();
+	}
 	if (extra_money != 0) {
 		_paste_status.out_of_money = true;
 		_paste_queue.clear();
@@ -1117,6 +1121,8 @@ void RunBlueprintPasteJob()
 	size_t sent = 0;
 	while (!_paste_queue.empty() && _paste_status.active) {
 		size_t in_flight = _paste_status.chunks_sent - _paste_status.chunks_done;
+		/* Route chunks depend on the previous result: never build over a failed preparation. */
+		if (_paste_is_route && in_flight != 0) break;
 		if (_networking ? in_flight >= PASTE_MAX_IN_FLIGHT_NETWORK : sent >= PASTE_MAX_PER_RUN_LOCAL) break;
 
 		/* Commands of a company that no longer exists (or that we no longer play) are not sent. */

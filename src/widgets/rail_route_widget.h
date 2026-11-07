@@ -30,6 +30,7 @@ enum RailRouteWidgets : WidgetID {
 	WID_RR_BUILD, ///< Start placing a trunk line.
 	WID_RR_INFO, ///< Placement state and the planned route.
 	WID_RR_STATUS, ///< Progress of the construction job.
+	WID_RR_TERRAFORM, ///< Toggle: permit necessary changes to the terrain.
 	WID_RR_ABORT, ///< Abort the construction job.
 };
 

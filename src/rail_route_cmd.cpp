@@ -207,7 +207,7 @@ std::tuple<CommandCost, Money, uint32_t, uint32_t, StringID> CmdPrepareRailRoute
 	};
 
 	RouteChunkReader r{chunk.data};
-	while (!r.AtEnd() && needed == 0) {
+	while (!r.AtEnd() && needed == 0 && failed == 0) {
 		uint8_t kind = r.U8();
 		uint16_t x0 = r.U16(), y0 = r.U16(), w = r.U16(), h = r.U16();
 		uint8_t value = r.U8();
@@ -217,8 +217,8 @@ std::tuple<CommandCost, Money, uint32_t, uint32_t, StringID> CmdPrepareRailRoute
 		bool demolish = HasBit(item_flags, to_underlying(RailRouteClearFlag::Demolish));
 
 		if (kind == to_underlying(RailRouteItemKind::Clear)) {
-			for (uint y = oy + y0; y < oy + y0 + h && needed == 0; y++) {
-				for (uint x = ox + x0; x < ox + x0 + w && needed == 0; x++) {
+			for (uint y = oy + y0; y < oy + y0 + h && needed == 0 && failed == 0; y++) {
+				for (uint x = ox + x0; x < ox + x0 + w && needed == 0 && failed == 0; x++) {
 					if (x >= Map::MaxX() || y >= Map::MaxY()) continue;
 					TileIndex target = GetRouteClearTarget(TileXY(x, y), water, demolish);
 					if (target == INVALID_TILE) continue;
@@ -228,8 +228,8 @@ std::tuple<CommandCost, Money, uint32_t, uint32_t, StringID> CmdPrepareRailRoute
 		} else {
 			/* Level: every corner of the rectangle to the height. A corner is the north corner of the tile with its coordinates. */
 			int target = value;
-			for (uint y = oy + y0; y < oy + y0 + h && needed == 0; y++) {
-				for (uint x = ox + x0; x < ox + x0 + w && needed == 0; x++) {
+			for (uint y = oy + y0; y < oy + y0 + h && needed == 0 && failed == 0; y++) {
+				for (uint x = ox + x0; x < ox + x0 + w && needed == 0 && failed == 0; x++) {
 					if (x >= Map::MaxX() || y >= Map::MaxY()) continue;
 					TileIndex tile = TileXY(x, y);
 					if (static_cast<int>(TileHeight(tile)) == target) continue;

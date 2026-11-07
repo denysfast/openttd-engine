@@ -3104,6 +3104,8 @@ STR_RAIL_ROUTE_START_Y_TOOLTIP                                  :{BLACK}Нача
 STR_RAIL_ROUTE_SIGNALS                                          :{BLACK}Сигналы, через (клеток):
 STR_RAIL_ROUTE_SIGNALS_TOOLTIP                                  :{BLACK}Поставить односторонние маршрутные сигналы на всех путях, по направлению от начала к концу
 STR_RAIL_ROUTE_INTERVAL_TOOLTIP                                 :{BLACK}Расстояние между сигналами вдоль линии, от 1 до 20 клеток
+STR_RAIL_ROUTE_TERRAFORM                                       :{BLACK}Разрешить земляные работы
+STR_RAIL_ROUTE_TERRAFORM_TOOLTIP                               :{BLACK}Сохранять пригодные естественные склоны. Если включено, менять землю только там, где это необходимо для непрерывного пути; если выключено, строить на существующем рельефе с обычными фундаментами
 STR_RAIL_ROUTE_WATER                                            :{BLACK}Убирать воду
 STR_RAIL_ROUTE_WATER_TOOLTIP                                    :{BLACK}Засыпать море, озёра, реки и каналы в коридоре; иначе клетки с водой мешают линии
 STR_RAIL_ROUTE_DEMOLISH                                         :{BLACK}Сносить дома, предприятия и городские дороги
@@ -3111,7 +3113,7 @@ STR_RAIL_ROUTE_DEMOLISH_TOOLTIP                                 :{BLACK}Снос
 STR_RAIL_ROUTE_SEA                                              :{BLACK}Поднимать землю на уровне моря
 STR_RAIL_ROUTE_SEA_TOOLTIP                                      :{BLACK}Держать линию хотя бы на один уровень выше моря, поднимая землю где нужно
 STR_RAIL_ROUTE_BUILD                                            :{BLACK}Строить
-STR_RAIL_ROUTE_BUILD_TOOLTIP                                    :{BLACK}Выберите направление начала, наведите мышью начало линии и щёлкните: начало закреплено. Затем щёлкните конец: линия следует за мышью как предпросмотр и строится по второму щелчку с типом рельсов из панели ж/д строительства. Инструмент остаётся включённым для следующих линий до Esc или правого щелчка. Клавиша: K
+STR_RAIL_ROUTE_BUILD_TOOLTIP                                    :{BLACK}Щёлкните начало и конец, чтобы построить показанную линию. На существующих рельсах направление начала выбирается автоматически. Shift+щелчок показывает стоимость, сохраняя начало; при ошибке начало тоже сохраняется для повторной попытки. Инструмент работает до Esc или правого щелчка. Клавиша: K
 STR_RAIL_ROUTE_ABORT                                            :{BLACK}Прервать стройку
 STR_RAIL_ROUTE_ABORT_TOOLTIP                                    :{BLACK}Остановить идущую стройку; уже построенное остаётся
 STR_RAIL_ROUTE_INFO_RAILTYPE                                    :{BLACK}Тип рельсов: {GOLD}{STRING}{BLACK}, сигналы: {GOLD}{STRING}
@@ -3138,6 +3140,7 @@ STR_RAIL_ROUTE_ERROR_NO_ROUTE                                   :путь не �
 STR_RAIL_ROUTE_ERROR_DOES_NOT_FIT                               :коридор не помещается на карте
 STR_RAIL_ROUTE_ERROR_WRONG_DIRECTION                            :конец должен лежать в направлении начала
 STR_RAIL_ROUTE_ERROR_START_MISMATCH                             :линия не сходится с началом
+STR_RAIL_ROUTE_ERROR_INVALID_RAILTYPE                          :неверный тип рельсов
 STR_RAIL_ROUTE_ERROR_INVALID_START                              :неверное направление начала
 
 STR_ERROR_RAIL_ROUTE_CAN_T_BUILD                                :{WHITE}Невозможно построить магистраль...

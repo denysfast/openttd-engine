@@ -8,12 +8,10 @@
 /**
  * @file rail_route.h Rail trunk line tool: plan and build many parallel one-way tracks from one tile to another.
  *
- * The route goes from the start tile to the end tile as straight as possible: one straight run along the major
- * axis and one 45 degree diagonal run (a diagonal step moves one tile along both axes), so at most one bend.
- * Every track of the corridor is the same polyline moved sideways, so parallel tracks never cross. Diagonal
- * track cannot climb in OpenTTD, so the height only changes on the straight run; a dynamic programme chooses
- * the heights, minimising earthworks. Whatever is in the way is demolished or filled. The corridor is then
- * cleared, levelled (sloped along the track on ramps), and the tracks and one-way signals are built.
+ * The planner compares routes with up to two bends, keeps usable natural slopes and reuses own rail.
+ * Necessary earthworks use a per-column height programme with gentle ramps and protected connections.
+ * Only obstacles on actual track tiles are cleared in advance; terrain beside the line is left alone
+ * unless it blocks a necessary terraform command.
  *
  * Planning runs on the client and only reads the map. Building is a list of commands sent by the
  * construction job of blueprint.cpp: #Commands::PrepareRailRoute (clear and level areas) followed by
@@ -49,6 +47,7 @@ struct RailRouteOptions {
 	uint8_t signal_interval = 6; ///< Distance between signals, in steps along the route.
 	SignalType signal_type = SignalType::PathOneWay; ///< Type of the signals.
 	SignalVariant signal_variant = SignalVariant::Electric; ///< Variant of the signals.
+	bool terraform = true; ///< Allow necessary earthworks when normal rail foundations do not suffice.
 	bool remove_water = true; ///< Clear water (sea, lakes, rivers, canals) in the corridor and fill it.
 	bool demolish = true; ///< Demolish town houses, industries and town roads in the corridor.
 	bool raise_sea_level = true; ///< Keep the corridor at least one level above the sea.
@@ -98,6 +97,7 @@ struct RailRoutePlan {
 	TileIndex end = INVALID_TILE; ///< End tile of the centre track; with a fixed start orientation the requested end may be moved into reach.
 };
 
+RailRouteStart GetRailRouteStartOrientation(TileIndex tile, RailType railtype);
 RailRoutePlan PlanRailRoute(TileIndex from, TileIndex to, const RailRouteOptions &options);
 std::vector<std::pair<TileIndex, TrackBits>> GetRailRouteStartPieces(TileIndex from, RailRouteStart start, uint8_t tracks);
 
