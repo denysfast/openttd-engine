@@ -2142,9 +2142,9 @@ static constexpr std::initializer_list<NWidgetPart> _nested_agent_chat_widgets =
 				NWidget(WWT_PUSHTXTBTN, Colours::Grey, WID_AC_ADD_COMPANY), SetFill(1, 0), SetResize(1, 0), SetStringTip(STR_AGENT_CHAT_ADD_COMPANY, STR_AGENT_CHAT_ADD_COMPANY_TOOLTIP),
 			EndContainer(),
 			/* An edit box so the window can take the global edit box focus: the backends deliver
-			 * typed text (and only typed text) through HandleTextInput() to a focused edit box. */
+			 * typed text (and only typed text) through HandleTextInput() to a focused edit box.
+			 * It is a leaf: the vertical container it lives in is closed further down. */
 			NWidget(WWT_EDITBOX, Colours::Grey, WID_AC_INPUT), SetMinimalSize(0, 48), SetFill(1, 0), SetResize(1, 0), SetToolTip(STR_AGENT_CHAT_INPUT_TOOLTIP),
-			EndContainer(),
 			NWidget(NWID_HORIZONTAL),
 				NWidget(WWT_PANEL, Colours::Grey, WID_AC_STATUS), SetMinimalSize(0, 14), SetFill(1, 0), SetResize(1, 0),
 				EndContainer(),
