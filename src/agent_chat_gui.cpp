@@ -737,6 +737,9 @@ static bool AgentChatCanQueueRead()
 /** Mark the agent chat windows dirty. */
 static void InvalidateAgentChatWindows()
 {
+	/* The widget state (which buttons are enabled) and the scrollbars are only refreshed by the
+	 * invalidation data of the window, so the chat window is invalidated, not only repainted. */
+	InvalidateWindowClassesData(WindowClass::AgentChat, 0);
 	SetWindowClassesDirty(WindowClass::AgentChat);
 	SetWindowClassesDirty(WindowClass::AgentChatStatus);
 }
@@ -861,10 +864,17 @@ static void AgentChatSyncContext()
 		_agent_chat.selection.Clear();
 	}
 
+	const bool changed = world_id != _agent_chat.world_id || epoch != _agent_chat.epoch || connected != _agent_chat.connected;
+
 	_agent_chat.world_id = world_id;
 	_agent_chat.epoch = epoch;
 	_agent_chat.connection_id = JsonString(context, "connection_id");
 	_agent_chat.connected = connected;
+
+	/* The enabled state of the widgets follows the connection, and the window is created before the
+	 * transport reports it. Refreshing the widget state here is what makes New chat usable on a
+	 * cold open; it happens in the tick, never while the window is being painted. */
+	if (changed) InvalidateAgentChatWindows();
 }
 
 /**
@@ -3553,6 +3563,14 @@ nlohmann::json DescribeAgentChatUi()
 		const NWidgetBase *closebox = w->nested_root->GetWidgetOfType(WWT_CLOSEBOX);
 		if (closebox != nullptr) widgets["closebox"] = RectToJson(ToScreenRect(*w, closebox->GetCurrentRect()));
 		out["widgets"] = std::move(widgets);
+
+		/* The actual enabled state of the action widgets: a read-only check can see whether a
+		 * click would be accepted instead of guessing it from the connection flag. */
+		Json widget_states = Json::object();
+		widget_states["new_chat"] = Json{{"disabled", w->IsWidgetDisabled(WID_AC_NEW_CHAT)}};
+		widget_states["send"] = Json{{"disabled", w->IsWidgetDisabled(WID_AC_SEND)}};
+		widget_states["stop"] = Json{{"disabled", w->IsWidgetDisabled(WID_AC_STOP)}};
+		out["widget_states"] = std::move(widget_states);
 
 		Json chat_rows = Json::array();
 		const Rect list = w->GetInnerRect(WID_AC_CHAT_LIST);
