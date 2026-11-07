@@ -64,6 +64,8 @@ add_files(
     agent_capture.h
     agent_chat_gui.cpp
     agent_chat_gui.h
+    agent_command_catalog.cpp
+    agent_command_catalog.h
     agent_game_tools.cpp
     agent_game_tools.h
     agent_transport_tools.cpp

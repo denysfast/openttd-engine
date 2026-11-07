@@ -15,6 +15,7 @@
 #include "../company_func.h"
 #include "../settings_type.h"
 #include "../agent_admin_tools.h"
+#include "../agent_command_catalog.h"
 #include "../agent_game_tools.h"
 #include "../agent_transport_tools.h"
 #include "../airport_cmd.h"
@@ -105,7 +106,8 @@ static constexpr auto _callback_tuple = std::make_tuple(
 	&InGameAgent::AgentAdminCommandCallback,
 	&InGameAgent::AgentAdminFoundTownCallback,
 	&InGameAgent::AgentAdminPlaceSignCallback,
-	&InGameAgent::AgentAdminBuildIndustryAreaCallback
+	&InGameAgent::AgentAdminBuildIndustryAreaCallback,
+	&InGameAgent::AgentCommandCatalogCallback
 );
 
 #ifdef SILENCE_GCC_FUNCTION_POINTER_CAST

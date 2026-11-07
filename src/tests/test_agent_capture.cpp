@@ -170,9 +170,12 @@ TEST_CASE("Agent capture: independent and minimap requests are validated strictl
 		CHECK(InGameAgent::CaptureGameFrame(Json{{"kind", "minimap"}})["error"] == "headless_unavailable");
 		CHECK(InGameAgent::CaptureGameFrame(Json{{"kind", "minimap"}, {"width", 256}, {"height", 256}})["error"] == "headless_unavailable");
 
-		/* A target needs a map and this binary has none (Map::size is 0), so the request is accepted
-		 * by the parser and then honestly reported as out of bounds. */
-		CHECK(InGameAgent::CaptureGameFrame(Json{{"target", {{"tile", 0}}}, {"width", 64}, {"height", 64}, {"zoom", 3}})["error"] == "out_of_bounds");
+		/* A target is parsed here and then fails for a reason of the binary, not of the parser: with
+		 * no map it is out of bounds, and when another test case allocated one the render still has
+		 * no frame buffer. Both answers are honest, `invalid_params` would not be. */
+		const Json targeted = InGameAgent::CaptureGameFrame(Json{{"target", {{"tile", 0}}}, {"width", 64}, {"height", 64}, {"zoom", 3}});
+		CHECK(targeted["ok"] == false);
+		CHECK((targeted["error"] == "out_of_bounds" || targeted["error"] == "headless_unavailable"));
 	}
 }
 
@@ -188,8 +191,12 @@ TEST_CASE("Agent capture: an independent camera centres its target in the image"
 	camera.zoom = ZoomLevel::Normal;
 	camera.virtual_width = ScaleByZoom(camera.width, camera.zoom);
 	camera.virtual_height = ScaleByZoom(camera.height, camera.zoom);
-	camera.virtual_left = 20000 - camera.virtual_width / 2;
-	camera.virtual_top = 10000 - camera.virtual_height / 2;
+
+	/* The scroll position is in remapped space, like a real viewport: the centre of the camera is
+	 * the remapped world point it looks at. */
+	const Point centre = RemapCoords(20000, 10000, 0);
+	camera.virtual_left = centre.x - camera.virtual_width / 2;
+	camera.virtual_top = centre.y - camera.virtual_height / 2;
 
 	/* A world point at the centre of the camera maps to the centre of the image. */
 	const Point middle = InGameAgent::WorldToScreen(camera, 20000, 10000, 0);

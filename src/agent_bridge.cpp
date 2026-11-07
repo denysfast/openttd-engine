@@ -13,6 +13,7 @@
 #include "agent_admin_tools.h"
 #include "agent_capture.h"
 #include "agent_chat_gui.h"
+#include "agent_command_catalog.h"
 #include "agent_game_tools.h"
 #include "agent_transport_tools.h"
 #include "command_func.h"
@@ -36,6 +37,7 @@
 #include "progress.h"
 #include "rev.h"
 #include "signs_base.h"
+#include "signs_cmd.h"
 #include "station_base.h"
 #include "station_cmd.h"
 #include "station_map.h"
@@ -47,8 +49,10 @@
 #include "town.h"
 #include "town_cmd.h"
 #include "vehicle_base.h"
+#include "vehicle_cmd.h"
 #include "video/video_driver.hpp"
 #include "waypoint_base.h"
+#include "waypoint_cmd.h"
 
 #include "3rdparty/fmt/format.h"
 
@@ -645,6 +649,16 @@ bool IsMutation(std::string_view method, const Json &params)
 }
 
 /**
+ * The world and epoch the bridge is bound to, as included in read results.
+ * @return {world_id, epoch}.
+ */
+Json WorldBinding()
+{
+	ResolveWorldId();
+	return {{"world_id", _state.world_id}, {"epoch", _state.epoch}};
+}
+
+/**
  * Implement world.info.
  * @return The result of the method.
  */
@@ -652,22 +666,31 @@ Json WorldInfo()
 {
 	Json companies = Json::array();
 	for (const Company *c : Company::Iterate()) {
+		/*
+		 * A company row is a typed reference of the company itself, with its lifetime, so a write
+		 * can guard the company it was planned for without a second lookup.
+		 */
 		companies.push_back({
+			{"type", "company"},
 			{"id", c->index.base()},
+			{"generation", c->generation},
 			{"name", c->name.empty() ? GetString(STR_COMPANY_NAME, c->index) : c->name},
 			{"is_ai", c->is_ai},
 			{"money", static_cast<int64_t>(c->money)},
 		});
 	}
 
-	return Ok({
+	Json value = {
 		{"date", TimerGameCalendar::date.base()},
 		{"ticks", TimerGameTick::counter},
 		{"paused", _pause_mode.Any()},
 		{"map", {{"width", Map::SizeX()}, {"height", Map::SizeY()}}},
 		{"companies", companies},
 		{"build", std::string(_openttd_revision)},
-	});
+	};
+	/* The read is bound to the world and epoch it was taken in, like every other read. */
+	value.update(WorldBinding());
+	return Ok(std::move(value));
 }
 
 /**
@@ -684,6 +707,7 @@ std::string_view CanonicalQueryKind(std::string_view kind)
 	if (kind == "industries" || kind == "industry") return "industries";
 	if (kind == "vehicles" || kind == "vehicle") return "vehicles";
 	if (kind == "engines" || kind == "engine") return "engines";
+	if (kind == "orders" || kind == "order") return "orders";
 	if (kind == "signs" || kind == "sign") return "signs";
 	if (kind == "tiles" || kind == "tile") return "tiles";
 	return {};
@@ -740,16 +764,6 @@ std::string ReadNameFilter(const Json &filters)
 	std::string name = JsonString(filters, "name_contains");
 	if (name.empty()) name = JsonString(filters, "name");
 	return LowerAscii(name);
-}
-
-/**
- * The world and epoch the bridge is bound to, as included in read results.
- * @return {world_id, epoch}.
- */
-Json WorldBinding()
-{
-	ResolveWorldId();
-	return {{"world_id", _state.world_id}, {"epoch", _state.epoch}};
 }
 
 /**
@@ -918,7 +932,7 @@ Json RefFailure(std::string_view type, std::string_view reason, std::string_view
 }
 
 /**
- * Read an integer member of a reference without narrowing it first.
+ * Read an integer member without narrowing it first.
  *
  * Ids and generations travel as JSON integers. A member of another type, a negative value or a
  * value above \a maximum is reported as unusable instead of being truncated into a pool index:
@@ -929,7 +943,7 @@ Json RefFailure(std::string_view type, std::string_view reason, std::string_view
  * @param value Receives the value.
  * @return True iff the member is present and a usable integer.
  */
-bool ReadRefInteger(const Json &object, const char *key, int64_t maximum, int64_t &value)
+bool ReadBoundedInteger(const Json &object, const char *key, int64_t maximum, int64_t &value)
 {
 	if (!object.is_object() || !object.contains(key)) return false;
 	const Json &member = object[key];
@@ -969,8 +983,8 @@ bool ReadRefTile(const Json &ref, TileIndex &tile)
 	int64_t x = 0;
 	int64_t y = 0;
 	if (location.is_object()) {
-		if (!ReadRefInteger(location, "x", max_x, x)) return false;
-		if (!ReadRefInteger(location, "y", max_y, y)) return false;
+		if (!ReadBoundedInteger(location, "x", max_x, x)) return false;
+		if (!ReadBoundedInteger(location, "y", max_y, y)) return false;
 	} else if (location.is_array() && location.size() == 2 && location[0].is_number_integer() && location[1].is_number_integer()) {
 		x = location[0].get<int64_t>();
 		y = location[1].get<int64_t>();
@@ -1039,7 +1053,7 @@ template <typename Tindex, typename Titem, typename F>
 Json ResolveTypedRef(std::string_view type, const Json &ref, std::optional<uint64_t> generation, bool require_identity, F fill)
 {
 	int64_t id = 0;
-	if (!ReadRefInteger(ref, "id", static_cast<int64_t>(Tindex::End().base()) - 1, id)) return RefFailure(type, "invalid_id", "invalid_params");
+	if (!ReadBoundedInteger(ref, "id", static_cast<int64_t>(Tindex::End().base()) - 1, id)) return RefFailure(type, "invalid_id", "invalid_params");
 	return ResolvePoolItem(type, Titem::GetIfValid(static_cast<Tindex>(id)), generation, require_identity, fill);
 }
 
@@ -1116,7 +1130,7 @@ Json ResolveRef(const Json &ref, bool require_identity)
 	std::optional<uint64_t> generation;
 	if (ref.contains("generation") && !ref["generation"].is_null()) {
 		int64_t value = 0;
-		if (!ReadRefInteger(ref, "generation", std::numeric_limits<int64_t>::max(), value)) return RefFailure(type, "invalid_generation", "invalid_params");
+		if (!ReadBoundedInteger(ref, "generation", std::numeric_limits<int64_t>::max(), value)) return RefFailure(type, "invalid_generation", "invalid_params");
 		generation = static_cast<uint64_t>(value);
 	}
 
@@ -1277,16 +1291,27 @@ Json WorldPause(const Json &params)
 Json WorldRename(const Json &params, CompanyID request_company)
 {
 	const std::string kind = JsonString(params, "kind");
-	const int id = JsonInt(params, "id", -1);
 	const std::string name = JsonString(params, "name");
 	if (name.empty()) return Error("invalid_params", "name must not be empty");
 
+	/*
+	 * Every id is bounded by the pool of its kind before it is narrowed, so an id of another kind,
+	 * a negative id or a value that would truncate is an invalid request and not a rename of a
+	 * random object. An id inside the pool that names no object is `unknown_object`.
+	 */
+	int64_t id = 0;
+
 	if (kind == "town") {
+		if (!ReadBoundedInteger(params, "id", static_cast<int64_t>(TownID::End().base()) - 1, id)) return Error("invalid_params", "`id` must be a town id");
 		const TownID town_id = static_cast<TownID>(id);
-		if (id < 0 || !Town::IsValidID(town_id)) return Error("unknown_object", "no such town");
+		if (!Town::IsValidID(town_id)) return Error("unknown_object", "no such town");
 		if (!Command<Commands::RenameTown>::Post(STR_ERROR_CAN_T_RENAME_TOWN, town_id, name)) return Error("command_failed", "rename town");
 	} else if (kind == "company") {
-		const CompanyID company_id = id >= 0 ? static_cast<CompanyID>(id) : request_company;
+		CompanyID company_id = request_company;
+		if (params.contains("id")) {
+			if (!ReadBoundedInteger(params, "id", static_cast<int64_t>(CompanyID::End().base()) - 1, id)) return Error("invalid_params", "`id` must be a company id");
+			company_id = static_cast<CompanyID>(id);
+		}
 		if (!Company::IsValidID(company_id)) return Error("unknown_object", "no such company");
 
 		/* RenameCompany operates on the current company, so scope it to the requested one. */
@@ -1299,9 +1324,43 @@ Json WorldRename(const Json &params, CompanyID request_company)
 		const Company *company = Company::GetIfValid(company_id);
 		if (company == nullptr || company->name != name) return Error("command_failed", "the company name was not changed");
 	} else if (kind == "station") {
+		if (!ReadBoundedInteger(params, "id", static_cast<int64_t>(StationID::End().base()) - 1, id)) return Error("invalid_params", "`id` must be a station id");
 		const StationID station_id = static_cast<StationID>(id);
-		if (id < 0 || !Station::IsValidID(station_id)) return Error("unknown_object", "no such station");
+		if (!Station::IsValidID(station_id)) return Error("unknown_object", "no such station");
 		if (!Command<Commands::RenameStation>::Post(STR_ERROR_CAN_T_RENAME_STATION, station_id, name)) return Error("command_failed", "rename station");
+	} else if (kind == "waypoint") {
+		if (!ReadBoundedInteger(params, "id", static_cast<int64_t>(StationID::End().base()) - 1, id)) return Error("invalid_params", "`id` must be a waypoint id");
+		const StationID waypoint_id = static_cast<StationID>(id);
+		if (Waypoint::GetIfValid(waypoint_id) == nullptr) return Error("unknown_object", "no such waypoint");
+		if (!Command<Commands::RenameWaypoint>::Post(STR_ERROR_CAN_T_CHANGE_WAYPOINT_NAME, waypoint_id, name)) return Error("command_failed", "rename waypoint");
+	} else if (kind == "vehicle") {
+		if (!ReadBoundedInteger(params, "id", static_cast<int64_t>(VehicleID::End().base()) - 1, id)) return Error("invalid_params", "`id` must be a vehicle id");
+		const VehicleID vehicle_id = static_cast<VehicleID>(id);
+		const Vehicle *vehicle = Vehicle::GetIfValid(vehicle_id);
+		if (vehicle == nullptr) return Error("unknown_object", "no such vehicle");
+
+		/* The engine checks ownership against the current company, so scope it to the owner. */
+		bool posted = false;
+		{
+			const Backup<CompanyID> context(_current_company, Company::IsValidID(request_company) ? request_company : vehicle->owner);
+			posted = Command<Commands::RenameVehicle>::Post(STR_ERROR_CAN_T_RENAME_TRAIN + to_underlying(vehicle->type), vehicle_id, name);
+		}
+		if (!posted) return Error("command_failed", "rename vehicle");
+	} else if (kind == "sign") {
+		if (!ReadBoundedInteger(params, "id", static_cast<int64_t>(SignID::End().base()) - 1, id)) return Error("invalid_params", "`id` must be a sign id");
+		const SignID sign_id = static_cast<SignID>(id);
+		if (Sign::GetIfValid(sign_id) == nullptr) return Error("unknown_object", "no such sign");
+
+		/* Colours::Invalid keeps the current text colour, which is what a rename without one means. */
+		bool posted = false;
+		{
+			const Backup<CompanyID> context(_current_company, Company::IsValidID(request_company) ? request_company : OWNER_DEITY);
+			posted = Command<Commands::RenameSign>::Post(STR_ERROR_CAN_T_CHANGE_SIGN_NAME, sign_id, name, Colours::Invalid);
+		}
+		if (!posted) return Error("command_failed", "rename sign");
+	} else if (kind == "group") {
+		/* The engine has no command that renames a group, so this is an explicit gap. */
+		return Error("unsupported_rename_kind", "the engine has no command to rename a group");
 	} else {
 		return Error("unsupported_rename_kind", kind);
 	}
@@ -1354,7 +1413,7 @@ void AddRowGenerations(std::string_view kind, Json &rows)
 		if (!row.is_object() || row.contains("generation")) continue;
 
 		int64_t id = 0;
-		if (!ReadRefInteger(row, "id", std::numeric_limits<int64_t>::max(), id)) continue;
+		if (!ReadBoundedInteger(row, "id", std::numeric_limits<int64_t>::max(), id)) continue;
 
 		if (kind == "vehicles") {
 			if (id >= static_cast<int64_t>(VehicleID::End().base())) continue;
@@ -1599,29 +1658,28 @@ Json ExecuteRequest(const Json &request, bool &deferred)
 	if (method == "world.info") return WorldInfo();
 	if (method == "world.query") {
 		/*
-		 * The game tool module owns the vehicle and engine inventory, which is richer than the
-		 * core rows; the core query keeps the other kinds and stays the fallback when the module
-		 * does not claim the kind, so a kind is never shadowed by a thinner answer. The module knows
-		 * the canonical plural kind only, so the legacy singular alias is normalised for it.
+		 * The tool modules own the kinds they implement (the game module answers vehicles, engines
+		 * and orders), and the core query keeps the rest: a module returns nothing for a kind it
+		 * does not claim, so a kind is never shadowed by a thinner answer and a kind a module adds
+		 * later needs no change here. The module knows the canonical plural kind only, so the
+		 * legacy singular alias is normalised for it; a kind this bridge does not canonicalise is
+		 * passed through unchanged, so the module can own it by itself.
 		 */
 		const std::string requested = JsonString(params, "kind");
 		const std::string_view kind = CanonicalQueryKind(requested);
-		if (kind == "vehicles" || kind == "engines") {
-			Json module_params = params;
-			module_params["kind"] = std::string(kind);
+		Json module_params = params;
+		if (!kind.empty()) module_params["kind"] = std::string(kind);
 
-			if (std::optional<Json> result = DispatchGameTool(method, module_params, company); result.has_value()) {
-				Json mapped = FromModule(std::move(*result));
-				if (mapped["ok"].is_boolean() && mapped["ok"].get<bool>() && mapped.contains("value") && mapped["value"].is_object()) {
-					Json &value = mapped["value"];
-					/* A row has to carry its lifetime, so a reference built from it can be strict. */
-					if (value.contains("rows") && value["rows"].is_array()) AddRowGenerations(kind, value["rows"]);
-					/* Every read is bound to the world and epoch it was taken in, whoever produced it. */
-					value.update(WorldBinding());
-				}
-				return mapped;
+		if (std::optional<Json> result = DispatchGameTool(method, module_params, company); result.has_value()) {
+			Json mapped = FromModule(std::move(*result));
+			if (mapped["ok"].is_boolean() && mapped["ok"].get<bool>() && mapped.contains("value") && mapped["value"].is_object()) {
+				Json &value = mapped["value"];
+				/* A row has to carry its lifetime, so a reference built from it can be strict. */
+				if (value.contains("rows") && value["rows"].is_array()) AddRowGenerations(kind, value["rows"]);
+				/* Every read is bound to the world and epoch it was taken in, whoever produced it. */
+				value.update(WorldBinding());
 			}
-			return Error("unsupported_query_kind", requested);
+			return mapped;
 		}
 		return WorldQuery(params);
 	}
@@ -1668,6 +1726,11 @@ Json ExecuteRequest(const Json &request, bool &deferred)
 
 	/* Administrative families: settings, companies, towns and projects. */
 	if (std::optional<Json> result = DispatchAdminTool(method, params, company); result.has_value()) {
+		return FromModule(std::move(*result));
+	}
+
+	/* The engine command catalog: world.commands (read) and world.command (generic write). */
+	if (std::optional<Json> result = DispatchCommandCatalog(method, params, company); result.has_value()) {
 		return FromModule(std::move(*result));
 	}
 
@@ -1894,10 +1957,11 @@ Json CameraCapabilities()
 Json Capabilities()
 {
 	std::vector<std::string> methods = {"world.info", "world.query", "world.objects", "world.pause",
-			"world.rename", "world.capture", "world.camera.get", "world.camera.set", "task.barrier", "ui.inspect"};
+			"world.rename", "world.capture", "world.camera.get", "world.camera.set", "world.commands",
+			"world.command", "task.barrier", "ui.inspect"};
 	Json modules = Json::array();
 
-	for (const Json &module : {GameToolCapabilities(), TransportToolCapabilities(), AdminToolCapabilities(), CameraCapabilities()}) {
+	for (const Json &module : {GameToolCapabilities(), TransportToolCapabilities(), AdminToolCapabilities(), CameraCapabilities(), CommandCatalogCapabilities()}) {
 		modules.push_back(module);
 		const auto entries = module.find("methods");
 		if (entries == module.end() || !entries->is_array()) continue;

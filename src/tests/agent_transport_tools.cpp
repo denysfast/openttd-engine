@@ -92,6 +92,7 @@ std::optional<InGameAgent::Json> Dispatch(const InGameAgent::Json &params)
 void CheckError(const InGameAgent::Json &params, std::string_view code, std::string_view fragment = {})
 {
 	const std::optional<InGameAgent::Json> result = InGameAgent::DispatchTransportTool("world.construct", params, TEST_COMPANY);
+	INFO("params: " << params.dump());
 	REQUIRE(result.has_value());
 	CHECK((*result)["ok"] == false);
 	CHECK((*result)["error"] == code);
@@ -255,9 +256,11 @@ TEST_CASE("agent transport tools: waypoints, conversions and the new tile ops va
 
 	/* A rail waypoint sits on a straight track and spans 1 to 255 tiles. */
 	CheckError({{"op", "waypoint"}, {"tiles", OneTile()}, {"track", "upper"}}, "invalid_arguments", "track");
-	CheckError({{"op", "waypoint"}, {"tiles", OneTile()}, {"length", 300}}, "invalid_arguments", "length");
-	CheckError({{"op", "waypoint"}, {"tiles", OneTile()}, {"length", 0}}, "invalid_arguments", "length");
-	CheckError({{"op", "waypoint"}, {"demolish", true}, {"tiles", OneTile()}, {"keep_rail", 1}}, "invalid_arguments", "keep_rail");
+	/* The axis of the waypoint is read before its length, so an explicit `track` is needed to reach
+	 * the length and keep_rail checks on a tile that carries no straight rail. */
+	CheckError({{"op", "waypoint"}, {"tiles", OneTile()}, {"track", "x"}, {"length", 300}}, "invalid_arguments", "length");
+	CheckError({{"op", "waypoint"}, {"tiles", OneTile()}, {"track", "x"}, {"length", 0}}, "invalid_arguments", "length");
+	CheckError({{"op", "waypoint"}, {"demolish", true}, {"tiles", OneTile()}, {"track", "x"}, {"keep_rail", 1}}, "invalid_arguments", "keep_rail");
 	CheckError({{"op", "waypoint"}, {"from", {{"x", 1}, {"y", 1}}}, {"to", {{"x", 3}, {"y", 4}}}}, "invalid_arguments", "from/to");
 
 	/* A conversion has to name the type it converts to. */
