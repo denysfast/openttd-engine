@@ -886,18 +886,18 @@ uint32_t TileObjectFingerprint(TileObjectKind kind, TileIndex tile)
 		case TileObjectKind::Tunnel:
 		case TileObjectKind::Water:
 		case TileObjectKind::MapObject:
-			MixFingerprint(hash, to_underlying(GetTileOwner(tile)));
+			MixFingerprint(hash, GetTileOwner(tile).base());
 			break;
 
 		case TileObjectKind::Road:
 			/* The road and the tram on one tile can belong to different companies. */
-			MixFingerprint(hash, to_underlying(GetTileOwner(tile)));
-			MixFingerprint(hash, to_underlying(GetRoadOwner(tile, RoadTramType::Road)));
+			MixFingerprint(hash, GetTileOwner(tile).base());
+			MixFingerprint(hash, GetRoadOwner(tile, RoadTramType::Road).base());
 			break;
 
 		case TileObjectKind::Tram:
-			MixFingerprint(hash, to_underlying(GetTileOwner(tile)));
-			MixFingerprint(hash, to_underlying(GetRoadOwner(tile, RoadTramType::Tram)));
+			MixFingerprint(hash, GetTileOwner(tile).base());
+			MixFingerprint(hash, GetRoadOwner(tile, RoadTramType::Tram).base());
 			break;
 
 		default:
