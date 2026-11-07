@@ -15,13 +15,12 @@
 #include "gfx_func.h"
 #include "palette_func.h"
 
-#include "safeguards.h"
-
 #include <algorithm>
 #include <cctype>
 #include <cmath>
-#include <cstring>
 #include <utility>
+
+#include "safeguards.h"
 
 /* --- SHA-256 --- */
 
@@ -250,7 +249,7 @@ std::string AgentChatSha256Hex(std::string_view data)
 	 * two blocks; the buffer is zeroed, so the padding itself is already there. */
 	uint8_t tail[128] = {};
 	const size_t remaining = data.size() - offset;
-	if (remaining > 0) std::memcpy(tail, data.data() + offset, remaining);
+	if (remaining > 0) std::copy_n(reinterpret_cast<const uint8_t *>(data.data() + offset), remaining, tail);
 	tail[remaining] = 0x80;
 	const size_t tail_size = remaining + 1 + 8 <= 64 ? 64 : 128;
 	const uint64_t bits = static_cast<uint64_t>(data.size()) * 8;
