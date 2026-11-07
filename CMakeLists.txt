@@ -293,7 +293,7 @@ if(ANDROID)
 endif()
 
 include(Catch)
-catch_discover_tests(openttd_test)
+catch_discover_tests(openttd_test PROPERTIES ENVIRONMENT "OTTD_TEST_LANGUAGE_FILE=${CMAKE_BINARY_DIR}/lang/english.lng")
 
 if(HAIKU)
     target_link_libraries(openttd_lib "be" "network" "midi")
