@@ -197,7 +197,9 @@ inline Point WorldToScreen(const Viewport &vp, int x, int y, int z)
  * A requested projection is returned as "projection":
  * - tile to screen: "coordinate_space": "screen_pixels", "tile" (index/x/y), "world"
  *   (x/y/z of the tile centre at ground height), "screen" (x/y), "in_viewport", "visible",
- *   "occluding_window" (null, or the class/number of the window covering that pixel) and
+ *   "occluding_window" (null, or the class/number of the window covering that pixel; the
+ *   finances window also names its "kind" as "finances" and reports the screen rectangle of the
+ *   close box it really has as "close_rect", omitted when the window has none) and
  *   "zoom".
  * - screen to tile: "coordinate_space": "world", "screen" (x/y), "world" (x/y as returned
  *   by TranslateXYToTileCoord(), or null when the pixel is outside the viewport), "tile"

@@ -924,6 +924,10 @@ static Json CameraJson(const ViewportData &vp)
 
 /**
  * The window that covers a screen position, when it is not the main window.
+ *
+ * Besides the class and number of the window, a window whose class a caller can recognise is
+ * named by its kind, and the close box it actually has is reported as a screen rectangle. This is
+ * a read-only description: nothing is clicked, and a window without a close box reports none.
  * @param x Screen x.
  * @param y Screen y.
  * @return The occluding window as JSON, or null when the main window is on top there.
@@ -932,10 +936,32 @@ static Json OccludingWindowJson(int x, int y)
 {
 	const Window *w = FindWindowFromPt(x, y);
 	if (w == nullptr || w->window_class == WindowClass::MainWindow) return Json(nullptr);
-	return Json{
+
+	Json occluding = Json{
 		{"class", to_underlying(w->window_class)},
 		{"number", static_cast<int32_t>(w->window_number)},
 	};
+
+	/* Name the window when its class is one a caller can recognise, so it does not have to know
+	 * the numeric value of a window class. */
+	if (w->window_class == WindowClass::Finances) occluding["kind"] = "finances";
+
+	/* The close box of the window that is actually on screen, in the same screen coordinates as
+	 * the rest of the projection. It is read from the widget tree; no offset is guessed. */
+	if (w->nested_root != nullptr) {
+		const NWidgetBase *closebox = w->nested_root->GetWidgetOfType(WWT_CLOSEBOX);
+		if (closebox != nullptr) {
+			const Rect r = closebox->GetCurrentRect();
+			occluding["close_rect"] = Json{
+				{"left", r.left + w->left},
+				{"top", r.top + w->top},
+				{"right", r.right + w->left},
+				{"bottom", r.bottom + w->top},
+			};
+		}
+	}
+
+	return occluding;
 }
 
 /**
