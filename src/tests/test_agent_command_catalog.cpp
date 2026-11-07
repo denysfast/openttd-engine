@@ -45,6 +45,12 @@ static Json CallCommand(const Json &params)
 	return *result;
 }
 
+/** One {entity, id} expected ref, the way the bridge sends them. */
+static Json Ref(const char *entity, uint64_t id)
+{
+	return Json{{"entity", entity}, {"id", id}};
+}
+
 /** Find a catalog entry by command name. */
 static const Json &FindEntry(const Json &commands, std::string_view name)
 {
@@ -233,10 +239,17 @@ TEST_CASE("AgentCommandCatalogRejectsBadArgumentsBeforePosting")
 	const Json partial = ValidateCommand("CmdBuildRoad", Arguments(1000));
 	CHECK(partial["error"].get<std::string>() == "invalid_arguments");
 
-	/* world.command itself: a valid call decodes and then needs a real company, which this call does not have. */
+	/* world.command itself: a valid call decodes, has to declare its guard, and then needs a real
+	 * company, which this call does not have. */
 	const Json valid = CallCommand({{"command", "CmdMoneyCheat"}, {"args", Arguments(100)}});
 	CHECK_FALSE(valid["ok"].get<bool>());
-	CHECK(valid["error"].get<std::string>() == "invalid_company");
+	CHECK(valid["error"].get<std::string>() == "missing_expected_targets");
+	const Json guarded = CallCommand({
+		{"command", "CmdMoneyCheat"},
+		{"args", Arguments(100)},
+		{"expected_targets", Arguments(Ref("company", 255))},
+	});
+	CHECK(guarded["error"].get<std::string>() == "invalid_company");
 
 	CHECK(CallCommand({{"command", "CmdNoSuchCommand"}, {"args", Arguments()}})["error"].get<std::string>() == "unknown_command");
 	CHECK(CallCommand({{"command", "CmdPasteBlueprint"}, {"args", Arguments(1000, 0)}})["error"].get<std::string>() == "unsupported_argument_types");
@@ -244,6 +257,339 @@ TEST_CASE("AgentCommandCatalogRejectsBadArgumentsBeforePosting")
 	CHECK(CallCommand({{"command", "CmdMoneyCheat"}, {"args", 5}})["error"].get<std::string>() == "invalid_params");
 	CHECK(CallCommand({{"command", "CmdMoneyCheat"}, {"args", Arguments(1)}, {"dry_run", 1}})["error"].get<std::string>() == "invalid_params");
 	CHECK(CallCommand({{"command", "CmdMoneyCheat"}, {"args", Arguments(1)}, {"location", -1}})["error"].get<std::string>() == "invalid_params");
+}
+
+TEST_CASE("AgentCommandCatalogDecodesStructuredArguments")
+{
+	/* EncodedString as literal text: encoded through the engine's own raw-text string. */
+	const Json text = ValidateCommand("CmdTownSetText", Arguments(5, "Hello town"));
+	REQUIRE(text["ok"].get<bool>());
+	CHECK(text["arguments"][0] == 5);
+	CHECK(text["arguments"][1]["text"].get<std::string>() == "Hello town");
+	CHECK(text["targets"][0]["entity"].get<std::string>() == "town");
+	CHECK(text["targets"][0]["id"] == 5);
+
+	/* EncodedString as a literal text object and as a StringID with parameters. */
+	const Json text_object = ValidateCommand("CmdTownSetText", Arguments(5, Json{{"text", "Object text"}}));
+	REQUIRE(text_object["ok"].get<bool>());
+	CHECK(text_object["arguments"][1]["text"].get<std::string>() == "Object text");
+
+	const Json string_id = ValidateCommand("CmdTownSetText", Arguments(5, Json{{"string_id", 1234}}));
+	REQUIRE(string_id["ok"].get<bool>());
+	CHECK(string_id["arguments"][1]["string_id"] == 1234);
+	CHECK(string_id["arguments"][1]["params"].empty());
+
+	const Json with_params = ValidateCommand("CmdTownSetText", Arguments(5, Json{
+		{"string_id", 1234},
+		{"params", Arguments("a", 5, Json{{"id", 7}}, Json{{"text", "b"}})},
+	}));
+	REQUIRE(with_params["ok"].get<bool>());
+	REQUIRE(with_params["arguments"][1]["params"].size() == 4);
+	CHECK(with_params["arguments"][1]["params"][0].get<std::string>() == "a");
+	CHECK(with_params["arguments"][1]["params"][1] == 5);
+	CHECK(with_params["arguments"][1]["params"][2]["id"] == 7);
+	CHECK(with_params["arguments"][1]["params"][3]["text"].get<std::string>() == "b");
+
+	/* Invalid nested EncodedStrings. */
+	CHECK(ValidateCommand("CmdTownSetText", Arguments(5, Json::object()))["error"].get<std::string>() == "invalid_arguments");
+	CHECK(ValidateCommand("CmdTownSetText", Arguments(5, Json{{"text", "a"}, {"string_id", 1}}))["error"].get<std::string>() == "invalid_arguments");
+	CHECK(ValidateCommand("CmdTownSetText", Arguments(5, Json{{"text", "a"}, {"params", Arguments(1)}}))["error"].get<std::string>() == "invalid_arguments");
+	CHECK(ValidateCommand("CmdTownSetText", Arguments(5, Json{{"string_id", "x"}}))["error"].get<std::string>() == "invalid_arguments");
+	CHECK(ValidateCommand("CmdTownSetText", Arguments(5, 7))["error"].get<std::string>() == "invalid_arguments");
+
+	/* Source: a town, an industry or a headquarters, both of them guarded as targets. */
+	const Json subsidy = ValidateCommand("CmdCreateSubsidy", Arguments(0, Json{{"type", "town"}, {"id", 5}}, Json{{"type", "industry"}, {"id", 7}}));
+	REQUIRE(subsidy["ok"].get<bool>());
+	CHECK(subsidy["arguments"][1]["type"].get<std::string>() == "town");
+	CHECK(subsidy["arguments"][2]["id"] == 7);
+	REQUIRE(subsidy["targets"].size() == 2);
+	CHECK(subsidy["targets"][0]["entity"].get<std::string>() == "town");
+	CHECK(subsidy["targets"][0]["id"] == 5);
+	CHECK(subsidy["targets"][1]["entity"].get<std::string>() == "industry");
+	CHECK(subsidy["targets"][1]["id"] == 7);
+
+	CHECK(ValidateCommand("CmdCreateSubsidy", Arguments(0, Json{{"type", "town"}}, Json{{"type", "town"}, {"id", 1}}))["error"].get<std::string>() == "invalid_arguments");
+	CHECK(ValidateCommand("CmdCreateSubsidy", Arguments(0, Json{{"type", "moon"}, {"id", 1}}, Json{{"type", "town"}, {"id", 1}}))["error"].get<std::string>() == "invalid_arguments");
+	CHECK(ValidateCommand("CmdCreateSubsidy", Arguments(0, Json{{"type", "town"}, {"id", 65535}}, Json{{"type", "town"}, {"id", 1}}))["error"].get<std::string>() == "invalid_arguments");
+	CHECK(ValidateCommand("CmdCreateSubsidy", Arguments(0, Json{{"type", "town"}, {"id", 70000}}, Json{{"type", "town"}, {"id", 1}}))["error"].get<std::string>() == "invalid_arguments");
+
+	/* VehicleListIdentifier: the index is the id the list is about. */
+	const Json list = ValidateCommand("CmdMassStartStopVehicle", Arguments(1000, true, false, Json{
+		{"list", "group"}, {"vtype", 0}, {"company", 1}, {"index", 3},
+	}));
+	REQUIRE(list["ok"].get<bool>());
+	CHECK(list["arguments"][3]["list"].get<std::string>() == "group");
+	CHECK(list["arguments"][3]["company"] == 1);
+	REQUIRE(list["targets"].size() == 1);
+	CHECK(list["targets"][0]["entity"].get<std::string>() == "group");
+	CHECK(list["targets"][0]["id"] == 3);
+
+	CHECK(ValidateCommand("CmdMassStartStopVehicle", Arguments(1000, true, false, Json{{"list", "nonsense"}, {"vtype", 0}, {"company", 1}, {"index", 3}}))["error"].get<std::string>() == "invalid_arguments");
+	CHECK(ValidateCommand("CmdMassStartStopVehicle", Arguments(1000, true, false, Json{{"list", "group"}, {"company", 1}, {"index", 3}}))["error"].get<std::string>() == "invalid_arguments");
+	CHECK(ValidateCommand("CmdMassStartStopVehicle", Arguments(1000, true, false, Json{{"list", "group"}, {"vtype", 4}, {"company", 1}, {"index", 3}}))["error"].get<std::string>() == "invalid_arguments");
+	CHECK(ValidateCommand("CmdMassStartStopVehicle", Arguments(1000, true, false, Json{{"list", "group"}, {"vtype", 0}, {"company", 1}}))["error"].get<std::string>() == "invalid_arguments");
+
+	/* Order: the destination is a target too, so a nested id is guarded as well. */
+	const Json order = ValidateCommand("CmdInsertOrder", Arguments(10, 0, Json{{"type", "goto_station"}, {"destination", 5}}));
+	REQUIRE(order["ok"].get<bool>());
+	CHECK(order["arguments"][2]["destination"] == 5);
+	CHECK(order["arguments"][2]["destination_entity"].get<std::string>() == "station");
+	REQUIRE(order["targets"].size() == 2);
+	CHECK(order["targets"][0]["entity"].get<std::string>() == "vehicle");
+	CHECK(order["targets"][0]["id"] == 10);
+	CHECK(order["targets"][1]["entity"].get<std::string>() == "station");
+	CHECK(order["targets"][1]["id"] == 5);
+	CHECK(order["targets"][1]["via"].get<std::string>() == "destination");
+
+	/* An order to a depot, with the depot flags of that order type. */
+	const Json depot_order = ValidateCommand("CmdInsertOrder", Arguments(10, 0, Json{
+		{"type", "goto_depot"}, {"destination", 2}, {"depot_order", 1}, {"action", 0}, {"wait_time", 100},
+	}));
+	REQUIRE(depot_order["ok"].get<bool>());
+	CHECK(depot_order["arguments"][2]["destination_entity"].get<std::string>() == "depot");
+	CHECK(depot_order["targets"][1]["entity"].get<std::string>() == "depot");
+	CHECK(depot_order["targets"][1]["id"] == 2);
+
+	/* Orders without a destination, and one that is only a marker. */
+	REQUIRE(ValidateCommand("CmdInsertOrder", Arguments(10, 0, Json{{"type", "loading"}, {"ordered", true}}))["ok"].get<bool>());
+	REQUIRE(ValidateCommand("CmdInsertOrder", Arguments(10, 0, Json{{"type", "leave_station"}}))["ok"].get<bool>());
+
+	/* Invalid nested Orders: the field checks have to be precise, not just "some error". */
+	const auto order_error = [](const Json &order_value) {
+		return ValidateCommand("CmdInsertOrder", Arguments(10, 0, order_value))["message"].get<std::string>();
+	};
+	CHECK(ValidateCommand("CmdInsertOrder", Arguments(10, 0, Json{{"type", "nonsense"}}))["error"].get<std::string>() == "invalid_arguments");
+	CHECK(order_error(Json{{"type", "goto_station"}}).find("needs 'destination'") != std::string::npos);
+	CHECK(order_error(Json{{"type", "loading"}, {"destination", 5}}).find("takes no 'destination'") != std::string::npos);
+	CHECK(order_error(Json{{"type", "goto_station"}, {"destination", 5}, {"ordered", true}}).find("takes no 'ordered'") != std::string::npos);
+	CHECK(order_error(Json{{"type", "goto_station"}, {"destination", 5}, {"depot_order", 1}}).find("takes no 'depot_order'") != std::string::npos);
+	CHECK(order_error(Json{{"type", "goto_station"}, {"destination", 5}, {"nonsense", 1}}).find("unknown order field") != std::string::npos);
+	CHECK(order_error(Json{{"type", "goto_station"}, {"destination", 70000}}).find("does not fit") != std::string::npos);
+	CHECK(order_error(Json{{"type", "goto_station"}, {"destination", -1}}).find("does not fit") != std::string::npos);
+	CHECK(order_error(Json{{"type", "goto_depot"}, {"destination", 2}, {"depot_order", 300}}).find("argument") != std::string::npos);
+
+	/* An aircraft hangar is a station, not a depot, so the caller says what the destination is and
+	 * the target follows the explicit value instead of the order type. */
+	const Json hangar = ValidateCommand("CmdInsertOrder", Arguments(10, 0, Json{
+		{"type", "goto_depot"}, {"destination", 7}, {"destination_entity", "station"},
+	}));
+	REQUIRE(hangar["ok"].get<bool>());
+	CHECK(hangar["arguments"][2]["destination_entity"].get<std::string>() == "station");
+	CHECK(hangar["targets"][1]["entity"].get<std::string>() == "station");
+	CHECK(hangar["targets"][1]["id"] == 7);
+
+	/* An explicit destination kind that the order type cannot have is rejected, not ignored. */
+	CHECK(order_error(Json{{"type", "goto_station"}, {"destination", 5}, {"destination_entity", "depot"}}).find("cannot have destination_entity") != std::string::npos);
+	CHECK(order_error(Json{{"type", "goto_depot"}, {"destination", 2}, {"destination_entity", "waypoint"}}).find("cannot have destination_entity") != std::string::npos);
+	CHECK(order_error(Json{{"type", "goto_depot"}, {"destination", 2}, {"destination_entity", 5}}).find("must be a string") != std::string::npos);
+
+	/* Enums that declare an end marker reject values outside the enum, not just values that do not
+	 * fit the storage type. */
+	const Json news_type = ValidateCommand("CmdCustomNewsItem", Arguments(15, 1, Json{{"type", "none"}}, "x"));
+	REQUIRE(news_type["ok"].get<bool>());
+	const Json bad_news_type = ValidateCommand("CmdCustomNewsItem", Arguments(16, 1, Json{{"type", "none"}}, "x"));
+	CHECK(bad_news_type["error"].get<std::string>() == "invalid_arguments");
+	CHECK(bad_news_type["message"].get<std::string>().find("not a valid NewsType") != std::string::npos);
+	CHECK(ValidateCommand("CmdCustomNewsItem", Arguments(200, 1, Json{{"type", "none"}}, "x"))["error"].get<std::string>() == "invalid_arguments");
+	REQUIRE(ValidateCommand("CmdGoalQuestion", Arguments(1, 0, false, 0, 3, "q"))["ok"].get<bool>());
+	const Json bad_question_type = ValidateCommand("CmdGoalQuestion", Arguments(1, 0, false, 0, 4, "q"));
+	CHECK(bad_question_type["error"].get<std::string>() == "invalid_arguments");
+	CHECK(bad_question_type["message"].get<std::string>().find("not a valid GoalQuestionType") != std::string::npos);
+	CHECK(ValidateCommand("CmdInsertOrder", Arguments(10, 0, 5))["error"].get<std::string>() == "invalid_arguments");
+
+	/* A std::variant argument (the news reference) names its alternative and its value. */
+	const Json news = ValidateCommand("CmdCustomNewsItem", Arguments(0, 1, Json{{"type", "town"}, {"value", 5}}, "News text"));
+	REQUIRE(news["ok"].get<bool>());
+	CHECK(news["arguments"][2]["type"].get<std::string>() == "town");
+	CHECK(news["arguments"][2]["value"] == 5);
+	REQUIRE(news["targets"].size() == 2);
+	CHECK(news["targets"][0]["entity"].get<std::string>() == "company");
+	CHECK(news["targets"][0]["id"] == 1);
+	CHECK(news["targets"][1]["entity"].get<std::string>() == "town");
+	CHECK(news["targets"][1]["id"] == 5);
+	CHECK(news["targets"][1]["via"].get<std::string>() == "value");
+
+	/* The empty alternative is the engine's monostate. */
+	const Json no_reference = ValidateCommand("CmdCustomNewsItem", Arguments(0, 1, Json{{"type", "none"}}, "News text"));
+	REQUIRE(no_reference["ok"].get<bool>());
+	REQUIRE(no_reference["targets"].size() == 1);
+	CHECK(no_reference["targets"][0]["entity"].get<std::string>() == "company");
+
+	CHECK(ValidateCommand("CmdCustomNewsItem", Arguments(0, 1, Json{{"type", "moon"}, {"value", 5}}, "x"))["error"].get<std::string>() == "invalid_arguments");
+	CHECK(ValidateCommand("CmdCustomNewsItem", Arguments(0, 1, Json{{"type", "none"}, {"value", 5}}, "x"))["error"].get<std::string>() == "invalid_arguments");
+	CHECK(ValidateCommand("CmdCustomNewsItem", Arguments(0, 1, Json{{"type", "town"}, {"value", "x"}}, "x"))["error"].get<std::string>() == "invalid_arguments");
+	CHECK(ValidateCommand("CmdCustomNewsItem", Arguments(0, 1, 5, "x"))["error"].get<std::string>() == "invalid_arguments");
+}
+
+TEST_CASE("AgentCommandCatalogGuardsExpectedTargets")
+{
+	const Json order_args = Arguments(10, 0, Json{{"type", "goto_station"}, {"destination", 5}});
+	/* Mirror a write: with a company, the actor company is a target as well. */
+	const auto validate = [](const Json &args, const Json &expected, int company = -1) {
+		Json params = {
+			{"op", "validate"},
+			{"command", "CmdInsertOrder"},
+			{"args", args},
+			{"expected_targets", expected},
+		};
+		if (company >= 0) params["company"] = company;
+		return ReadCatalog(params);
+	};
+
+	/* The complete list passes: exactly the entities the arguments name. */
+	REQUIRE(validate(order_args, Arguments(Ref("vehicle", 10), Ref("station", 5)))["ok"].get<bool>());
+
+	/* A target the arguments name but the guard does not is missing, so a write can never touch an
+	 * object the bridge did not resolve. */
+	const Json missing = validate(order_args, Arguments(Ref("vehicle", 10)));
+	CHECK(missing["error"].get<std::string>() == "target_mismatch");
+	REQUIRE(missing["detail"]["missing"].size() == 1);
+	CHECK(missing["detail"]["missing"][0]["entity"].get<std::string>() == "station");
+	CHECK(missing["detail"]["missing"][0]["id"] == 5);
+
+	/* Zero targets on a command that names two entities is missing both of them. */
+	const Json zero = validate(order_args, Json::array());
+	CHECK(zero["error"].get<std::string>() == "target_mismatch");
+	CHECK(zero["detail"]["missing"].size() == 2);
+
+	/* A guarded ref the arguments do not name is rejected too: an unrelated valid ref cannot
+	 * authorize a reused target. */
+	const Json unrelated = validate(order_args, Arguments(Ref("vehicle", 10), Ref("station", 5), Ref("station", 9)));
+	CHECK(unrelated["error"].get<std::string>() == "target_mismatch");
+	REQUIRE(unrelated["detail"]["unexpected"].size() == 1);
+	CHECK(unrelated["detail"]["unexpected"][0]["entity"].get<std::string>() == "station");
+	CHECK(unrelated["detail"]["unexpected"][0]["id"] == 9);
+	CHECK_FALSE(unrelated["detail"].contains("missing"));
+
+	/* A different, perfectly valid vehicle id is a mismatch in both directions. */
+	const Json reused = validate(order_args, Arguments(Ref("vehicle", 11), Ref("station", 5)));
+	CHECK(reused["error"].get<std::string>() == "target_mismatch");
+	REQUIRE(reused["detail"].contains("missing"));
+	REQUIRE(reused["detail"]["missing"].size() == 1);
+	CHECK(reused["detail"]["missing"][0]["id"] == 10);
+	REQUIRE(reused["detail"].contains("unexpected"));
+	REQUIRE(reused["detail"]["unexpected"].size() == 1);
+	CHECK(reused["detail"]["unexpected"][0]["id"] == 11);
+
+	/* The nested order destination is bound to the actual argument, not just to "a station". */
+	const Json wrong_destination = validate(order_args, Arguments(Ref("vehicle", 10), Ref("station", 6)));
+	CHECK(wrong_destination["error"].get<std::string>() == "target_mismatch");
+
+	/* The actor company is a target: a guard without it is incomplete. */
+	const Json without_company = validate(order_args, Arguments(Ref("vehicle", 10), Ref("station", 5)), 3);
+	CHECK(without_company["error"].get<std::string>() == "target_mismatch");
+	REQUIRE(without_company["detail"]["missing"].size() == 1);
+	CHECK(without_company["detail"]["missing"][0]["entity"].get<std::string>() == "company");
+	CHECK(without_company["detail"]["missing"][0]["id"] == 3);
+	REQUIRE(validate(order_args, Arguments(Ref("company", 3), Ref("vehicle", 10), Ref("station", 5)), 3)["ok"].get<bool>());
+
+	/* A command without an entity argument is guarded by its company alone. */
+	const auto validate_build = [](const Json &expected, int company) {
+		return ReadCatalog({
+			{"op", "validate"},
+			{"command", "CmdLandscapeClear"},
+			{"args", Arguments(1000)},
+			{"expected_targets", expected},
+			{"company", company},
+		});
+	};
+	REQUIRE(validate_build(Arguments(Ref("company", 3)), 3)["ok"].get<bool>());
+	CHECK(validate_build(Json::array(), 3)["error"].get<std::string>() == "target_mismatch");
+	CHECK(validate_build(Arguments(Ref("town", 5), Ref("company", 3)), 3)["error"].get<std::string>() == "target_mismatch");
+
+	/* A write may not omit the guard at all: the bridge only checks the refs it was given. */
+	const Json no_guard = CallCommand({
+		{"command", "CmdLandscapeClear"},
+		{"args", Arguments(1000)},
+	});
+	CHECK(no_guard["error"].get<std::string>() == "missing_expected_targets");
+	const Json with_guard = CallCommand({
+		{"command", "CmdLandscapeClear"},
+		{"args", Arguments(1000)},
+		{"expected_targets", Arguments(Ref("company", 255))},
+	});
+	/* The guard passed and the call stopped at the company check, which needs a real company. */
+	CHECK(with_guard["error"].get<std::string>() == "invalid_company");
+}
+
+TEST_CASE("AgentCommandCatalogReportsTargetsAndGaps")
+{
+	const Json catalog = ReadCatalog({{"op", "list"}});
+	const Json &commands = catalog["commands"];
+
+	/* A command that only acts on the company itself has no entity target. */
+	const Json &clear = FindEntry(commands, "CmdLandscapeClear");
+	CHECK(clear["targets"].empty());
+	CHECK(clear["target_scope"].get<std::string>() == "company");
+
+	/* A build command names the town it builds in, and nothing else. */
+	const Json &build_road = FindEntry(commands, "CmdBuildRoad");
+	REQUIRE(build_road["targets"].size() == 1);
+	CHECK(build_road["targets"][0]["index"] == 4);
+	CHECK(build_road["targets"][0]["target"]["entity"].get<std::string>() == "town");
+
+	/* A command that renames a town names exactly that town. */
+	const Json &rename_town = FindEntry(commands, "CmdRenameTown");
+	REQUIRE(rename_town["targets"].size() == 1);
+	CHECK(rename_town["targets"][0]["index"] == 0);
+	CHECK(rename_town["targets"][0]["target"]["entity"].get<std::string>() == "town");
+	CHECK(rename_town["target_scope"].get<std::string>() == "entities");
+
+	/* The variant argument lists the alternatives the decoder accepts. */
+	const Json described = ReadCatalog({{"op", "describe"}, {"command", "CmdCustomNewsItem"}});
+	const Json &news_arguments = described["commands"][0]["arguments"];
+	REQUIRE(news_arguments.size() == 4);
+	CHECK(news_arguments[2]["kind"].get<std::string>() == "variant");
+	CHECK(news_arguments[2]["supported"].get<bool>());
+	const Json &alternatives = news_arguments[2]["schema"]["type"];
+	CHECK(alternatives.size() == 7);
+	for (const char *alternative : {"none", "tile", "vehicle", "station", "industry", "town", "engine"}) {
+		CHECK(std::ranges::find(alternatives, alternative) != alternatives.end());
+	}
+	CHECK(news_arguments[2]["target"]["id_path"].get<std::string>() == "value");
+	CHECK(news_arguments[2]["target"]["entity_by"]["map"]["town"].get<std::string>() == "town");
+
+	/* The backend derives its expected refs from the published contract, not from a guess. */
+	const Json &refs = described["commands"][0]["expected_refs"];
+	CHECK(refs["required_for_write"].get<bool>());
+	CHECK(refs["set_equality"].get<bool>());
+	CHECK(refs["includes_actor_company"].get<bool>());
+	CHECK(refs["sources"].is_array());
+	const Json &order_refs = FindEntry(commands, "CmdInsertOrder")["expected_refs"];
+	REQUIRE(order_refs["sources"].size() == 2);
+	CHECK(order_refs["sources"][0]["index"] == 0);
+	CHECK(order_refs["sources"][0]["target"]["entity"].get<std::string>() == "vehicle");
+	CHECK(order_refs["sources"][0]["target"]["id_path"].is_null());
+	CHECK(order_refs["sources"][1]["index"] == 2);
+	CHECK(order_refs["sources"][1]["target"]["id_path"].get<std::string>() == "destination");
+	CHECK(order_refs["sources"][1]["target"]["entity_by"]["map"]["depot"].get<std::string>() == "depot");
+	CHECK(order_refs["sources"][1]["target"]["entity_by"]["map"]["station"].get<std::string>() == "station");
+
+	/* The structured argument types are dispatchable now. */
+	for (const char *name : {"CmdTownSetText", "CmdCreateSubsidy", "CmdInsertOrder", "CmdMassStartStopVehicle", "CmdSendVehicleToDepot"}) {
+		const Json &entry = FindEntry(commands, name);
+		CHECK(entry["support"]["supported"].get<bool>());
+		CHECK(entry["support"]["status"].get<std::string>() == "dispatchable");
+	}
+
+	/* The capability document says the same, and still reports the one real gap. */
+	const Json caps = CommandCatalogCapabilities();
+	const size_t dispatchable = caps["commands"]["dispatchable"].get<size_t>();
+	/* The milestone number: only the two BlueprintChunkData commands are gaps. */
+	CHECK(dispatchable == 156);
+	CHECK(caps["commands"]["gaps"].get<size_t>() == 2);
+	CHECK(caps["commands"]["gaps"].get<size_t>() == caps["commands"]["total"].get<size_t>() - dispatchable);
+
+	bool blueprint_gap = false;
+	for (const Json &gap : caps["gaps"]) {
+		if (gap["gap"] == "blueprint_chunk_data") {
+			blueprint_gap = true;
+			CHECK(gap["commands"].size() == 2);
+		}
+	}
+	CHECK(blueprint_gap);
+	CHECK(caps["targets"].contains("guard"));
+	CHECK(ValidateCommand("CmdPasteBlueprint", Arguments(1000, 0))["error"].get<std::string>() == "unsupported_argument_types");
 }
 
 TEST_CASE("AgentCommandCatalogReportsTruthfulCapabilities")
