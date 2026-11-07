@@ -16,12 +16,17 @@
 #include "industry.h"
 
 CommandCost CmdBuildIndustry(DoCommandFlags flags, TileIndex tile, IndustryType it, uint32_t first_layout, bool fund, uint32_t seed);
+/** Largest width and height of the area #CmdBuildIndustryArea fills. */
+static constexpr uint INDUSTRY_AREA_MAX_SIZE = 256;
+
+std::tuple<CommandCost, uint32_t> CmdBuildIndustryArea(DoCommandFlags flags, TileIndex tile, TileIndex start_tile, IndustryType it, uint32_t seed);
 CommandCost CmdIndustrySetFlags(DoCommandFlags flags, IndustryID ind_id, IndustryControlFlags ctlflags);
 CommandCost CmdIndustrySetExclusivity(DoCommandFlags flags, IndustryID ind_id, Owner company_id, bool consumer);
 CommandCost CmdIndustrySetText(DoCommandFlags flags, IndustryID ind_id, const EncodedString &text);
 CommandCost CmdIndustrySetProduction(DoCommandFlags flags, IndustryID ind_id, uint8_t prod_level, bool show_news, const EncodedString &text);
 
 DEF_CMD_TRAIT(Commands::BuildIndustry, CmdBuildIndustry, CommandFlag::Deity, CommandType::LandscapeConstruction)
+DEF_CMD_TRAIT(Commands::BuildIndustryArea, CmdBuildIndustryArea, CommandFlags({CommandFlag::Deity, CommandFlag::NoTest}), CommandType::LandscapeConstruction) // the test only plans, building stops when the money runs out
 DEF_CMD_TRAIT(Commands::IndustrySetFlags, CmdIndustrySetFlags, CommandFlag::Deity, CommandType::OtherManagement)
 DEF_CMD_TRAIT(Commands::IndustrySetExclusivity, CmdIndustrySetExclusivity, CommandFlag::Deity, CommandType::OtherManagement)
 DEF_CMD_TRAIT(Commands::IndustrySetText, CmdIndustrySetText, CommandFlags({CommandFlag::Deity, CommandFlag::StrCtrl}), CommandType::OtherManagement)

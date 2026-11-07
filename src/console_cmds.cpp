@@ -52,6 +52,8 @@
 #include "company_cmd.h"
 #include "misc_cmd.h"
 #include "industry.h"
+#include "industry_cmd.h"
+#include "core/random_func.hpp"
 #include "town.h"
 #include "town_cmd.h"
 #include "vehicle_cmd.h"
@@ -63,6 +65,7 @@
 #include "town_districts.h"
 #include "town_map.h"
 #include "station_base.h"
+#include "vehicle_base.h"
 #include "station_func.h"
 #include "station_cmd.h"
 #include "core/backup_type.hpp"
@@ -2476,6 +2479,67 @@ static bool ConGroupArea(std::span<std::string_view> argv)
 	return true;
 }
 
+/** Fund as many industries of a type as fit into an area. @copydoc IConsoleCmdProc */
+static bool ConIndustryArea(std::span<std::string_view> argv)
+{
+	if (argv.empty()) {
+		IConsolePrint(CC_HELP, "Fund as many industries of a type as fit into an area. Usage: 'industry_area <x1> <y1> <x2> <y2> <industry type> [<company>] [estimate]'.");
+		IConsolePrint(CC_HELP, "With a company (1-based) it pays like the fund window does, without one it builds for free. 'estimate' only prints the plan.");
+		return true;
+	}
+	if (argv.size() < 6 || argv.size() > 8) return false;
+	if (_game_mode != GameMode::Normal) {
+		IConsolePrint(CC_ERROR, "There is no game running.");
+		return true;
+	}
+
+	std::array<uint32_t, 5> c{};
+	for (uint i = 0; i < 5; i++) {
+		auto v = ParseInteger(argv[i + 1]);
+		if (!v.has_value()) return false;
+		c[i] = *v;
+	}
+	if (c[0] >= Map::SizeX() || c[2] >= Map::SizeX() || c[1] >= Map::SizeY() || c[3] >= Map::SizeY()) {
+		IConsolePrint(CC_ERROR, "Tile outside the map.");
+		return true;
+	}
+	if (c[4] >= NUM_INDUSTRYTYPES || !GetIndustrySpec(static_cast<IndustryType>(c[4]))->enabled) {
+		IConsolePrint(CC_ERROR, "Unknown industry type '{}'.", argv[5]);
+		return true;
+	}
+
+	bool estimate = argv.back() == "estimate";
+	size_t args = argv.size() - (estimate ? 1 : 0);
+	CompanyID company = OWNER_DEITY;
+	if (args == 7) {
+		auto number = ParseInteger(argv[6]);
+		if (!number.has_value() || *number == 0 || !Company::IsValidID(CompanyID(*number - 1))) {
+			IConsolePrint(CC_ERROR, "Unknown company '{}'.", argv[6]);
+			return true;
+		}
+		company = CompanyID(*number - 1);
+	}
+
+	IndustryType type = static_cast<IndustryType>(c[4]);
+	TileIndex start = TileXY(c[0], c[1]);
+	TileIndex end = TileXY(c[2], c[3]);
+	uint32_t seed = InteractiveRandom();
+	AutoRestoreBackup cur_company(_current_company, company);
+	if (estimate) {
+		auto [cost, count] = Command<Commands::BuildIndustryArea>::Do(DoCommandFlag::QueryCost, end, start, type, seed);
+		if (cost.Failed()) {
+			IConsolePrint(CC_ERROR, "No industry fits: {}", cost.GetErrorMessage() != INVALID_STRING_ID ? GetString(cost.GetErrorMessage()) : std::string{"error"});
+		} else {
+			IConsolePrint(CC_INFO, "Plan: {} industries, cost {}.", count, cost.GetCost());
+		}
+		return true;
+	}
+	if (!Command<Commands::BuildIndustryArea>::Post(STR_ERROR_CAN_T_CONSTRUCT_THIS_INDUSTRY, end, start, type, seed)) {
+		IConsolePrint(CC_ERROR, "Funding the industries failed.");
+	}
+	return true;
+}
+
 /** Invest money into towns, by a company or for free. @copydoc IConsoleCmdProc */
 static bool ConTownInvest(std::span<std::string_view> argv)
 {
@@ -2711,6 +2775,73 @@ static bool ConStationCatchment(std::span<std::string_view> argv)
 }
 
 /** Show the towns a station can belong to, or assign it to one of them. @copydoc IConsoleCmdProc */
+/**
+ * List the vehicles that waited longest for a path or for cargo.
+ * @param argv The arguments.
+ * @return True when the arguments were valid.
+ */
+static bool ConVehicleWaits(std::span<std::string_view> argv)
+{
+	if (argv.empty()) {
+		IConsolePrint(CC_HELP, "List vehicles by the time they waited. Usage: 'vehicle_waits [path|cargo [this|last [<count> [<company>]]]]'.");
+		IConsolePrint(CC_HELP, "Path: standing still outside stations and depots (signals, no path, blocked). Cargo: loading, but nothing to load. Times in days.");
+		return true;
+	}
+	if (argv.size() > 5) return false;
+
+	if (_game_mode == GameMode::Menu) {
+		IConsolePrint(CC_ERROR, "There is no game running.");
+		return true;
+	}
+
+	bool cargo = argv.size() > 1 && argv[1] == "cargo";
+	if (argv.size() > 1 && !cargo && argv[1] != "path") return false;
+	bool last = argv.size() > 2 && argv[2] == "last";
+	if (argv.size() > 2 && !last && argv[2] != "this") return false;
+	uint count = 20;
+	if (argv.size() > 3) {
+		auto n = ParseInteger(argv[3]);
+		if (!n.has_value()) return false;
+		count = *n;
+	}
+	std::optional<CompanyID> company;
+	if (argv.size() > 4) {
+		auto c = ParseInteger(argv[4]);
+		if (!c.has_value() || *c < 1 || !Company::IsValidID(*c - 1)) {
+			IConsolePrint(CC_ERROR, "Company '{}' does not exist.", argv[4]);
+			return true;
+		}
+		company = static_cast<CompanyID>(*c - 1);
+	}
+
+	auto key = [cargo, last](const Vehicle *v) {
+		return cargo ? (last ? v->wait_cargo_last_year : v->wait_cargo_this_year) : (last ? v->wait_path_last_year : v->wait_path_this_year);
+	};
+
+	std::vector<const Vehicle *> list;
+	uint64_t total = 0;
+	for (const Vehicle *v : Vehicle::Iterate()) {
+		if (!v->IsPrimaryVehicle() || (company.has_value() && v->owner != *company)) continue;
+		list.push_back(v);
+		total += key(v);
+	}
+	std::sort(list.begin(), list.end(), [&key](const Vehicle *a, const Vehicle *b) {
+		return key(a) != key(b) ? key(a) > key(b) : a->index < b->index;
+	});
+
+	IConsolePrint(CC_INFO, "{} vehicles, waited for {} {} year: {} days in total.", list.size(), cargo ? "cargo" : "a path", last ? "last" : "this", total / Ticks::DAY_TICKS);
+	IConsolePrint(CC_INFO, "   id company type name                            path (this/last)  cargo (this/last)");
+	static const std::string_view type_names[] = {"train", "road", "ship", "air"};
+	for (uint i = 0; i < count && i < list.size(); i++) {
+		const Vehicle *v = list[i];
+		IConsolePrint(CC_DEFAULT, "{:5} {:7} {:5} {:30} {:7} {:7}    {:7} {:7}", v->index, v->owner.base() + 1,
+				to_underlying(v->type) < 4 ? type_names[to_underlying(v->type)] : "?", GetString(STR_VEHICLE_NAME, v->index),
+				v->wait_path_this_year / Ticks::DAY_TICKS, v->wait_path_last_year / Ticks::DAY_TICKS,
+				v->wait_cargo_this_year / Ticks::DAY_TICKS, v->wait_cargo_last_year / Ticks::DAY_TICKS);
+	}
+	return true;
+}
+
 static bool ConStationTown(std::span<std::string_view> argv)
 {
 	if (argv.empty()) {
@@ -3808,7 +3939,7 @@ static bool ConRailRoute(std::span<std::string_view> argv)
 {
 	if (argv.empty()) {
 		IConsolePrint(CC_HELP, "Build a rail trunk line of parallel one-way tracks from x1,y1 to x2,y2. Usage: 'rail_route <x1> <y1> <x2> <y2> <tracks 1-30> [<company> [<options>]]'.");
-		IConsolePrint(CC_HELP, "Options, comma separated: start=x|y|ns|ew (fixed start orientation), signals=<interval|0>, water=0|1, demolish=0|1, sea=0|1, rt=<rail type label>, type=<signal type 0-5>, semaphore, plan (only show the plan).");
+		IConsolePrint(CC_HELP, "Options, comma separated: start=auto|x|y|ns|ew, terraform=0|1, signals=<interval|0>, water=0|1, demolish=0|1, sea=0|1, rt=<rail type label>, type=<signal type 0-5>, semaphore, plan (only show the plan).");
 		IConsolePrint(CC_HELP, "Company: 1-based; defaults to your company. Progress: 'blueprint_status'.");
 		return true;
 	}
@@ -3854,12 +3985,13 @@ static bool ConRailRoute(std::span<std::string_view> argv)
 			if (key == "plan") {
 				plan_only = true;
 			} else if (key == "start") {
-				if (val == "x") options.start = RailRouteStart::X;
+				if (val == "auto") options.start = RailRouteStart::Auto;
+				else if (val == "x") options.start = RailRouteStart::X;
 				else if (val == "y") options.start = RailRouteStart::Y;
 				else if (val == "ns") options.start = RailRouteStart::NS;
 				else if (val == "ew") options.start = RailRouteStart::EW;
 				else {
-					IConsolePrint(CC_ERROR, "Start must be x, y, ns or ew.");
+					IConsolePrint(CC_ERROR, "Start must be auto, x, y, ns or ew.");
 					return true;
 				}
 			} else if (key == "semaphore") {
@@ -3869,6 +4001,8 @@ static bool ConRailRoute(std::span<std::string_view> argv)
 				options.signal_interval = static_cast<uint8_t>(std::clamp<uint>(*num, 1, 255));
 			} else if (key == "type" && num.has_value() && *num < to_underlying(SignalType::End)) {
 				options.signal_type = static_cast<SignalType>(*num);
+			} else if (key == "terraform" && num.has_value()) {
+				options.terraform = *num != 0;
 			} else if (key == "water" && num.has_value()) {
 				options.remove_water = *num != 0;
 			} else if (key == "demolish" && num.has_value()) {
@@ -3890,6 +4024,7 @@ static bool ConRailRoute(std::span<std::string_view> argv)
 		}
 	}
 
+	AutoRestoreBackup<CompanyID> route_company(_current_company, company);
 	auto start = std::chrono::steady_clock::now();
 	RailRoutePlan plan = PlanRailRoute(TileXY(*x1, *y1), TileXY(*x2, *y2), options);
 	auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - start).count();
@@ -3924,6 +4059,10 @@ static bool ConRailRoute(std::span<std::string_view> argv)
 	Money available = Company::Get(company)->money;
 	if (available < e.Total()) {
 		IConsolePrint(CC_ERROR, "Not enough money: the trunk line needs about {}, the company has {}.", static_cast<int64_t>(e.Total()), static_cast<int64_t>(available));
+		return true;
+	}
+	if (plan.prepare.empty() && plan.build.empty()) {
+		IConsolePrint(CC_INFO, "The trunk line is already built.");
 		return true;
 	}
 	if (!StartConstructionJob(fmt::format("{},{} - {},{}", *x1, *y1, *x2, *y2), plan.origin, std::move(plan.prepare), std::move(plan.build), company, true)) {
@@ -4253,11 +4392,13 @@ void IConsoleStdLibRegister()
 	IConsole::CmdRegister("town_invest",             ConTownInvest);
 	IConsole::CmdRegister("town_delete",             ConTownDelete);
 	IConsole::CmdRegister("depot_clone",             ConDepotClone);
+	IConsole::CmdRegister("industry_area",           ConIndustryArea,     ConHookServerOrNoNetwork);
 	IConsole::CmdRegister("group_area",              ConGroupArea);
 	IConsole::CmdRegister("power_grid",              ConPowerGrid);
 	IConsole::CmdRegister("power_add_fuel",          ConPowerAddFuel,     ConHookServerOrNoNetwork);
 	IConsole::CmdRegister("townsim_log",             ConTownSimLog);
 	IConsole::CmdRegister("station_catchment",       ConStationCatchment, ConHookServerOrNoNetwork);
+	IConsole::CmdRegister("vehicle_waits",           ConVehicleWaits);
 	IConsole::CmdRegister("station_town",            ConStationTown,      ConHookServerOrNoNetwork);
 
 	/* networking functions */

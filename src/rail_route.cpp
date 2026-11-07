@@ -13,12 +13,10 @@
  * a straight step moves +1 u, a diagonal step +1 u and +1 v. Track pieces are named as if u were x and v were y;
  * the frame is mapped to the map by flipping and/or swapping the axes.
  *
- * Shape: the route is as straight as possible - one straight run and one diagonal run (at most one bend), in
- * the order that needs less earthworks. Demolition and filling are not avoided.
- *
- * Height: diagonal track is always level, so heights change only on straight steps, by at most one level per
- * #ROUTE_RAMP_SPACING steps. A dynamic programme over blocks of steps chooses the height at every block border,
- * minimising the earthworks of the corridor plus a cost for what has to be demolished.
+ * Shape: compare a bounded set of straight/diagonal routes with up to two bends. Reuse existing
+ * connections, avoid protected obstacles and prefer continuous tracks on the original terrain.
+ * When earthworks are necessary, a dynamic programme chooses every corner column separately;
+ * diagonal columns stay level and straight columns have gentle ramps.
  */
 
 #include "stdafx.h"
@@ -26,6 +24,8 @@
 #include <set>
 #include "rail_route.h"
 #include "bridge_map.h"
+#include "clear_map.h"
+#include "tree_map.h"
 #include "tunnelbridge_map.h"
 #include "house.h"
 #include "town_map.h"
@@ -34,6 +34,9 @@
 #include "industry_map.h"
 #include "map_func.h"
 #include "rail.h"
+#include "company_func.h"
+#include "landscape.h"
+#include "station_map.h"
 #include "road_map.h"
 #include "settings_type.h"
 #include "signal_func.h"
@@ -43,18 +46,10 @@
 
 #include "safeguards.h"
 
-/** Steps of a block of the height programme, at least; long routes use longer blocks (at most #ROUTE_MAX_BLOCKS blocks). */
-static constexpr uint ROUTE_MIN_BLOCK = 16;
-/** Maximum number of blocks of the height programme. */
-static constexpr uint ROUTE_MAX_BLOCKS = 256;
-/** A ramp tile is followed by at least this many steps before the next one (gentle gradients). */
-static constexpr uint ROUTE_RAMP_SPACING = 4;
-/** Cost of a tile that cannot be cleared, in units of earthworks (one corner one level). */
-static constexpr int64_t ROUTE_BLOCKED_COST = 2000;
-/** Width of the cleared strip on both sides of the corridor, so levelling has room; two, because a corner on the stepped edge of a diagonal run touches the tile two rows out. */
-static constexpr int ROUTE_CLEAR_MARGIN = 2;
-/** Widest cleared strip: levelling a corner by n levels reshapes the land up to n - 1 tiles beside it. */
-static constexpr int ROUTE_MAX_CLEAR_MARGIN = 16;
+/** A ramp tile is followed by at least this many steps before the next one. */
+static constexpr int ROUTE_RAMP_SPACING = 4;
+/** Cost of an obstacle which the selected options cannot remove. */
+static constexpr int64_t ROUTE_BLOCKED_COST = 1'000'000;
 
 /** Item size limit of the chunks, see #BlueprintChunkData::MAX_SIZE. */
 static constexpr size_t CHUNK_LIMIT = BlueprintChunkData::MAX_SIZE;
@@ -122,7 +117,7 @@ static Track TrackFromEdges(DiagDirection a, DiagDirection b)
 
 /**
  * Get the pieces of one track of a route in the canonical frame: a straight step is an X piece, a diagonal step
- * a Right piece and a Left piece one tile further in v. The end tile gets a final X piece.
+ * a Right piece and a Left piece one tile further in v. The end continues the last run.
  * @param steps The steps.
  * @return The pieces, in the order a train passes them.
  */
@@ -141,8 +136,30 @@ std::vector<RailRoutePiece> GetRailRoutePieces(const std::vector<RailRouteStep> 
 		}
 		u++;
 	}
-	pieces.push_back({u, v, Track::X, TrackExitdirToTrackdir(Track::X, DiagDirection::SW), static_cast<int>(steps.size())});
+	Track last = !steps.empty() && steps.back().diagonal ? Track::Right : Track::X;
+	pieces.push_back({u, v, last, TrackExitdirToTrackdir(last, last == Track::Right ? DiagDirection::SE : DiagDirection::SW), static_cast<int>(steps.size())});
 	return pieces;
+}
+
+/** Existing tracks that can be reused without changing their owner or rail type. */
+static TrackBits ExistingRouteTracks(TileIndex tile, RailType railtype)
+{
+	if (!IsPlainRailTile(tile) && !IsRailStationTile(tile)) return {};
+	if (GetTileOwner(tile) != _current_company) return {};
+	if (IsPlainRailTile(tile) && GetRailType(tile) == railtype) return GetTrackBits(tile);
+	if (IsRailStationTile(tile) && GetRailType(tile) == railtype) return TrackBits{AxisToTrack(GetRailStationAxis(tile))};
+	return {};
+}
+
+/** Height at the middle of an edge after applying its rail foundation. */
+static int RouteEdgeHeight(TileIndex tile, TrackBits bits, DiagDirection edge)
+{
+	auto [slope, z] = GetTileSlopeZ(tile);
+	Foundation foundation = GetRailFoundation(slope, bits);
+	if (foundation == Foundation::Invalid) return -1;
+	z = (z + ApplyFoundationToSlope(foundation, slope)) * TILE_HEIGHT;
+	auto [near, far] = GetSlopePixelZOnEdge(slope, edge, z);
+	return (near + far) / 2;
 }
 
 /** Context of planning one route. */
@@ -154,9 +171,9 @@ class RoutePlanner {
 	int k0; ///< Lowest offset (canonical v) of a track.
 	int k1; ///< Highest offset of a track.
 	std::vector<std::pair<int, int>> tracks; ///< Every track: its offset, and how many leading pieces it skips to start on the fixed start pieces.
-	int hlo = 0; ///< Lowest height the corridor may get.
-	int hhi = 0; ///< Highest height.
-	int end_height = 0; ///< Height at the end of the last step.
+	std::vector<int> column_height; ///< Selected corner heights; empty when the original terrain is kept.
+	std::map<TileIndex, TrackBits> track_tiles; ///< Selected route, including terminal pieces.
+	std::vector<RailRoutePiece> pieces; ///< Selected canonical track pieces.
 
 public:
 	RoutePlanner(const RailRouteOptions &options, RouteFrame frame, int length, int minor) :
@@ -194,7 +211,7 @@ public:
 	TileIndex MapTile(int u, int v) const
 	{
 		auto [x, y] = this->frame.Tile(u, v);
-		if (x < 0 || y < 0 || x >= static_cast<int>(Map::MaxX()) || y >= static_cast<int>(Map::MaxY())) return INVALID_TILE;
+		if (x < 1 || y < 1 || x + 1 >= static_cast<int>(Map::MaxX()) || y + 1 >= static_cast<int>(Map::MaxY())) return INVALID_TILE;
 		return TileXY(x, y);
 	}
 
@@ -214,6 +231,9 @@ public:
 			cost = this->options.demolish && removable ? 20 : ROUTE_BLOCKED_COST;
 		}
 		switch (GetTileType(tile)) {
+			case TileType::Railway:
+			case TileType::Station:
+				return cost + (ExistingRouteTracks(tile, this->options.railtype).Any() ? 0 : ROUTE_BLOCKED_COST);
 			case TileType::Clear:
 			case TileType::Trees:
 				return cost;
@@ -242,179 +262,238 @@ public:
 		}
 	}
 
-	/** Earthworks and obstacles of one block for every corridor height. */
-	struct BlockCost {
-		std::vector<int64_t> by_height; ///< Cost per height hlo..hhi.
-	};
-
-	/**
-	 * Compute the cost of a block for every height.
-	 * @param u0 First step of the block.
-	 * @param len Number of steps.
-	 * @param v0 Number of diagonal steps before the block.
-	 * @param diagonal Type of every step of the route.
-	 * @return The costs.
-	 */
-	BlockCost ComputeBlockCost(int u0, int len, int v0, const std::vector<bool> &diagonal) const
+	/** Build the exact footprint, without the unused lead-in of staggered diagonal starts. */
+	std::map<TileIndex, TrackBits> MakeTrackTiles(const std::vector<RailRouteStep> &steps, std::vector<RailRoutePiece> &pieces) const
 	{
-		std::array<int64_t, 256> count{};
-		int64_t obstacles = 0;
-		int v = v0;
-		for (int s = 0; s < len; s++) {
-			int u = u0 + s;
-			int rows_hi = this->k1 + (diagonal[u] ? 1 : 0);
-			for (int k = this->k0; k <= rows_hi; k++) obstacles += this->ObstacleCost(this->MapTile(u, v + k));
-			for (int k = this->k0; k <= rows_hi + 1; k++) {
-				int h = this->CornerHeight(u, v + k);
-				if (h >= 0) count[h]++;
+		pieces = GetRailRoutePieces(steps);
+		std::map<TileIndex, TrackBits> tiles;
+		for (auto [k, skip] : this->tracks) {
+			for (size_t pi = skip; pi < pieces.size(); pi++) {
+				const auto &p = pieces[pi];
+				TileIndex tile = this->MapTile(p.u, p.v + k);
+				if (tile == INVALID_TILE) return {};
+				auto [a, b] = _route_track_edges[to_underlying(p.track)];
+				Track track = TrackFromEdges(this->frame.Edge(a), this->frame.Edge(b));
+				/* Keep the end in the direction of the last run. At existing rail, use the piece
+				 * which accepts our incoming edge instead of adding a straight stub over a bend. */
+				if (pi + 1 == pieces.size()) {
+					TrackBits existing = ExistingRouteTracks(tile, this->options.railtype);
+					DiagDirection incoming = this->frame.Edge(DiagDirection::NE);
+					bool matched = false;
+					for (Track t : existing) {
+						auto [e1, e2] = _route_track_edges[to_underlying(t)];
+						if (e1 == incoming || e2 == incoming) { track = t; matched = true; break; }
+					}
+					if (!matched && existing.Any() && IsPlainRailTile(tile)) {
+						/* A perpendicular straight needs a turnout, not an unconnected crossing. */
+						Track t = *existing.begin();
+						auto [e1, e2] = _route_track_edges[to_underlying(t)];
+						DiagDirection outward = e1 == this->frame.Edge(DiagDirection::SW) || e1 == this->frame.Edge(DiagDirection::SE) ? e1 : e2;
+						track = TrackFromEdges(incoming, outward);
+					}
+				}
+				tiles[tile].Set(track);
 			}
-			if (diagonal[u]) v++;
 		}
-
-		BlockCost bc;
-		bc.by_height.resize(this->hhi - this->hlo + 1);
-		/* cost(h) = sum count[l] * |l - h|, with running sums over the levels. */
-		int64_t below_n = 0, below_sum = 0, above_n = 0, above_sum = 0;
-		for (int l = 0; l < 256; l++) {
-			above_n += count[l];
-			above_sum += count[l] * l;
-		}
-		int next = 0;
-		for (int h = this->hlo; h <= this->hhi; h++) {
-			while (next <= h && next < 256) {
-				below_n += count[next];
-				below_sum += count[next] * next;
-				above_n -= count[next];
-				above_sum -= count[next] * next;
-				next++;
-			}
-			bc.by_height[h - this->hlo] = obstacles + (below_n * h - below_sum) + (above_sum - above_n * h);
-		}
-		return bc;
+		return tiles;
 	}
 
-	/**
-	 * Choose the heights of a route with known step types: diagonal steps keep the height, straight steps may
-	 * ramp (at most one level per #ROUTE_RAMP_SPACING steps); the heights minimise earthworks and demolition.
-	 * @param diagonal Type of every step.
-	 * @param[out] steps The steps with their heights.
-	 * @return The cost of the route, or INT64_MAX when there is none.
-	 */
-	int64_t PlanHeights(const std::vector<bool> &diagonal, std::vector<RailRouteStep> &steps)
+	/** Can the entire route use the original terrain and normal rail foundations? */
+	bool KeepTerrain(const std::map<TileIndex, TrackBits> &tiles) const
 	{
-		const int range = this->hhi - this->hlo + 1;
-		const int block = std::max<int>(ROUTE_MIN_BLOCK, CeilDiv(this->length, ROUTE_MAX_BLOCKS));
-		const int blocks = CeilDiv(this->length, block);
-		constexpr int64_t INF = INT64_MAX / 4;
-
-		std::vector<int64_t> cur(range, 0), nxt(range);
-		std::vector<std::vector<int16_t>> back(blocks, std::vector<int16_t>(range, -1));
-		int v0 = 0;
-		for (int j = 0; j < blocks; j++) {
-			int u0 = j * block;
-			int len = std::min(block, this->length - u0);
-			int diag = 0;
-			for (int s = 0; s < len; s++) diag += diagonal[u0 + s] ? 1 : 0;
-			/* A block with diagonal steps keeps one height; a straight block may ramp. */
-			int max_ramp = diag > 0 ? 0 : len / static_cast<int>(ROUTE_RAMP_SPACING);
-			BlockCost bc = this->ComputeBlockCost(u0, len, v0, diagonal);
-			std::fill(nxt.begin(), nxt.end(), INF);
-			for (int h = this->hlo; h <= this->hhi; h++) {
-				int64_t c = cur[h - this->hlo];
-				if (c >= INF) continue;
-				for (int nh = std::max(this->hlo, h - max_ramp); nh <= std::min(this->hhi, h + max_ramp); nh++) {
-					int64_t total = c + bc.by_height[(h + nh) / 2 - this->hlo] + std::abs(nh - h);
-					if (total < nxt[nh - this->hlo]) {
-						nxt[nh - this->hlo] = total;
-						back[j][nh - this->hlo] = static_cast<int16_t>(h);
+		for (const auto &[tile, bits] : tiles) {
+			if (IsTileType(tile, TileType::Water)) return false;
+			if (this->options.raise_sea_level && TileHeight(tile) == 0) return false;
+			TrackBits combined = bits | ExistingRouteTracks(tile, this->options.railtype);
+			Foundation f = GetRailFoundation(GetTileSlope(tile), combined);
+			if (f == Foundation::Invalid) return false;
+			if (f != Foundation::None && !_settings_game.construction.build_on_slopes) return false;
+			TrackBits existing = ExistingRouteTracks(tile, this->options.railtype);
+			for (Track old : existing) {
+				for (DiagDirection edge : {_route_track_edges[to_underlying(old)].first, _route_track_edges[to_underlying(old)].second}) {
+					if (RouteEdgeHeight(tile, combined, edge) != RouteEdgeHeight(tile, existing, edge)) return false;
+				}
+			}
+			/* Both pieces on a shared diagonal tile need one compatible foundation. Each
+			 * internal connection must meet at the same height, including on steep land. */
+			for (Track t : bits) {
+				for (DiagDirection edge : {_route_track_edges[to_underlying(t)].first, _route_track_edges[to_underlying(t)].second}) {
+					TileIndex next = TileAddByDiagDir(tile, edge);
+					if (next >= Map::Size()) return false;
+					auto it = tiles.find(next);
+					TrackBits other = it == tiles.end() ? ExistingRouteTracks(next, this->options.railtype) : it->second | ExistingRouteTracks(next, this->options.railtype);
+					for (Track nt : other) {
+						auto [a, b] = _route_track_edges[to_underlying(nt)];
+						if (a != ReverseDiagDir(edge) && b != ReverseDiagDir(edge)) continue;
+						if (RouteEdgeHeight(tile, combined, edge) != RouteEdgeHeight(next, other, ReverseDiagDir(edge))) return false;
 					}
 				}
 			}
-			std::swap(cur, nxt);
-			v0 += diag;
 		}
+		return true;
+	}
 
-		int best_h = -1;
-		int64_t best = INF;
-		for (int h = this->hlo; h <= this->hhi; h++) {
-			if (cur[h - this->hlo] < best) {
-				best = cur[h - this->hlo];
-				best_h = h;
+	/** Actual corners touched by the track, indexed by canonical column. */
+	std::vector<std::set<int>> CornerRows(const std::vector<RailRoutePiece> &pieces) const
+	{
+		std::vector<std::set<int>> rows(this->length + 2);
+		for (auto [k, skip] : this->tracks) {
+			for (size_t pi = skip; pi < pieces.size(); pi++) {
+				const auto &p = pieces[pi];
+				for (int c : {p.u, p.u + 1}) {
+					rows[c].insert(p.v + k);
+					rows[c].insert(p.v + k + 1);
+				}
 			}
 		}
-		if (best_h < 0) return INT64_MAX;
-
-		std::vector<int> border(blocks + 1);
-		border[blocks] = best_h;
-		for (int j = blocks - 1; j >= 0; j--) border[j] = back[j][border[j + 1] - this->hlo];
-
-		steps.assign(this->length, {});
-		for (int j = 0; j < blocks; j++) {
-			int u0 = j * block;
-			int len = std::min(block, this->length - u0);
-			int dh = border[j + 1] - border[j];
-			for (int s = 0; s < len; s++) {
-				RailRouteStep &step = steps[u0 + s];
-				step.diagonal = diagonal[u0 + s];
-				/* Ramps spread evenly over the block (only straight blocks ramp). */
-				step.height = border[j] + dh * s / len;
-			}
-		}
-		this->end_height = best_h;
-		return best;
+		return rows;
 	}
 
 	/**
-	 * Find the steps of the route. The route is as straight as possible: at most one bend, a straight run and
-	 * a diagonal run in the order that needs less earthworks; demolition and filling do not matter.
-	 * @param[out] steps The steps.
-	 * @return False when no route was found.
+	 * Choose each corner column separately. Height changes are allowed only under straight
+	 * rail, with four tiles between ramps. Costs use the actual columns (including both
+	 * ends), rather than the average height of a sixteen-tile block. Existing infrastructure
+	 * pins its corners, so a new route cannot excavate its connections.
 	 */
+	int64_t PlanHeights(const std::vector<RailRouteStep> &steps, const std::vector<RailRoutePiece> &pieces,
+			const std::map<TileIndex, TrackBits> &tiles, std::vector<int> &heights) const
+	{
+		const auto rows = this->CornerRows(pieces);
+		int lo = INT_MAX, hi = 0;
+		std::map<TileIndex, int> pinned;
+		for (const auto &[tile, bits] : tiles) {
+			if (ExistingRouteTracks(tile, this->options.railtype).None()) continue;
+			for (uint dx : {0, 1}) for (uint dy : {0, 1}) {
+				TileIndex corner = TileXY(TileX(tile) + dx, TileY(tile) + dy);
+				pinned[corner] = TileHeight(corner);
+			}
+		}
+		for (int c = 0; c <= this->length + 1; c++) {
+			for (int v : rows[c]) {
+				int h = this->CornerHeight(c, v);
+				if (h < 0) return INT64_MAX;
+				lo = std::min(lo, h);
+				hi = std::max(hi, h);
+			}
+		}
+		lo = std::max(lo, this->options.raise_sea_level ? 1 : 0);
+		hi = std::max(lo, hi);
+		if (hi > _settings_game.construction.map_height_limit) return INT64_MAX;
+		const int range = hi - lo + 1;
+		const int states = range * ROUTE_RAMP_SPACING;
+		constexpr int64_t INF = INT64_MAX / 4;
+		std::vector<int64_t> cur(states, INF), next(states, INF);
+		std::vector<std::vector<int16_t>> back(this->length + 2, std::vector<int16_t>(states, -1));
+		for (int h = lo; h <= hi; h++) cur[(h - lo) * ROUTE_RAMP_SPACING] = 0;
+		for (int c = 0; c <= this->length + 1; c++) {
+			std::vector<int64_t> cost(range, 0);
+			for (int v : rows[c]) {
+				auto [x, y] = this->frame.Corner(c, v);
+				TileIndex corner = TileXY(x, y);
+				int old = TileHeight(corner);
+				/* Protect infrastructure beside the route as well as underneath it. */
+				bool protect = pinned.contains(corner);
+				for (int dx : {-1, 0}) for (int dy : {-1, 0}) {
+					TileIndex neighbour = TileXY(x + dx, y + dy);
+					if (ExistingRouteTracks(neighbour, this->options.railtype).Any() || this->ObstacleCost(neighbour) >= ROUTE_BLOCKED_COST) protect = true;
+				}
+				for (int h = lo; h <= hi; h++) {
+					int d = std::abs(old - h);
+					cost[h - lo] = protect && d != 0 ? INF : std::min(INF, cost[h - lo] + 8 * d + 2 * d * d);
+				}
+			}
+			/* Score column c, then advance across tile column c. A bend and the end
+			 * tile stay level; unused lead-in columns are left unconstrained. */
+			std::fill(next.begin(), next.end(), INF);
+			for (int state = 0; state < states; state++) {
+				int h = state / ROUTE_RAMP_SPACING + lo;
+				int cooldown = state % ROUTE_RAMP_SPACING;
+				int64_t base = cur[state] + cost[h - lo];
+				if (base >= INF) continue;
+				bool ramp = c < this->length && !steps[c].diagonal;
+				for (int dh : {0, -1, 1}) {
+					if (dh != 0 && (!ramp || cooldown != 0)) continue;
+					int nh = h + dh;
+					if (nh < lo || nh > hi) continue;
+					int ns = (nh - lo) * ROUTE_RAMP_SPACING + (dh == 0 ? std::max(0, cooldown - 1) : ROUTE_RAMP_SPACING - 1);
+					int64_t value = base + (dh == 0 ? 0 : 2);
+					if (value < next[ns]) { next[ns] = value; back[c][ns] = state; }
+				}
+			}
+			cur.swap(next);
+		}
+		auto best = std::min_element(cur.begin(), cur.end());
+		if (*best >= INF) return INT64_MAX;
+		heights.resize(this->length + 2);
+		int state = best - cur.begin();
+		for (int c = this->length + 1; c >= 0; c--) {
+			state = back[c][state];
+			heights[c] = lo + state / ROUTE_RAMP_SPACING;
+		}
+		return *best;
+	}
+
+	/** Try a bounded set of routes with up to two bends, favouring terrain that needs no changes. */
 	bool PlanSteps(std::vector<RailRouteStep> &steps)
 	{
-		/* Height range: the terrain under the corridor, at least one level above the sea when asked. */
-		int tmin = INT_MAX, tmax = 0;
-		for (int u = 0; u <= this->length + 1; u += std::max(1, this->length / 512)) {
-			for (int v = this->k0; v <= this->minor + this->k1 + 2; v += std::max(1, (this->minor + this->options.tracks) / 64)) {
-				int h = this->CornerHeight(u, v);
-				if (h < 0) continue;
-				tmin = std::min(tmin, h);
-				tmax = std::max(tmax, h);
-			}
-		}
-		if (tmin == INT_MAX) return false;
-		int floor = this->options.raise_sea_level ? 1 : 0;
-		this->hlo = std::max(tmin, floor);
-		this->hhi = std::clamp(tmax, this->hlo, static_cast<int>(_settings_game.construction.map_height_limit));
-
 		int64_t best = INT64_MAX;
-		int best_end = 0;
+		std::set<std::vector<bool>> shapes;
+		const bool straight_start = this->options.start == RailRouteStart::X || this->options.start == RailRouteStart::Y;
+		const bool diagonal_start = this->options.start == RailRouteStart::NS || this->options.start == RailRouteStart::EW;
 		for (bool diagonal_first : {false, true}) {
-			/* Without a straight or without a diagonal part both orders are the same route. */
-			if (diagonal_first && (this->minor == 0 || this->minor == this->length)) break;
-			/* A fixed start orientation fixes the order: a straight start begins with the straight run, a diagonal one with the diagonal run. */
-			RailRouteStart start = this->options.start;
-			bool straight_start = start == RailRouteStart::X || start == RailRouteStart::Y;
-			bool diagonal_start = start == RailRouteStart::NS || start == RailRouteStart::EW;
-			if ((straight_start && diagonal_first) || (diagonal_start && !diagonal_first && this->minor != this->length)) continue;
-			std::vector<bool> diagonal(this->length);
-			for (int u = 0; u < this->length; u++) diagonal[u] = diagonal_first ? u < this->minor : u >= this->length - this->minor;
-			std::vector<RailRouteStep> candidate;
-			int64_t cost = this->PlanHeights(diagonal, candidate);
-			if (cost < best) {
-				best = cost;
-				steps = std::move(candidate);
-				best_end = this->end_height;
+			if ((straight_start && diagonal_first) || (diagonal_start && !diagonal_first)) continue;
+			int outside = diagonal_first ? this->minor : this->length - this->minor;
+			int inside = this->length - outside;
+			for (int split : {outside, 0, outside / 4, outside / 2, outside * 3 / 4}) {
+				if (this->options.start != RailRouteStart::Auto && split == 0) continue;
+				int required = 1;
+				for (auto [k, skip] : this->tracks) required = std::max(required, diagonal_first ? skip / 2 + 1 : skip + 1);
+				if (split < required && this->options.start != RailRouteStart::Auto) continue;
+				std::vector<bool> shape(this->length, diagonal_first);
+				std::fill(shape.begin() + split, shape.begin() + split + inside, !diagonal_first);
+				shapes.insert(std::move(shape));
 			}
 		}
-		this->end_height = best_end;
+		for (const auto &shape : shapes) {
+			std::vector<RailRouteStep> candidate(this->length);
+			int bends = 0;
+			for (int c = 0; c < this->length; c++) {
+				candidate[c].diagonal = shape[c];
+				if (c > 0 && shape[c] != shape[c - 1]) bends++;
+			}
+			std::vector<RailRoutePiece> candidate_pieces;
+			auto tiles = this->MakeTrackTiles(candidate, candidate_pieces);
+			if (tiles.empty()) continue;
+			int64_t obstacles = 0;
+			bool blocked = false;
+			for (const auto &[tile, bits] : tiles) {
+				int64_t cost = this->ObstacleCost(tile);
+				if (cost >= ROUTE_BLOCKED_COST) { blocked = true; break; }
+				TrackBits existing = ExistingRouteTracks(tile, this->options.railtype);
+				if (existing.Any() && bits != (bits & existing)) {
+					if (IsRailStationTile(tile) || (HasSignals(tile) && TracksOverlap(bits | existing))) { blocked = true; break; }
+				}
+				obstacles += cost;
+			}
+			if (blocked) continue;
+			std::vector<int> heights;
+			int64_t cost = this->KeepTerrain(tiles) ? 0 : this->options.terraform ? this->PlanHeights(candidate, candidate_pieces, tiles, heights) : INT64_MAX;
+			if (cost == INT64_MAX) continue;
+			cost += obstacles * 8 + bends;
+			if (cost >= best) continue;
+			best = cost;
+			steps = std::move(candidate);
+			this->pieces = std::move(candidate_pieces);
+			this->track_tiles = std::move(tiles);
+			this->column_height = std::move(heights);
+			/* With no obstacles or earthworks and the minimum number of bends, no later
+			 * candidate can improve this route. Keep previews of long flat lines cheap. */
+			if (best == (this->minor == 0 || this->minor == this->length ? 0 : 1)) break;
+		}
 		return best != INT64_MAX;
 	}
 
-	/**
-	 * Plan the route.
-	 * @param plan The plan to fill.
-	 */
+	/** Plan clearing, necessary earthworks, new pieces and new signals, in that order. */
 	void Plan(RailRoutePlan &plan)
 	{
 		std::vector<RailRouteStep> steps;
@@ -423,222 +502,116 @@ public:
 			return;
 		}
 		plan.length = this->length;
-		for (size_t s = 1; s < steps.size(); s++) {
-			if (steps[s].diagonal != steps[s - 1].diagonal) plan.bends++;
-		}
-		/* Height of corner column c: the height at the start of step c; after the last step the end height. */
-		std::vector<int> column_height(this->length + 2);
-		for (int c = 0; c <= this->length + 1; c++) column_height[c] = c < this->length ? steps[c].height : this->end_height;
-		plan.min_height = *std::min_element(column_height.begin(), column_height.end());
-		plan.max_height = *std::max_element(column_height.begin(), column_height.end());
-
-		/* Rows of tiles of every column: column c holds the tiles of step c (two rows more for a diagonal step). */
-		std::vector<std::pair<int, int>> tile_rows(this->length + 1);
-		int v = 0;
-		for (int c = 0; c <= this->length; c++) {
-			bool diagonal = c < this->length && steps[c].diagonal;
-			tile_rows[c] = {v + this->k0, v + this->k1 + (diagonal ? 1 : 0)};
-			if (diagonal) v++;
-		}
-
-		/* Cleared strip beside every column: wider where the corridor cuts deep or fills high. */
-		std::vector<int> margin(this->length + 1);
-		for (int c = 0; c <= this->length; c++) {
-			int depth = 0;
-			for (int cc : {c, c + 1}) {
-				for (int k = tile_rows[c].first; k <= tile_rows[c].second + 1; k++) {
-					int h = this->CornerHeight(cc, k);
-					if (h >= 0) depth = std::max(depth, std::abs(h - column_height[cc]));
-				}
+		for (size_t s = 1; s < steps.size(); s++) if (steps[s].diagonal != steps[s - 1].diagonal) plan.bends++;
+		plan.tracks.assign(this->track_tiles.begin(), this->track_tiles.end());
+		int minx = INT_MAX, miny = INT_MAX;
+		for (const auto &[tile, bits] : this->track_tiles) {
+			if (TileX(tile) < 1 || TileY(tile) < 1 || TileX(tile) + 1 >= Map::MaxX() || TileY(tile) + 1 >= Map::MaxY()) {
+				plan.error = "the corridor does not fit on the map";
+				return;
 			}
-			margin[c] = std::min(ROUTE_CLEAR_MARGIN + std::max(depth - 1, 0), ROUTE_MAX_CLEAR_MARGIN);
-		}
-
-		/* Bounding box on the map (with the cleared strip) and the origin of all chunks. */
-		int minx = INT_MAX, miny = INT_MAX, maxx = INT_MIN, maxy = INT_MIN;
-		for (int c = -margin[0]; c <= this->length + margin[this->length]; c++) {
-			int t = std::clamp(c, 0, this->length);
-			for (int k : {tile_rows[t].first - margin[t], tile_rows[t].second + margin[t]}) {
-				auto [x, y] = this->frame.Tile(c, k);
-				minx = std::min(minx, x);
-				maxx = std::max(maxx, x);
-				miny = std::min(miny, y);
-				maxy = std::max(maxy, y);
-			}
-		}
-		if (minx < 1 || miny < 1 || maxx >= static_cast<int>(Map::MaxX()) - 1 || maxy >= static_cast<int>(Map::MaxY()) - 1) {
-			plan.error = "the corridor does not fit on the map";
-			return;
+			minx = std::min<int>(minx, TileX(tile));
+			miny = std::min<int>(miny, TileY(tile));
 		}
 		plan.origin = TileXY(minx, miny);
-
-		/* Track pieces of all tracks. */
-		std::vector<RailRoutePiece> pieces = GetRailRoutePieces(steps);
-		std::map<TileIndex, TrackBits> track_tiles;
-		struct SignalPos { TileIndex tile; Track track; Trackdir trackdir; };
-		std::vector<SignalPos> signals;
-		for (auto [k, skip] : this->tracks) {
-			for (size_t pi = skip; pi < pieces.size(); pi++) {
-				const RailRoutePiece &piece = pieces[pi];
-				TileIndex tile = this->MapTile(piece.u, piece.v + k);
-				if (tile == INVALID_TILE) continue;
-				auto [e1, e2] = _route_track_edges[to_underlying(piece.track)];
-				Track track = TrackFromEdges(this->frame.Edge(e1), this->frame.Edge(e2));
-				Trackdir trackdir = TrackExitdirToTrackdir(track, this->frame.Edge(TrackdirToExitdir(piece.trackdir)));
-				track_tiles[tile].Set(track);
-				/* One signal per track at its first piece, then every interval steps on the first piece of the step. */
-				bool first_piece = piece.track != Track::Left;
-				int steps_in = piece.step - pieces[skip].step;
-				if (this->options.signals && (pi == skip || (first_piece && steps_in > 0 && steps_in % std::max<int>(this->options.signal_interval, 1) == 0))) {
-					signals.push_back({tile, track, trackdir});
-				}
-			}
-		}
-		plan.tracks.assign(track_tiles.begin(), track_tiles.end());
-
-		/* --- Prepare chunks: clearing, then levelling. --- */
-		ChunkWriter prepare(plan.prepare);
-		uint8_t clear_flags = (this->options.remove_water ? 1 << to_underlying(RailRouteClearFlag::Water) : 0) |
+		plan.min_height = INT_MAX;
+		std::set<IndustryID> industries;
+		ChunkWriter prepare(plan.prepare), build(plan.build);
+		const uint8_t clear_flags = (this->options.remove_water ? 1 << to_underlying(RailRouteClearFlag::Water) : 0) |
 				(this->options.demolish ? 1 << to_underlying(RailRouteClearFlag::Demolish) : 0);
-		auto emit_rect = [&](RailRouteItemKind kind, int c_from, int c_to, int row_lo, int row_hi, bool corners, int height) {
-			/* Canonical columns c_from..c_to, rows row_lo..row_hi -> map rectangle. */
-			auto [x1, y1] = corners ? this->frame.Corner(c_from, row_lo) : this->frame.Tile(c_from, row_lo);
-			auto [x2, y2] = corners ? this->frame.Corner(c_to, row_hi) : this->frame.Tile(c_to, row_hi);
-			int x = std::min(x1, x2), y = std::min(y1, y2);
-			int w = std::abs(x2 - x1) + 1, h = std::abs(y2 - y1) + 1;
-			std::vector<uint8_t> &item = prepare.Begin();
+		auto emit_prepare = [&](RailRouteItemKind kind, TileIndex tile, int height) {
+			auto &item = prepare.Begin();
 			item.push_back(to_underlying(kind));
-			auto u16 = [&](int val) { item.push_back(GB(val, 0, 8)); item.push_back(GB(val, 8, 8)); };
-			u16(x - minx); u16(y - miny); u16(w); u16(h);
-			item.push_back(static_cast<uint8_t>(kind == RailRouteItemKind::Clear ? 0 : height));
-			item.push_back(clear_flags);
+			auto u16 = [&](uint val) { item.push_back(GB(val, 0, 8)); item.push_back(GB(val, 8, 8)); };
+			u16(TileX(tile) - minx); u16(TileY(tile) - miny); u16(1); u16(1);
+			item.push_back(height); item.push_back(clear_flags);
 			prepare.Commit();
 		};
-
-		/* Clear: runs of columns with the same rows. */
-		for (int c = 0; c <= this->length;) {
-			int e = c;
-			while (e + 1 <= this->length && tile_rows[e + 1] == tile_rows[c] && margin[e + 1] == margin[c]) e++;
-			emit_rect(RailRouteItemKind::Clear, c, e, tile_rows[c].first - margin[c], tile_rows[c].second + margin[c], false, 0);
-			c = e + 1;
-		}
-
-		/* Clear beyond both ends too: the corners of the first and the last column touch the tiles outside. */
-		emit_rect(RailRouteItemKind::Clear, -margin[0], -1, tile_rows[0].first - margin[0], tile_rows[0].second + margin[0], false, 0);
-		emit_rect(RailRouteItemKind::Clear, this->length + 1, this->length + margin[this->length],
-				tile_rows[this->length].first - margin[this->length], tile_rows[this->length].second + margin[this->length], false, 0);
-
-		/* Level: corner column c spans the corners of the tiles of columns c - 1 and c. */
-		std::vector<std::pair<int, int>> corner_rows(this->length + 2);
-		for (int c = 0; c <= this->length + 1; c++) {
-			int lo = INT_MAX, hi = INT_MIN;
-			for (int t : {c - 1, c}) {
-				if (t < 0 || t > this->length) continue;
-				lo = std::min(lo, tile_rows[t].first);
-				hi = std::max(hi, tile_rows[t].second + 1);
+		/* Clear only obstacles on actual track tiles. Terraforming clears a neighbour only
+		 * when a dry run identifies that specific neighbour as blocking the operation. */
+		for (const auto &[tile, bits] : this->track_tiles) {
+			int h = GetTileZ(tile);
+			plan.min_height = std::min(plan.min_height, h);
+			plan.max_height = std::max<int>(plan.max_height, GetTileMaxZ(tile));
+			if (this->ObstacleCost(tile) == 0) continue;
+			emit_prepare(RailRouteItemKind::Clear, tile, 0);
+			switch (GetTileType(tile)) {
+				case TileType::Water: plan.estimate.water++; plan.estimate.clearing += _price[Price::ClearWater]; break;
+				case TileType::House: plan.estimate.houses++; plan.estimate.clearing += HouseSpec::Get(GetHouseType(tile))->GetRemovalCost(); break;
+				case TileType::Industry:
+					if (industries.insert(GetIndustryIndex(tile)).second) plan.estimate.clearing += GetIndustrySpec(Industry::GetByTile(tile)->type)->GetRemovalCost();
+					break;
+				default: plan.estimate.clearing += _price[Price::ClearRoad]; break;
 			}
-			corner_rows[c] = {lo, hi};
 		}
-		for (int c = 0; c <= this->length + 1;) {
-			int e = c;
-			while (e + 1 <= this->length + 1 && corner_rows[e + 1] == corner_rows[c] && column_height[e + 1] == column_height[c]) e++;
-			emit_rect(RailRouteItemKind::Level, c, e, corner_rows[c].first, corner_rows[c].second, true, column_height[c]);
-			c = e + 1;
-		}
-
-		/* --- Build chunks: track, then signals (blueprint item format, see blueprint.h). --- */
-		ChunkWriter build(plan.build);
-		for (const auto &[tile, bits] : track_tiles) {
-			std::vector<uint8_t> &item = build.Begin();
-			item.push_back(to_underlying(BlueprintItemKind::Track));
-			auto u16 = [&](int val) { item.push_back(GB(val, 0, 8)); item.push_back(GB(val, 8, 8)); };
-			u16(TileX(tile) - minx); u16(TileY(tile) - miny);
-			item.push_back(this->options.railtype);
-			item.push_back(bits.base());
-			build.Commit();
-		}
-		for (const SignalPos &s : signals) {
-			std::vector<uint8_t> &item = build.Begin();
-			item.push_back(to_underlying(BlueprintItemKind::Signal));
-			auto u16 = [&](int val) { item.push_back(GB(val, 0, 8)); item.push_back(GB(val, 8, 8)); };
-			u16(TileX(s.tile) - minx); u16(TileY(s.tile) - miny);
-			item.push_back(to_underlying(s.track));
-			item.push_back(to_underlying(this->options.signal_type));
-			item.push_back(to_underlying(this->options.signal_variant));
-			item.push_back(SignalAlongTrackdir(s.trackdir));
-			build.Commit();
-		}
-
-		this->Estimate(plan, tile_rows, margin, corner_rows, column_height, pieces.size() * this->tracks.size(), signals.size());
-	}
-
-	/** Estimate the costs of the route. */
-	void Estimate(RailRoutePlan &plan, const std::vector<std::pair<int, int>> &tile_rows, const std::vector<int> &margin, const std::vector<std::pair<int, int>> &corner_rows,
-			const std::vector<int> &column_height, size_t pieces, size_t signals)
-	{
-		RailRouteEstimate &est = plan.estimate;
-		std::set<IndustryID> industries;
-		for (int c = 0; c <= this->length; c++) {
-			for (int k = tile_rows[c].first - margin[c]; k <= tile_rows[c].second + margin[c]; k++) {
-				TileIndex tile = this->MapTile(c, k);
-				if (tile == INVALID_TILE) continue;
-				/* Beside the corridor only what is in the way is cleared; the land itself is left. */
-				bool beside = k < tile_rows[c].first || k > tile_rows[c].second;
-				if (beside && (GetTileType(tile) == TileType::Clear || GetTileType(tile) == TileType::Trees || this->ObstacleCost(tile) >= ROUTE_BLOCKED_COST)) continue;
-				switch (GetTileType(tile)) {
-					case TileType::Clear: est.clearing += _price[Price::ClearGrass]; break;
-					case TileType::Trees: est.clearing += _price[Price::ClearTrees]; break;
-					case TileType::Water:
-						if (this->options.remove_water) {
-							est.clearing += _price[Price::ClearWater];
-							est.water++;
-						} else {
-							est.blocked++;
-						}
-						break;
-					case TileType::House:
-						if (this->options.demolish) {
-							est.clearing += HouseSpec::Get(GetHouseType(tile))->GetRemovalCost();
-							est.houses++;
-						} else {
-							est.blocked++;
-						}
-						break;
-					case TileType::Industry:
-						if (this->options.demolish) {
-							if (industries.insert(GetIndustryIndex(tile)).second) est.clearing += GetIndustrySpec(Industry::GetByTile(tile)->type)->GetRemovalCost();
-						} else {
-							est.blocked++;
-						}
-						break;
-					default:
-						if (this->ObstacleCost(tile) >= ROUTE_BLOCKED_COST) {
-							est.blocked++;
-						} else {
-							est.clearing += _price[Price::ClearRoad];
-						}
-						break;
+		plan.estimate.industries = industries.size();
+		/* Lower first, then raise. Emit each changed corner once; no eager margin clearing
+		 * or repeated levelling of already correct columns. */
+		if (!this->column_height.empty()) {
+			auto rows = this->CornerRows(this->pieces);
+			plan.min_height = *std::min_element(this->column_height.begin(), this->column_height.end());
+			plan.max_height = *std::max_element(this->column_height.begin(), this->column_height.end());
+			for (bool raising : {false, true}) {
+				for (int c = 0; c <= this->length + 1; c++) {
+					for (int v : rows[c]) {
+						auto [x, y] = this->frame.Corner(c, v);
+						TileIndex tile = TileXY(x, y);
+						int old = TileHeight(tile), h = this->column_height[c];
+						if (old == h || (h > old) != raising) continue;
+						emit_prepare(RailRouteItemKind::Level, tile, h);
+						int d = std::abs(h - old);
+						plan.estimate.terraform += _price[Price::Terraform] * d * (d + 1);
+					}
 				}
 			}
 		}
-		est.industries = static_cast<uint>(industries.size());
-		/* Demolition in towns costs more than the removal prices: the knock-on terraforming hits houses and roads beside. */
-		est.clearing = est.clearing * 6 / 5;
-
-		int64_t levels = 0;
-		for (int c = 0; c <= this->length + 1; c++) {
-			for (int k = corner_rows[c].first; k <= corner_rows[c].second; k++) {
-				int h = this->CornerHeight(c, k);
-				if (h < 0) continue;
-				int d = std::abs(h - column_height[c]);
-				levels += d;
-				/* A corner on the edge drags the land beside it along: a slope of d - 1 + d - 2 + ... levels. */
-				if (k == corner_rows[c].first || k == corner_rows[c].second) levels += static_cast<int64_t>(d) * (d - 1) / 2;
+		for (const auto &[tile, bits] : this->track_tiles) {
+			TrackBits missing = TrackBits{bits}.Reset(ExistingRouteTracks(tile, this->options.railtype));
+			if (missing.None()) continue;
+			auto &item = build.Begin();
+			item.push_back(to_underlying(BlueprintItemKind::Track));
+			auto u16 = [&](uint val) { item.push_back(GB(val, 0, 8)); item.push_back(GB(val, 8, 8)); };
+			u16(TileX(tile) - minx); u16(TileY(tile) - miny);
+			item.push_back(this->options.railtype); item.push_back(missing.base());
+			build.Commit();
+			for ([[maybe_unused]] Track t : missing) plan.estimate.track += RailBuildCost(this->options.railtype);
+			if (IsTileType(tile, TileType::Clear)) {
+				/* Normal rail construction also pays for the grass, rocks, fields or snow. */
+				static constexpr std::array<Price, 6> prices = {Price::ClearGrass, Price::ClearRough, Price::ClearRocks,
+					Price::ClearFields, Price::ClearRough, Price::ClearRough};
+				ClearGround ground = GetClearGround(tile);
+				if (IsSnowTile(tile) || ground != ClearGround::Grass || GetClearDensity(tile) != 0) plan.estimate.clearing += _price[prices[to_underlying(ground)]];
+				if (IsSnowTile(tile)) plan.estimate.clearing += std::abs(_price[Price::ClearRough] - _price[Price::ClearGrass]);
+			} else if (IsTileType(tile, TileType::Trees)) {
+				uint count = GetTreeCount(tile);
+				if (IsInsideMM(GetTreeType(tile), TREE_RAINFOREST, TREE_CACTUS)) count *= 4;
+				plan.estimate.clearing += _price[Price::ClearTrees] * count;
+			}
+			if (GetRailFoundation(GetTileSlope(tile), bits) != Foundation::None) plan.estimate.track += _price[Price::BuildFoundation];
+		}
+		if (!this->options.signals) return;
+		for (auto [k, skip] : this->tracks) {
+			for (size_t pi = skip; pi < this->pieces.size(); pi++) {
+				const auto &p = this->pieces[pi];
+				int distance = p.step - this->pieces[skip].step;
+				if (pi != static_cast<size_t>(skip) && (p.track == Track::Left || distance <= 0 || distance % std::max<int>(this->options.signal_interval, 1) != 0)) continue;
+				TileIndex tile = this->MapTile(p.u, p.v + k);
+				/* Existing signals and junctions belong to the player: never reverse them. */
+				if (ExistingRouteTracks(tile, this->options.railtype).Any() || TracksOverlap(this->track_tiles.at(tile))) continue;
+				auto [a, b] = _route_track_edges[to_underlying(p.track)];
+				Track track = TrackFromEdges(this->frame.Edge(a), this->frame.Edge(b));
+				if (!this->track_tiles.at(tile).Test(track)) continue;
+				Trackdir td = TrackExitdirToTrackdir(track, this->frame.Edge(TrackdirToExitdir(p.trackdir)));
+				auto &item = build.Begin();
+				item.push_back(to_underlying(BlueprintItemKind::Signal));
+				auto u16 = [&](uint val) { item.push_back(GB(val, 0, 8)); item.push_back(GB(val, 8, 8)); };
+				u16(TileX(tile) - minx); u16(TileY(tile) - miny);
+				item.push_back(to_underlying(track)); item.push_back(to_underlying(this->options.signal_type));
+				item.push_back(to_underlying(this->options.signal_variant)); item.push_back(SignalAlongTrackdir(td));
+				build.Commit();
+				plan.estimate.track += _price[Price::BuildSignals];
 			}
 		}
-		/* Plus a margin for the knock-on effects at the ends and on diagonal edges. */
-		est.terraform = _price[Price::Terraform] * levels * 2;
-		est.track = RailBuildCost(this->options.railtype) * static_cast<int64_t>(pieces) + _price[Price::BuildSignals] * static_cast<int64_t>(signals);
 	}
 
 private:
@@ -703,6 +676,18 @@ static RouteFrame GetStartReferenceFrame(TileIndex from, RailRouteStart start)
 	}
 }
 
+/** Detect an unambiguous existing start, leaving an empty tile or a junction to the selected orientation. */
+RailRouteStart GetRailRouteStartOrientation(TileIndex tile, RailType railtype)
+{
+	if (tile >= Map::Size()) return RailRouteStart::Auto;
+	TrackBits bits = ExistingRouteTracks(tile, railtype);
+	if (bits == Track::X) return RailRouteStart::X;
+	if (bits == Track::Y) return RailRouteStart::Y;
+	if (bits.Any() && TrackBits{bits}.Reset(TRACK_BIT_VERT).None()) return RailRouteStart::NS;
+	if (bits.Any() && TrackBits{bits}.Reset(TRACK_BIT_HORZ).None()) return RailRouteStart::EW;
+	return RailRouteStart::Auto;
+}
+
 /**
  * Get the fixed start of a trunk line: the first piece of every track. It only depends on the start tile,
  * the orientation and the number of tracks, never on the end.
@@ -717,7 +702,18 @@ static std::vector<std::pair<TileIndex, Track>> GetStartTemplate(TileIndex from,
 	bool diagonal = start == RailRouteStart::NS || start == RailRouteStart::EW;
 	std::vector<std::pair<TileIndex, Track>> result;
 	int lo = -static_cast<int>((tracks - 1) / 2);
-	for (int k = lo; k < lo + tracks; k++) result.push_back(GetStartPiece(ref, k, diagonal, 0));
+	int phase = 0;
+	if (diagonal && IsPlainRailTile(from) && GetTileOwner(from) == _current_company) {
+		TrackBits bits = GetTrackBits(from);
+		auto [tile, track] = GetStartPiece(ref, 0, true, 0);
+		if (!bits.Test(track)) {
+			RouteFrame shifted = ref;
+			shifted.ay -= ref.sy;
+			auto [other_tile, other_track] = GetStartPiece(shifted, 0, true, 1);
+			if (bits.Test(other_track)) { ref = shifted; phase = 1; }
+		}
+	}
+	for (int k = lo; k < lo + tracks; k++) result.push_back(GetStartPiece(ref, k, diagonal, phase));
 	return result;
 }
 
@@ -731,7 +727,7 @@ static std::vector<std::pair<TileIndex, Track>> GetStartTemplate(TileIndex from,
 std::vector<std::pair<TileIndex, TrackBits>> GetRailRouteStartPieces(TileIndex from, RailRouteStart start, uint8_t tracks)
 {
 	std::vector<std::pair<TileIndex, TrackBits>> result;
-	if (start == RailRouteStart::Auto || start >= RailRouteStart::End || from >= Map::Size() || tracks < 1) return result;
+	if (start == RailRouteStart::Auto || start >= RailRouteStart::End || from >= Map::Size() || tracks < 1 || tracks > RailRouteOptions::MAX_TRACKS) return result;
 	std::map<TileIndex, TrackBits> tiles;
 	for (auto [tile, track] : GetStartTemplate(from, start, tracks)) {
 		if (tile != INVALID_TILE) tiles[tile].Set(track);
@@ -750,8 +746,9 @@ std::vector<std::pair<TileIndex, TrackBits>> GetRailRouteStartPieces(TileIndex f
  * @param options The options.
  * @return The plan; see RailRoutePlan::error.
  */
-RailRoutePlan PlanRailRoute(TileIndex from, TileIndex to, const RailRouteOptions &options)
+RailRoutePlan PlanRailRoute(TileIndex from, TileIndex to, const RailRouteOptions &requested_options)
 {
+	RailRouteOptions options = requested_options;
 	RailRoutePlan plan;
 	if (from >= Map::Size() || to >= Map::Size()) {
 		plan.error = "invalid tile";
@@ -759,6 +756,12 @@ RailRoutePlan PlanRailRoute(TileIndex from, TileIndex to, const RailRouteOptions
 	}
 	if (options.tracks < 1 || options.tracks > RailRouteOptions::MAX_TRACKS) {
 		plan.error = "invalid number of tracks";
+		return plan;
+	}
+
+	if (options.start == RailRouteStart::Auto) options.start = GetRailRouteStartOrientation(from, options.railtype);
+	if (options.railtype >= RAILTYPE_END || GetRailTypeInfo(options.railtype)->label.Empty()) {
+		plan.error = "invalid rail type";
 		return plan;
 	}
 
@@ -801,7 +804,7 @@ RailRoutePlan PlanRailRoute(TileIndex from, TileIndex to, const RailRouteOptions
 	RouteFrame frame{static_cast<int>(TileX(from)), static_cast<int>(TileY(from)), dx < 0 ? -1 : 1, dy < 0 ? -1 : 1, swap};
 	int length = std::max(std::abs(dx), std::abs(dy));
 	int minor = std::min(std::abs(dx), std::abs(dy));
-	if (length < 2) {
+	if (length < 1) {
 		plan.error = "the route is too short";
 		return plan;
 	}

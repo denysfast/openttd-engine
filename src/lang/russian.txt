@@ -473,6 +473,14 @@ STR_SORT_BY_VALUE                                               :Стоимос�
 STR_SORT_BY_LENGTH                                              :Длина
 STR_SORT_BY_LIFE_TIME                                           :Оставшийся срок службы
 STR_SORT_BY_TIMETABLE_DELAY                                     :Отставание от графика
+STR_SORT_BY_WAIT_PATH_THIS_YEAR                                 :Ждёт пути в этом году
+STR_SORT_BY_WAIT_PATH_LAST_YEAR                                 :Ждёт пути в прошлом году
+STR_SORT_BY_WAIT_CARGO_THIS_YEAR                                :Ждёт груза в этом году
+STR_SORT_BY_WAIT_CARGO_LAST_YEAR                                :Ждёт груза в прошлом году
+STR_SORT_BY_WAIT_PATH_THIS_PERIOD                               :Ждёт пути в этом периоде
+STR_SORT_BY_WAIT_PATH_LAST_PERIOD                               :Ждёт пути в прошлом периоде
+STR_SORT_BY_WAIT_CARGO_THIS_PERIOD                              :Ждёт груза в этом периоде
+STR_SORT_BY_WAIT_CARGO_LAST_PERIOD                              :Ждёт груза в прошлом периоде
 STR_SORT_BY_FACILITY                                            :Тип станции
 STR_SORT_BY_WAITING_TOTAL                                       :Общий объём груза
 STR_SORT_BY_WAITING_AVAILABLE                                   :Объём доступного груза
@@ -3096,6 +3104,8 @@ STR_RAIL_ROUTE_START_Y_TOOLTIP                                  :{BLACK}Нача
 STR_RAIL_ROUTE_SIGNALS                                          :{BLACK}Сигналы, через (клеток):
 STR_RAIL_ROUTE_SIGNALS_TOOLTIP                                  :{BLACK}Поставить односторонние маршрутные сигналы на всех путях, по направлению от начала к концу
 STR_RAIL_ROUTE_INTERVAL_TOOLTIP                                 :{BLACK}Расстояние между сигналами вдоль линии, от 1 до 20 клеток
+STR_RAIL_ROUTE_TERRAFORM                                       :{BLACK}Разрешить земляные работы
+STR_RAIL_ROUTE_TERRAFORM_TOOLTIP                               :{BLACK}Сохранять пригодные естественные склоны. Если включено, менять землю только там, где это необходимо для непрерывного пути; если выключено, строить на существующем рельефе с обычными фундаментами
 STR_RAIL_ROUTE_WATER                                            :{BLACK}Убирать воду
 STR_RAIL_ROUTE_WATER_TOOLTIP                                    :{BLACK}Засыпать море, озёра, реки и каналы в коридоре; иначе клетки с водой мешают линии
 STR_RAIL_ROUTE_DEMOLISH                                         :{BLACK}Сносить дома, предприятия и городские дороги
@@ -3103,7 +3113,7 @@ STR_RAIL_ROUTE_DEMOLISH_TOOLTIP                                 :{BLACK}Снос
 STR_RAIL_ROUTE_SEA                                              :{BLACK}Поднимать землю на уровне моря
 STR_RAIL_ROUTE_SEA_TOOLTIP                                      :{BLACK}Держать линию хотя бы на один уровень выше моря, поднимая землю где нужно
 STR_RAIL_ROUTE_BUILD                                            :{BLACK}Строить
-STR_RAIL_ROUTE_BUILD_TOOLTIP                                    :{BLACK}Выберите направление начала, наведите мышью начало линии и щёлкните: начало закреплено. Затем щёлкните конец: линия следует за мышью как предпросмотр и строится по второму щелчку с типом рельсов из панели ж/д строительства. Инструмент остаётся включённым для следующих линий до Esc или правого щелчка. Клавиша: K
+STR_RAIL_ROUTE_BUILD_TOOLTIP                                    :{BLACK}Щёлкните начало и конец, чтобы построить показанную линию. На существующих рельсах направление начала выбирается автоматически. Shift+щелчок показывает стоимость, сохраняя начало; при ошибке начало тоже сохраняется для повторной попытки. Инструмент работает до Esc или правого щелчка. Клавиша: K
 STR_RAIL_ROUTE_ABORT                                            :{BLACK}Прервать стройку
 STR_RAIL_ROUTE_ABORT_TOOLTIP                                    :{BLACK}Остановить идущую стройку; уже построенное остаётся
 STR_RAIL_ROUTE_INFO_RAILTYPE                                    :{BLACK}Тип рельсов: {GOLD}{STRING}{BLACK}, сигналы: {GOLD}{STRING}
@@ -3130,6 +3140,7 @@ STR_RAIL_ROUTE_ERROR_NO_ROUTE                                   :путь не �
 STR_RAIL_ROUTE_ERROR_DOES_NOT_FIT                               :коридор не помещается на карте
 STR_RAIL_ROUTE_ERROR_WRONG_DIRECTION                            :конец должен лежать в направлении начала
 STR_RAIL_ROUTE_ERROR_START_MISMATCH                             :линия не сходится с началом
+STR_RAIL_ROUTE_ERROR_INVALID_RAILTYPE                          :неверный тип рельсов
 STR_RAIL_ROUTE_ERROR_INVALID_START                              :неверное направление начала
 
 STR_ERROR_RAIL_ROUTE_CAN_T_BUILD                                :{WHITE}Невозможно построить магистраль...
@@ -3472,6 +3483,10 @@ STR_FUND_INDUSTRY_INDUSTRY_BUILD_COST                           :{BLACK}Цена
 STR_FUND_INDUSTRY_PROSPECT_NEW_INDUSTRY                         :{BLACK}Разведать
 STR_FUND_INDUSTRY_BUILD_NEW_INDUSTRY                            :{BLACK}Построить
 STR_FUND_INDUSTRY_FUND_NEW_INDUSTRY                             :{BLACK}Профинансировать
+STR_FUND_INDUSTRY_FUND_TOOLTIP                                  :{BLACK}Щелчок по карте - построить одно предприятие выбранного типа. Протяните мышью область - она заполнится предприятиями так плотно, как они помещаются
+STR_FUND_INDUSTRY_AREA_CAPTION                                  :{WHITE}Предприятия в области
+STR_FUND_INDUSTRY_AREA_QUERY                                    :{YELLOW}Построить {COMMA} предприяти{P е я й} «{STRING}» в выбранной области за {CURRENCY_LONG}?{}{}{WHITE}Правило «одно предприятие типа на город» здесь не действует. Если деньги кончатся, стройка остановится.
+STR_FUND_INDUSTRY_AREA_QUERY_EDITOR                             :{YELLOW}Построить {COMMA} предприяти{P е я й} «{STRING}» в выбранной области?
 STR_FUND_INDUSTRY_REMOVE_ALL_INDUSTRIES                         :{BLACK}Убрать все предприятия
 STR_FUND_INDUSTRY_REMOVE_ALL_INDUSTRIES_TOOLTIP                 :{BLACK}Убрать все предприятия с карты
 STR_FUND_INDUSTRY_REMOVE_ALL_INDUSTRIES_CAPTION                 :{WHITE}Убрать все предприятия
@@ -4576,6 +4591,10 @@ STR_VEHICLE_LIST_SEND_FOR_SERVICING                             :Отправи�
 STR_VEHICLE_LIST_CREATE_GROUP                                   :Создать группу
 STR_VEHICLE_LIST_PROFIT_THIS_YEAR_LAST_YEAR                     :{TINY_FONT}{BLACK}Прибыль в этом году: {CURRENCY_LONG} (в прошлом году: {CURRENCY_LONG})
 STR_VEHICLE_LIST_PROFIT_THIS_PERIOD_LAST_PERIOD                 :{TINY_FONT}{BLACK}Прибыль в текущем цикле: {LTBLUE}{CURRENCY_LONG} (в прошлом: {CURRENCY_LONG})
+STR_VEHICLE_LIST_WAIT_PATH_THIS_YEAR_LAST_YEAR                  :{TINY_FONT}{BLACK}Ждёт пути: {NUM} дн. (в прошлом году: {NUM} дн.)
+STR_VEHICLE_LIST_WAIT_PATH_THIS_PERIOD_LAST_PERIOD              :{TINY_FONT}{BLACK}Ждёт пути: {NUM} дн. (в прошлом периоде: {NUM} дн.)
+STR_VEHICLE_LIST_WAIT_CARGO_THIS_YEAR_LAST_YEAR                 :{TINY_FONT}{BLACK}Ждёт груза: {NUM} дн. (в прошлом году: {NUM} дн.)
+STR_VEHICLE_LIST_WAIT_CARGO_THIS_PERIOD_LAST_PERIOD             :{TINY_FONT}{BLACK}Ждёт груза: {NUM} дн. (в прошлом периоде: {NUM} дн.)
 STR_VEHICLE_LIST_CARGO                                          :[{CARGO_LIST}]
 STR_VEHICLE_LIST_NAME_AND_CARGO                                 :{STRING} {STRING}
 
@@ -5048,6 +5067,8 @@ STR_VEHICLE_INFO_PROFIT_THIS_YEAR_LAST_YEAR                     :{BLACK}Приб
 STR_VEHICLE_INFO_PROFIT_THIS_YEAR_LAST_YEAR_MIN_PERFORMANCE     :{BLACK}Прибыль в текущем году: {LTBLUE}{CURRENCY_LONG} (в прошлом: {CURRENCY_LONG}) {BLACK}Мин. удельная мощн.: {LTBLUE}{POWER_TO_WEIGHT}
 STR_VEHICLE_INFO_PROFIT_THIS_PERIOD_LAST_PERIOD                 :{BLACK}Прибыль в текущем цикле: {LTBLUE}{CURRENCY_LONG} (в прошлом: {CURRENCY_LONG})
 STR_VEHICLE_INFO_PROFIT_THIS_PERIOD_LAST_PERIOD_MIN_PERFORMANCE :{BLACK}Прибыль в текущем цикле: {LTBLUE}{CURRENCY_LONG} (в прошлом: {CURRENCY_LONG}) {BLACK}Мин. удельная мощн.: {LTBLUE}{POWER_TO_WEIGHT}
+STR_VEHICLE_INFO_WAIT_TIMES_THIS_YEAR_LAST_YEAR                 :{BLACK}Ждёт пути: {LTBLUE}{NUM} дн. {BLACK}(в прошлом году: {LTBLUE}{NUM} дн.{BLACK}) · Ждёт груза: {LTBLUE}{NUM} дн. {BLACK}(в прошлом году: {LTBLUE}{NUM} дн.{BLACK})
+STR_VEHICLE_INFO_WAIT_TIMES_THIS_PERIOD_LAST_PERIOD             :{BLACK}Ждёт пути: {LTBLUE}{NUM} дн. {BLACK}(в прошлом периоде: {LTBLUE}{NUM} дн.{BLACK}) · Ждёт груза: {LTBLUE}{NUM} дн. {BLACK}(в прошлом периоде: {LTBLUE}{NUM} дн.{BLACK})
 STR_VEHICLE_INFO_RELIABILITY_BREAKDOWNS                         :{BLACK}Надёжность: {LTBLUE}{COMMA}% (макс. {COMMA}%) {BLACK}Поломок после ТО: {LTBLUE}{COMMA}
 
 STR_VEHICLE_INFO_BUILT_VALUE                                    :{LTBLUE}{ENGINE} {BLACK}Построен в {LTBLUE}{NUM} г.{BLACK} Стоимость: {LTBLUE}{CURRENCY_LONG}
@@ -5621,6 +5642,7 @@ STR_ERROR_CAN_T_BUILD_HERE                                      :Здесь не
 STR_ERROR_CAN_T_CONSTRUCT_THIS_INDUSTRY                         :Построить это предприятие невозможно...
 STR_ERROR_CAN_T_PROSPECT_INDUSTRY                               :Не удалось разведать месторождение...
 STR_ERROR_INDUSTRY_TOO_CLOSE                                    :слишком близко к другому предприятию
+STR_ERROR_INDUSTRY_AREA_TOO_LARGE                               :слишком большая область (не больше 256 × 256 клеток)
 STR_ERROR_MUST_FOUND_TOWN_FIRST                                 :сначала нужно основать город
 STR_ERROR_ONLY_ONE_ALLOWED_PER_TOWN                             :такой объект уже есть в городе
 STR_ERROR_CAN_ONLY_BE_BUILT_IN_TOWNS_WITH_POPULATION_OF_1200    :можно строить в городах с населением не менее 1200 жителей

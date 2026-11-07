@@ -78,6 +78,9 @@ IndustrySpec _industry_specs[NUM_INDUSTRYTYPES];
 IndustryTileSpec _industry_tile_specs[NUM_INDUSTRYTILES];
 IndustryBuildData _industry_builder; ///< In-game manager of industries.
 
+/** Set while #CmdBuildIndustryArea plans and builds: the "one industry of a type per town" rule does not apply. */
+static bool _industry_area_ignore_town_limit = false;
+
 static int WhoCanServiceIndustry(Industry *ind);
 
 /**
@@ -1487,7 +1490,7 @@ static CommandCost FindTownForIndustry(TileIndex tile, IndustryType type, Town *
 {
 	*t = ClosestTownFromTile(tile, UINT_MAX);
 
-	if (_settings_game.economy.multiple_industry_per_town) return CommandCost();
+	if (_settings_game.economy.multiple_industry_per_town || _industry_area_ignore_town_limit) return CommandCost();
 
 	for (const IndustryID &industry : Industry::industries[type]) {
 		if (Industry::Get(industry)->town == *t) {
@@ -2197,6 +2200,228 @@ CommandCost CmdBuildIndustry(DoCommandFlags flags, TileIndex tile, IndustryType 
 	}
 
 	return CommandCost(ExpensesType::Other, indspec->GetConstructionCost());
+}
+
+/** Bounding box of the built tiles of one layout of an industry type, for packing them into an area. */
+struct IndustryAreaLayout {
+	size_t index; ///< Index into #IndustrySpec::layouts.
+	int min_x; ///< Smallest x offset of a built tile.
+	int min_y; ///< Smallest y offset of a built tile.
+	uint w; ///< Width of the bounding box.
+	uint h; ///< Height of the bounding box.
+};
+
+/** One industry of the plan of #CmdBuildIndustryArea. */
+struct IndustryAreaPlacement {
+	TileIndex tile; ///< Tile the layout is built at (its offset 0,0).
+	size_t layout; ///< Index into #IndustrySpec::layouts.
+	uint32_t random_var8f; ///< Random seed for NewGRF callbacks.
+	uint16_t random_initial_bits; ///< Random bits of the new industry.
+};
+
+/**
+ * Can a tile surely not be part of a funded industry? Only cheap and certain cases, the full check comes later.
+ * @param tile Tile to check.
+ * @return \c true if no industry tile can be placed there.
+ */
+static bool IsTileSurelyBlockedForIndustry(TileIndex tile)
+{
+	switch (GetTileType(tile)) {
+		case TileType::Industry:
+		case TileType::Station:
+		case TileType::Railway:
+		case TileType::Road:
+		case TileType::TunnelBridge:
+		case TileType::Void:
+			return true;
+		default:
+			return IsBridgeAbove(tile);
+	}
+}
+
+/**
+ * Plan as many industries of one type as fit into an area: the area is scanned row by row and the first layout
+ * (in the given order) whose bounding box starts at the first free tile and passes all checks is taken.
+ * Nothing is built; the industries of the plan are kept apart and away from each other (conflicting types)
+ * by the plan itself, everything else is checked against the map as it is.
+ * @param type Industry type.
+ * @param indspec Its specification.
+ * @param area Area to fill; the built tiles of every industry are inside it.
+ * @param order Layouts in the order they are tried at every tile.
+ * @param seed Seed of the random bits of the industries.
+ * @param creation_type The circumstances the industries are created under.
+ * @return The planned industries.
+ */
+static std::vector<IndustryAreaPlacement> PlanIndustryArea(IndustryType type, const IndustrySpec *indspec, const TileArea &area, const std::vector<IndustryAreaLayout> &order, uint32_t seed, IndustryAvailabilityCallType creation_type)
+{
+	std::vector<IndustryAreaPlacement> plan;
+	std::vector<bool> occupied(static_cast<size_t>(area.w) * area.h, false);
+	std::vector<int8_t> blocked(static_cast<size_t>(area.w) * area.h, -1); // -1 unknown, 0 free, 1 blocked
+	const uint ax = TileX(area.tile);
+	const uint ay = TileY(area.tile);
+
+	const bool self_conflict = std::ranges::find(indspec->conflicting, type) != std::end(indspec->conflicting);
+
+	Randomizer randomizer;
+	randomizer.SetSeed(seed);
+	uint32_t random_var8f = randomizer.Next();
+	uint16_t random_initial_bits = GB(randomizer.Next(), 0, 16);
+
+	for (uint y = 0; y < area.h; y++) {
+		for (uint x = 0; x < area.w; x++) {
+			if (occupied[y * area.w + x]) continue;
+
+			for (const IndustryAreaLayout &l : order) {
+				if (x + l.w > area.w || y + l.h > area.h) continue;
+
+				/* Tile of offset 0,0 of the layout. */
+				int tx = static_cast<int>(ax + x) - l.min_x;
+				int ty = static_cast<int>(ay + y) - l.min_y;
+				if (tx < 0 || ty < 0 || static_cast<uint>(tx) >= Map::SizeX() || static_cast<uint>(ty) >= Map::SizeY()) continue;
+				TileIndex tile = TileXY(tx, ty);
+
+				/* Built tiles must be free in the plan and not surely blocked on the map. */
+				bool free = true;
+				for (const IndustryTileLayoutTile &it : indspec->layouts[l.index]) {
+					if (it.gfx == GFX_WATERTILE_SPECIALCHECK) continue;
+					uint lx = static_cast<uint>(tx + it.ti.x) - ax;
+					uint ly = static_cast<uint>(ty + it.ti.y) - ay;
+					size_t i = static_cast<size_t>(ly) * area.w + lx;
+					if (occupied[i]) {
+						free = false;
+						break;
+					}
+					if (blocked[i] < 0) blocked[i] = IsTileSurelyBlockedForIndustry(TileXY(ax + lx, ay + ly)) ? 1 : 0;
+					if (blocked[i] > 0) {
+						free = false;
+						break;
+					}
+				}
+				if (!free) continue;
+
+				if (self_conflict && std::ranges::any_of(plan, [tile](const IndustryAreaPlacement &p) { return DistanceMax(tile, p.tile) <= 14; })) continue;
+
+				Industry *ind = nullptr;
+				CommandCost ret = CreateNewIndustryHelper(tile, type, {}, indspec, l.index, random_var8f, random_initial_bits, _current_company, creation_type, &ind);
+				if (ret.Failed()) continue;
+
+				plan.push_back({tile, l.index, random_var8f, random_initial_bits});
+				for (const IndustryTileLayoutTile &it : indspec->layouts[l.index]) {
+					if (it.gfx == GFX_WATERTILE_SPECIALCHECK) continue;
+					occupied[static_cast<size_t>(ty + it.ti.y - ay) * area.w + (tx + it.ti.x - ax)] = true;
+				}
+				random_var8f = randomizer.Next();
+				random_initial_bits = GB(randomizer.Next(), 0, 16);
+				break;
+			}
+		}
+	}
+
+	return plan;
+}
+
+/**
+ * Fund as many industries of one type as fit into an area, packed as densely as the layouts allow.
+ * The area is planned once per layout order (each layout tried first, the others by size), the plan with the most
+ * industries is built. The "one industry of a type per town" rule does not apply. Building stops when the money
+ * runs out. In test mode (estimate) the plan is computed but nothing is built.
+ * @param flags Type of operation.
+ * @param tile One corner of the area.
+ * @param start_tile Opposite corner of the area.
+ * @param it Industry type.
+ * @param seed Seed of the random bits of the industries.
+ * @return Cost of the funded industries and their number, or an error.
+ */
+std::tuple<CommandCost, uint32_t> CmdBuildIndustryArea(DoCommandFlags flags, TileIndex tile, TileIndex start_tile, IndustryType it, uint32_t seed)
+{
+	if (it >= NUM_INDUSTRYTYPES || start_tile >= Map::Size() || tile >= Map::Size()) return {CMD_ERROR, 0};
+
+	const IndustrySpec *indspec = GetIndustrySpec(it);
+	if (!indspec->enabled || indspec->layouts.empty()) return {CMD_ERROR, 0};
+
+	const bool deity = _current_company == OWNER_DEITY;
+	if (_game_mode != GameMode::Editor && !deity && indspec->IsRawIndustry() && _settings_game.construction.raw_industry_construction != 1) {
+		/* Raw industries can't be funded at all, or only be prospected (somewhere on the map). */
+		return {CMD_ERROR, 0};
+	}
+	IndustryAvailabilityCallType creation_type = deity ? IndustryAvailabilityCallType::RandomCreation : IndustryAvailabilityCallType::UserCreation;
+	if (_game_mode != GameMode::Editor && GetIndustryProbabilityCallback(it, creation_type, 1) == 0) return {CMD_ERROR, 0};
+
+	TileArea area(tile, start_tile);
+	if (area.w > INDUSTRY_AREA_MAX_SIZE || area.h > INDUSTRY_AREA_MAX_SIZE) return {CommandCost(STR_ERROR_INDUSTRY_AREA_TOO_LARGE), 0};
+
+	/* Bounding boxes of the layouts. */
+	std::vector<IndustryAreaLayout> layouts;
+	for (size_t i = 0; i < indspec->layouts.size(); i++) {
+		int min_x = INT_MAX, min_y = INT_MAX, max_x = INT_MIN, max_y = INT_MIN;
+		for (const IndustryTileLayoutTile &t : indspec->layouts[i]) {
+			if (t.gfx == GFX_WATERTILE_SPECIALCHECK) continue;
+			min_x = std::min<int>(min_x, t.ti.x);
+			min_y = std::min<int>(min_y, t.ti.y);
+			max_x = std::max<int>(max_x, t.ti.x);
+			max_y = std::max<int>(max_y, t.ti.y);
+		}
+		if (min_x > max_x) continue; // No built tiles at all.
+		layouts.push_back({i, min_x, min_y, static_cast<uint>(max_x - min_x + 1), static_cast<uint>(max_y - min_y + 1)});
+	}
+	if (layouts.empty()) return {CMD_ERROR, 0};
+	/* Smaller boxes first: they leave fewer gaps. */
+	std::stable_sort(layouts.begin(), layouts.end(), [](const IndustryAreaLayout &a, const IndustryAreaLayout &b) { return a.w * a.h < b.w * b.h; });
+
+	AutoRestoreBackup ignore_town_limit(_industry_area_ignore_town_limit, true);
+
+	/* Try every layout first; keep the plan with the most industries (the first one on a tie). */
+	std::vector<IndustryAreaPlacement> plan;
+	const size_t orders = std::min<size_t>(layouts.size(), 8);
+	for (size_t first = 0; first < orders; first++) {
+		std::vector<IndustryAreaLayout> order = layouts;
+		std::rotate(order.begin(), order.begin() + first, order.begin() + first + 1);
+		std::vector<IndustryAreaPlacement> candidate = PlanIndustryArea(it, indspec, area, order, seed, creation_type);
+		if (candidate.size() > plan.size()) plan = std::move(candidate);
+	}
+
+	if (plan.empty()) return {CommandCost(STR_ERROR_SITE_UNSUITABLE), 0};
+
+	const Money unit_cost = indspec->GetConstructionCost();
+	if (!flags.Test(DoCommandFlag::Execute)) {
+		return {CommandCost(ExpensesType::Other, unit_cost * static_cast<int64_t>(plan.size())), static_cast<uint32_t>(plan.size())};
+	}
+
+	CommandCost total(ExpensesType::Other);
+	uint32_t built = 0;
+	bool out_of_money = false;
+	for (const IndustryAreaPlacement &p : plan) {
+		CommandCost next(ExpensesType::Other, total.GetCost() + unit_cost);
+		if (!CheckCompanyHasMoney(next)) {
+			out_of_money = true;
+			break;
+		}
+
+		Industry *ind = nullptr;
+		CommandCost ret = CreateNewIndustryHelper(p.tile, it, flags, indspec, p.layout, p.random_var8f, p.random_initial_bits, _current_company, creation_type, &ind);
+		if (ret.Failed() || ind == nullptr) continue;
+
+		total.AddCost(unit_cost);
+		built++;
+		if (_game_mode != GameMode::Editor) {
+			if (built == 1) {
+				AdvertiseIndustryOpening(ind);
+			} else {
+				AI::BroadcastNewEvent(new ScriptEventIndustryOpen(ind->index));
+				Game::NewEvent(new ScriptEventIndustryOpen(ind->index));
+			}
+		}
+	}
+
+	if (built == 0) {
+		if (out_of_money) {
+			CommandCost err(ExpensesType::Other, unit_cost);
+			CheckCompanyHasMoney(err);
+			return {err, 0};
+		}
+		return {CommandCost(STR_ERROR_SITE_UNSUITABLE), 0};
+	}
+	return {total, built};
 }
 
 /**

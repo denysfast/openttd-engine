@@ -67,11 +67,19 @@ static BaseVehicleListWindow::VehicleIndividualSortFunction VehicleValueSorter;
 static BaseVehicleListWindow::VehicleIndividualSortFunction VehicleLengthSorter;
 static BaseVehicleListWindow::VehicleIndividualSortFunction VehicleTimeToLiveSorter;
 static BaseVehicleListWindow::VehicleIndividualSortFunction VehicleTimetableDelaySorter;
+static BaseVehicleListWindow::VehicleIndividualSortFunction VehiclePathWaitThisYearSorter;
+static BaseVehicleListWindow::VehicleIndividualSortFunction VehiclePathWaitLastYearSorter;
+static BaseVehicleListWindow::VehicleIndividualSortFunction VehicleCargoWaitThisYearSorter;
+static BaseVehicleListWindow::VehicleIndividualSortFunction VehicleCargoWaitLastYearSorter;
 static BaseVehicleListWindow::VehicleGroupSortFunction VehicleGroupLengthSorter;
 static BaseVehicleListWindow::VehicleGroupSortFunction VehicleGroupTotalProfitThisYearSorter;
 static BaseVehicleListWindow::VehicleGroupSortFunction VehicleGroupTotalProfitLastYearSorter;
 static BaseVehicleListWindow::VehicleGroupSortFunction VehicleGroupAverageProfitThisYearSorter;
 static BaseVehicleListWindow::VehicleGroupSortFunction VehicleGroupAverageProfitLastYearSorter;
+static BaseVehicleListWindow::VehicleGroupSortFunction VehicleGroupPathWaitThisYearSorter;
+static BaseVehicleListWindow::VehicleGroupSortFunction VehicleGroupPathWaitLastYearSorter;
+static BaseVehicleListWindow::VehicleGroupSortFunction VehicleGroupCargoWaitThisYearSorter;
+static BaseVehicleListWindow::VehicleGroupSortFunction VehicleGroupCargoWaitLastYearSorter;
 
 /** Wrapper to convert a VehicleIndividualSortFunction to a VehicleGroupSortFunction. @copydoc GUIList::Sorter */
 template <BaseVehicleListWindow::VehicleIndividualSortFunction func>
@@ -94,6 +102,10 @@ const std::initializer_list<BaseVehicleListWindow::VehicleGroupSortFunction * co
 	&VehicleIndividualToGroupSorterWrapper<VehicleLengthSorter>,
 	&VehicleIndividualToGroupSorterWrapper<VehicleTimeToLiveSorter>,
 	&VehicleIndividualToGroupSorterWrapper<VehicleTimetableDelaySorter>,
+	&VehicleIndividualToGroupSorterWrapper<VehiclePathWaitThisYearSorter>,
+	&VehicleIndividualToGroupSorterWrapper<VehiclePathWaitLastYearSorter>,
+	&VehicleIndividualToGroupSorterWrapper<VehicleCargoWaitThisYearSorter>,
+	&VehicleIndividualToGroupSorterWrapper<VehicleCargoWaitLastYearSorter>,
 };
 
 const std::initializer_list<const StringID> BaseVehicleListWindow::vehicle_group_none_sorter_names_calendar = {
@@ -110,6 +122,10 @@ const std::initializer_list<const StringID> BaseVehicleListWindow::vehicle_group
 	STR_SORT_BY_LENGTH,
 	STR_SORT_BY_LIFE_TIME,
 	STR_SORT_BY_TIMETABLE_DELAY,
+	STR_SORT_BY_WAIT_PATH_THIS_YEAR,
+	STR_SORT_BY_WAIT_PATH_LAST_YEAR,
+	STR_SORT_BY_WAIT_CARGO_THIS_YEAR,
+	STR_SORT_BY_WAIT_CARGO_LAST_YEAR,
 };
 
 const std::initializer_list<const StringID> BaseVehicleListWindow::vehicle_group_none_sorter_names_wallclock = {
@@ -126,6 +142,10 @@ const std::initializer_list<const StringID> BaseVehicleListWindow::vehicle_group
 	STR_SORT_BY_LENGTH,
 	STR_SORT_BY_LIFE_TIME,
 	STR_SORT_BY_TIMETABLE_DELAY,
+	STR_SORT_BY_WAIT_PATH_THIS_PERIOD,
+	STR_SORT_BY_WAIT_PATH_LAST_PERIOD,
+	STR_SORT_BY_WAIT_CARGO_THIS_PERIOD,
+	STR_SORT_BY_WAIT_CARGO_LAST_PERIOD,
 };
 
 const std::initializer_list<BaseVehicleListWindow::VehicleGroupSortFunction * const> BaseVehicleListWindow::vehicle_group_shared_orders_sorter_funcs = {
@@ -134,6 +154,10 @@ const std::initializer_list<BaseVehicleListWindow::VehicleGroupSortFunction * co
 	&VehicleGroupTotalProfitLastYearSorter,
 	&VehicleGroupAverageProfitThisYearSorter,
 	&VehicleGroupAverageProfitLastYearSorter,
+	&VehicleGroupPathWaitThisYearSorter,
+	&VehicleGroupPathWaitLastYearSorter,
+	&VehicleGroupCargoWaitThisYearSorter,
+	&VehicleGroupCargoWaitLastYearSorter,
 };
 
 const std::initializer_list<const StringID> BaseVehicleListWindow::vehicle_group_shared_orders_sorter_names_calendar = {
@@ -142,6 +166,10 @@ const std::initializer_list<const StringID> BaseVehicleListWindow::vehicle_group
 	STR_SORT_BY_TOTAL_PROFIT_LAST_YEAR,
 	STR_SORT_BY_AVERAGE_PROFIT_THIS_YEAR,
 	STR_SORT_BY_AVERAGE_PROFIT_LAST_YEAR,
+	STR_SORT_BY_WAIT_PATH_THIS_YEAR,
+	STR_SORT_BY_WAIT_PATH_LAST_YEAR,
+	STR_SORT_BY_WAIT_CARGO_THIS_YEAR,
+	STR_SORT_BY_WAIT_CARGO_LAST_YEAR,
 };
 
 const std::initializer_list<const StringID> BaseVehicleListWindow::vehicle_group_shared_orders_sorter_names_wallclock = {
@@ -150,6 +178,10 @@ const std::initializer_list<const StringID> BaseVehicleListWindow::vehicle_group
 	STR_SORT_BY_TOTAL_PROFIT_LAST_PERIOD,
 	STR_SORT_BY_AVERAGE_PROFIT_THIS_PERIOD,
 	STR_SORT_BY_AVERAGE_PROFIT_LAST_PERIOD,
+	STR_SORT_BY_WAIT_PATH_THIS_PERIOD,
+	STR_SORT_BY_WAIT_PATH_LAST_PERIOD,
+	STR_SORT_BY_WAIT_CARGO_THIS_PERIOD,
+	STR_SORT_BY_WAIT_CARGO_LAST_PERIOD,
 };
 
 const std::initializer_list<const StringID> BaseVehicleListWindow::vehicle_group_by_names = {
@@ -1451,6 +1483,30 @@ static bool VehicleGroupAverageProfitLastYearSorter(const GUIVehicleGroup &a, co
 	return a.GetDisplayProfitLastYear() * static_cast<uint>(b.NumVehicles()) < b.GetDisplayProfitLastYear() * static_cast<uint>(a.NumVehicles());
 }
 
+/** Sort vehicle groups by the total time waiting for a path this year. @copydoc GUIList::Sorter */
+static bool VehicleGroupPathWaitThisYearSorter(const GUIVehicleGroup &a, const GUIVehicleGroup &b)
+{
+	return a.GetPathWaitTicksThisYear() < b.GetPathWaitTicksThisYear();
+}
+
+/** Sort vehicle groups by the total time waiting for a path last year. @copydoc GUIList::Sorter */
+static bool VehicleGroupPathWaitLastYearSorter(const GUIVehicleGroup &a, const GUIVehicleGroup &b)
+{
+	return a.GetPathWaitTicksLastYear() < b.GetPathWaitTicksLastYear();
+}
+
+/** Sort vehicle groups by the total time waiting for cargo this year. @copydoc GUIList::Sorter */
+static bool VehicleGroupCargoWaitThisYearSorter(const GUIVehicleGroup &a, const GUIVehicleGroup &b)
+{
+	return a.GetCargoWaitTicksThisYear() < b.GetCargoWaitTicksThisYear();
+}
+
+/** Sort vehicle groups by the total time waiting for cargo last year. @copydoc GUIList::Sorter */
+static bool VehicleGroupCargoWaitLastYearSorter(const GUIVehicleGroup &a, const GUIVehicleGroup &b)
+{
+	return a.GetCargoWaitTicksLastYear() < b.GetCargoWaitTicksLastYear();
+}
+
 /** Sort vehicles by their number. @copydoc GUIList::Sorter */
 static bool VehicleNumberSorter(const Vehicle * const &a, const Vehicle * const &b)
 {
@@ -1495,6 +1551,30 @@ static bool VehicleProfitLastYearSorter(const Vehicle * const &a, const Vehicle 
 {
 	int r = ClampTo<int32_t>(a->GetDisplayProfitLastYear() - b->GetDisplayProfitLastYear());
 	return (r != 0) ? r < 0 : VehicleNumberSorter(a, b);
+}
+
+/** Sort vehicles by the time waiting for a path this year. @copydoc GUIList::Sorter */
+static bool VehiclePathWaitThisYearSorter(const Vehicle * const &a, const Vehicle * const &b)
+{
+	return (a->wait_path_this_year != b->wait_path_this_year) ? a->wait_path_this_year < b->wait_path_this_year : VehicleNumberSorter(a, b);
+}
+
+/** Sort vehicles by the time waiting for a path last year. @copydoc GUIList::Sorter */
+static bool VehiclePathWaitLastYearSorter(const Vehicle * const &a, const Vehicle * const &b)
+{
+	return (a->wait_path_last_year != b->wait_path_last_year) ? a->wait_path_last_year < b->wait_path_last_year : VehicleNumberSorter(a, b);
+}
+
+/** Sort vehicles by the time waiting for cargo this year. @copydoc GUIList::Sorter */
+static bool VehicleCargoWaitThisYearSorter(const Vehicle * const &a, const Vehicle * const &b)
+{
+	return (a->wait_cargo_this_year != b->wait_cargo_this_year) ? a->wait_cargo_this_year < b->wait_cargo_this_year : VehicleNumberSorter(a, b);
+}
+
+/** Sort vehicles by the time waiting for cargo last year. @copydoc GUIList::Sorter */
+static bool VehicleCargoWaitLastYearSorter(const Vehicle * const &a, const Vehicle * const &b)
+{
+	return (a->wait_cargo_last_year != b->wait_cargo_last_year) ? a->wait_cargo_last_year < b->wait_cargo_last_year : VehicleNumberSorter(a, b);
 }
 
 /** Sort vehicles by their cargo. @copydoc GUIList::Sorter */
@@ -1803,10 +1883,24 @@ void BaseVehicleListWindow::DrawVehicleListItems(VehicleID selected_vehicle, int
 	for (auto it = first; it != last; ++it) {
 		const GUIVehicleGroup &vehgroup = *it;
 
-		DrawString(tr.left, tr.right, ir.bottom - GetCharacterHeight(FontSize::Small) - WidgetDimensions::scaled.framerect.bottom,
-				GetString(TimerGameEconomy::UsingWallclockUnits() ? STR_VEHICLE_LIST_PROFIT_THIS_PERIOD_LAST_PERIOD : STR_VEHICLE_LIST_PROFIT_THIS_YEAR_LAST_YEAR,
-						vehgroup.GetDisplayProfitThisYear(),
-						vehgroup.GetDisplayProfitLastYear()));
+		size_t wait_sort_offset = this->GetVehicleSorterNames().size() - 4;
+		size_t sort_type = this->vehgroups.SortType();
+		if (sort_type >= wait_sort_offset && sort_type < wait_sort_offset + 2) {
+			DrawString(tr.left, tr.right, ir.bottom - GetCharacterHeight(FontSize::Small) - WidgetDimensions::scaled.framerect.bottom,
+					GetString(TimerGameEconomy::UsingWallclockUnits() ? STR_VEHICLE_LIST_WAIT_PATH_THIS_PERIOD_LAST_PERIOD : STR_VEHICLE_LIST_WAIT_PATH_THIS_YEAR_LAST_YEAR,
+							vehgroup.GetPathWaitTicksThisYear() / Ticks::DAY_TICKS,
+							vehgroup.GetPathWaitTicksLastYear() / Ticks::DAY_TICKS));
+		} else if (sort_type >= wait_sort_offset + 2) {
+			DrawString(tr.left, tr.right, ir.bottom - GetCharacterHeight(FontSize::Small) - WidgetDimensions::scaled.framerect.bottom,
+					GetString(TimerGameEconomy::UsingWallclockUnits() ? STR_VEHICLE_LIST_WAIT_CARGO_THIS_PERIOD_LAST_PERIOD : STR_VEHICLE_LIST_WAIT_CARGO_THIS_YEAR_LAST_YEAR,
+							vehgroup.GetCargoWaitTicksThisYear() / Ticks::DAY_TICKS,
+							vehgroup.GetCargoWaitTicksLastYear() / Ticks::DAY_TICKS));
+		} else {
+			DrawString(tr.left, tr.right, ir.bottom - GetCharacterHeight(FontSize::Small) - WidgetDimensions::scaled.framerect.bottom,
+					GetString(TimerGameEconomy::UsingWallclockUnits() ? STR_VEHICLE_LIST_PROFIT_THIS_PERIOD_LAST_PERIOD : STR_VEHICLE_LIST_PROFIT_THIS_YEAR_LAST_YEAR,
+							vehgroup.GetDisplayProfitThisYear(),
+							vehgroup.GetDisplayProfitLastYear()));
+		}
 
 		DrawVehicleProfitButton(vehgroup.GetOldestVehicleAge(), vehgroup.GetDisplayProfitLastYear(), vehgroup.NumVehicles(), vehicle_button_x, ir.top + GetCharacterHeight(FontSize::Normal) + WidgetDimensions::scaled.vsep_normal);
 
@@ -2501,7 +2595,7 @@ struct VehicleDetailsWindow : Window {
 		switch (widget) {
 			case WID_VD_TOP_DETAILS: {
 				Dimension dim = { 0, 0 };
-				size.height = 4 * GetCharacterHeight(FontSize::Normal) + padding.height;
+				size.height = 5 * GetCharacterHeight(FontSize::Normal) + padding.height;
 
 				uint64_t max_value = GetParamMaxValue(INT16_MAX);
 				dim = maxdim(dim, GetStringBoundingBox(GetString(STR_VEHICLE_INFO_MAX_SPEED, max_value)));
@@ -2509,6 +2603,8 @@ struct VehicleDetailsWindow : Window {
 				dim = maxdim(dim, GetStringBoundingBox(GetString(STR_VEHICLE_INFO_WEIGHT_POWER_MAX_SPEED_MAX_TE, max_value, max_value, max_value, max_value)));
 				dim = maxdim(dim, GetStringBoundingBox(GetString(STR_VEHICLE_INFO_PROFIT_THIS_YEAR_LAST_YEAR_MIN_PERFORMANCE, max_value, max_value, max_value)));
 				dim = maxdim(dim, GetStringBoundingBox(GetString(STR_VEHICLE_INFO_PROFIT_THIS_PERIOD_LAST_PERIOD_MIN_PERFORMANCE, max_value, max_value, max_value)));
+				dim = maxdim(dim, GetStringBoundingBox(GetString(STR_VEHICLE_INFO_WAIT_TIMES_THIS_YEAR_LAST_YEAR, max_value, max_value, max_value, max_value)));
+				dim = maxdim(dim, GetStringBoundingBox(GetString(STR_VEHICLE_INFO_WAIT_TIMES_THIS_PERIOD_LAST_PERIOD, max_value, max_value, max_value, max_value)));
 				dim = maxdim(dim, GetStringBoundingBox(GetString(STR_VEHICLE_INFO_RELIABILITY_BREAKDOWNS, max_value, max_value, max_value)));
 				dim = maxdim(dim, GetStringBoundingBox(GetString(TimerGameEconomy::UsingWallclockUnits() ? STR_VEHICLE_INFO_AGE_RUNNING_COST_PERIOD : STR_VEHICLE_INFO_AGE_RUNNING_COST_YR, STR_VEHICLE_INFO_AGE, max_value, max_value, max_value)));
 				size.width = dim.width + padding.width;
@@ -2665,6 +2761,15 @@ struct VehicleDetailsWindow : Window {
 							v->GetDisplayProfitThisYear(),
 							v->GetDisplayProfitLastYear()));
 				}
+				tr.top += GetCharacterHeight(FontSize::Normal);
+
+				/* Draw waiting times */
+				DrawString(tr,
+						GetString(TimerGameEconomy::UsingWallclockUnits() ? STR_VEHICLE_INFO_WAIT_TIMES_THIS_PERIOD_LAST_PERIOD : STR_VEHICLE_INFO_WAIT_TIMES_THIS_YEAR_LAST_YEAR,
+								v->wait_path_this_year / Ticks::DAY_TICKS,
+								v->wait_path_last_year / Ticks::DAY_TICKS,
+								v->wait_cargo_this_year / Ticks::DAY_TICKS,
+								v->wait_cargo_last_year / Ticks::DAY_TICKS));
 				tr.top += GetCharacterHeight(FontSize::Normal);
 
 				/* Draw breakdown & reliability */

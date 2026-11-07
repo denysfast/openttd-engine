@@ -126,6 +126,7 @@ static std::string GetRailRouteErrorText(const std::string &error)
 		{"the end must lie in the direction of the start", STR_RAIL_ROUTE_ERROR_WRONG_DIRECTION},
 		{"the route does not fit the start", STR_RAIL_ROUTE_ERROR_START_MISMATCH},
 		{"invalid start orientation", STR_RAIL_ROUTE_ERROR_INVALID_START},
+		{"invalid rail type", STR_RAIL_ROUTE_ERROR_INVALID_RAILTYPE},
 	};
 	for (const auto &[text, string] : known) {
 		if (error == text) return GetString(string);
@@ -231,6 +232,7 @@ struct RailRouteWindow : Window {
 		this->SetWidgetDisabledState(WID_RR_INTERVAL_DECREASE, !o.signals || o.signal_interval <= 1);
 		this->SetWidgetDisabledState(WID_RR_INTERVAL_INCREASE, !o.signals || o.signal_interval >= MAX_SIGNAL_INTERVAL);
 		this->SetWidgetDisabledState(WID_RR_INTERVAL, !o.signals);
+		this->SetWidgetLoweredState(WID_RR_TERRAFORM, o.terraform);
 		this->SetWidgetLoweredState(WID_RR_WATER, o.remove_water);
 		this->SetWidgetLoweredState(WID_RR_DEMOLISH, o.demolish);
 		this->SetWidgetLoweredState(WID_RR_SEA, o.raise_sea_level);
@@ -282,7 +284,12 @@ struct RailRouteWindow : Window {
 		_rail_route_preview.start = start;
 		_rail_route_preview.end = INVALID_TILE;
 		_rail_route_preview.red = red;
-		_rail_route_preview.tracks = GetRailRouteStartPieces(start, _rail_route_options.start, _rail_route_options.tracks);
+		RailRouteStart orientation = _rail_route_options.start;
+		if (this->mode == Mode::PickStart) {
+			RailRouteStart detected = GetRailRouteStartOrientation(start, GetOptions().railtype);
+			if (detected != RailRouteStart::Auto) orientation = detected;
+		}
+		_rail_route_preview.tracks = GetRailRouteStartPieces(start, orientation, _rail_route_options.tracks);
 	}
 
 	/**
@@ -350,14 +357,14 @@ struct RailRouteWindow : Window {
 	 * Plan the route to the end tile and start building it.
 	 * @param end The end tile.
 	 */
-	void BuildRoute(TileIndex end)
+	bool BuildRoute(TileIndex end)
 	{
 		int x = TileX(end) * TILE_SIZE;
 		int y = TileY(end) * TILE_SIZE;
-		if (!Company::IsValidID(_local_company)) return;
+		if (!Company::IsValidID(_local_company)) return false;
 		if (GetBlueprintPasteStatus().active) {
 			ShowErrorMessage(GetEncodedString(STR_ERROR_RAIL_ROUTE_CAN_T_BUILD), GetEncodedString(STR_ERROR_RAIL_ROUTE_JOB_RUNNING), WarningLevel::Info, x, y);
-			return;
+			return false;
 		}
 
 		RailRoutePlan plan = PlanRailRoute(this->start_tile, end, GetOptions());
@@ -365,20 +372,27 @@ struct RailRouteWindow : Window {
 		this->SetWidgetDirty(WID_RR_INFO);
 		if (!plan.error.empty()) {
 			ShowErrorMessage(GetEncodedString(STR_ERROR_RAIL_ROUTE_CAN_T_BUILD), GetEncodedString(STR_ERROR_RAIL_ROUTE_DETAIL, GetRailRouteErrorText(plan.error)), WarningLevel::Info, x, y);
-			return;
+			return false;
+		}
+		if (_shift_pressed) {
+			ShowEstimatedCostOrIncome(plan.estimate.Total(), x, y);
+			return false;
 		}
 		Money needed = plan.estimate.Total();
 		Money available = Company::Get(_local_company)->money;
 		if (available < needed) {
 			ShowErrorMessage(GetEncodedString(STR_ERROR_RAIL_ROUTE_CAN_T_BUILD), GetEncodedString(STR_ERROR_RAIL_ROUTE_NOT_ENOUGH_MONEY, needed, available), WarningLevel::Info, x, y);
-			return;
+			return false;
 		}
 		std::string name = fmt::format("{},{} - {},{}", TileX(this->start_tile), TileY(this->start_tile), TileX(plan.end), TileY(plan.end));
+		if (plan.prepare.empty() && plan.build.empty()) return true;
 		if (!StartConstructionJob(name, plan.origin, std::move(plan.prepare), std::move(plan.build), _local_company, true)) {
 			ShowErrorMessage(GetEncodedString(STR_ERROR_RAIL_ROUTE_CAN_T_BUILD), GetEncodedString(STR_ERROR_RAIL_ROUTE_JOB_RUNNING), WarningLevel::Info, x, y);
+			return false;
 		}
 		this->UpdateButtons();
 		this->SetDirty();
+		return true;
 	}
 
 	/**
@@ -534,6 +548,11 @@ struct RailRouteWindow : Window {
 				this->OnOptionsChanged();
 				break;
 
+			case WID_RR_TERRAFORM:
+				o.terraform = !o.terraform;
+				this->OnOptionsChanged();
+				break;
+
 			case WID_RR_WATER:
 				o.remove_water = !o.remove_water;
 				this->OnOptionsChanged();
@@ -575,13 +594,17 @@ struct RailRouteWindow : Window {
 			case Mode::PickStart:
 				/* The start is fixed now; the route is planned when the cursor leaves the start tile. */
 				this->start_tile = tile;
+				if (RailRouteStart detected = GetRailRouteStartOrientation(tile, GetOptions().railtype); detected != RailRouteStart::Auto) {
+					_rail_route_options.start = detected;
+					this->UpdateButtons();
+				}
 				this->summary = {};
 				this->mode = Mode::PickEnd;
 				this->PlanPreview(tile);
 				break;
 
 			case Mode::PickEnd:
-				this->BuildRoute(tile);
+				if (!this->BuildRoute(tile)) break;
 				/* Wait for the next start; the start pieces follow the cursor again. */
 				this->ClearPreview();
 				this->mode = Mode::PickStart;
@@ -708,6 +731,10 @@ static constexpr std::initializer_list<NWidgetPart> _nested_rail_route_widgets =
 					NWidget(WWT_LABEL, Colours::Invalid, WID_RR_INTERVAL), SetToolTip(STR_RAIL_ROUTE_INTERVAL_TOOLTIP),
 					NWidget(WWT_PUSHARROWBTN, Colours::DarkGreen, WID_RR_INTERVAL_INCREASE), SetArrowWidgetTypeTip(ArrowWidgetType::Increase, STR_RAIL_ROUTE_INTERVAL_TOOLTIP),
 				EndContainer(),
+			EndContainer(),
+			NWidget(NWID_HORIZONTAL), SetPIP(0, WidgetDimensions::unscaled.hsep_wide, 0),
+				NWidget(WWT_BOOLBTN, Colours::DarkGreen, WID_RR_TERRAFORM), SetAlternateColourTip(Colours::Yellow, STR_RAIL_ROUTE_TERRAFORM_TOOLTIP),
+				NWidget(WWT_TEXT, Colours::Invalid), SetFill(1, 0), SetResize(1, 0), SetStringTip(STR_RAIL_ROUTE_TERRAFORM, STR_RAIL_ROUTE_TERRAFORM_TOOLTIP),
 			EndContainer(),
 			NWidget(NWID_HORIZONTAL), SetPIP(0, WidgetDimensions::unscaled.hsep_wide, 0),
 				NWidget(WWT_BOOLBTN, Colours::DarkGreen, WID_RR_WATER), SetAlternateColourTip(Colours::Yellow, STR_RAIL_ROUTE_WATER_TOOLTIP),

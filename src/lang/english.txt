@@ -347,6 +347,14 @@ STR_SORT_BY_VALUE                                               :Value
 STR_SORT_BY_LENGTH                                              :Length
 STR_SORT_BY_LIFE_TIME                                           :Remaining lifetime
 STR_SORT_BY_TIMETABLE_DELAY                                     :Timetable delay
+STR_SORT_BY_WAIT_PATH_THIS_YEAR                                 :Waiting for path this year
+STR_SORT_BY_WAIT_PATH_LAST_YEAR                                 :Waiting for path last year
+STR_SORT_BY_WAIT_CARGO_THIS_YEAR                                :Waiting for cargo this year
+STR_SORT_BY_WAIT_CARGO_LAST_YEAR                                :Waiting for cargo last year
+STR_SORT_BY_WAIT_PATH_THIS_PERIOD                               :Waiting for path this period
+STR_SORT_BY_WAIT_PATH_LAST_PERIOD                               :Waiting for path last period
+STR_SORT_BY_WAIT_CARGO_THIS_PERIOD                              :Waiting for cargo this period
+STR_SORT_BY_WAIT_CARGO_LAST_PERIOD                              :Waiting for cargo last period
 STR_SORT_BY_FACILITY                                            :Station type
 STR_SORT_BY_WAITING_TOTAL                                       :Total waiting cargo
 STR_SORT_BY_WAITING_AVAILABLE                                   :Available waiting cargo
@@ -2933,6 +2941,8 @@ STR_RAIL_ROUTE_START_Y_TOOLTIP                                  :{BLACK}Start st
 STR_RAIL_ROUTE_SIGNALS                                          :{BLACK}Signals, every (tiles):
 STR_RAIL_ROUTE_SIGNALS_TOOLTIP                                  :{BLACK}Build one-way path signals on every track, in the direction from the start to the end
 STR_RAIL_ROUTE_INTERVAL_TOOLTIP                                 :{BLACK}Distance between signals along the line, 1 to 20 tiles
+STR_RAIL_ROUTE_TERRAFORM                                       :{BLACK}Allow earthworks
+STR_RAIL_ROUTE_TERRAFORM_TOOLTIP                               :{BLACK}Keep usable natural slopes. When enabled, reshape only the terrain needed for a continuous route; when disabled, build entirely on the existing terrain using normal rail foundations
 STR_RAIL_ROUTE_WATER                                            :{BLACK}Remove water
 STR_RAIL_ROUTE_WATER_TOOLTIP                                    :{BLACK}Fill sea, lakes, rivers and canals in the corridor; otherwise water tiles block the line
 STR_RAIL_ROUTE_DEMOLISH                                         :{BLACK}Demolish houses, industries and town roads
@@ -2940,7 +2950,7 @@ STR_RAIL_ROUTE_DEMOLISH_TOOLTIP                                 :{BLACK}Demolish
 STR_RAIL_ROUTE_SEA                                              :{BLACK}Raise land at sea level
 STR_RAIL_ROUTE_SEA_TOOLTIP                                      :{BLACK}Keep the line at least one level above the sea, raising the land where needed
 STR_RAIL_ROUTE_BUILD                                            :{BLACK}Build
-STR_RAIL_ROUTE_BUILD_TOOLTIP                                    :{BLACK}Choose the orientation of the start, then aim the start of the line with the mouse and click: the start is fixed. Then click the end: the line follows the mouse as a preview and is built at the second click with the rail type of the railway toolbar. Stays active for more lines until Esc or right-click. Hotkey: K
+STR_RAIL_ROUTE_BUILD_TOOLTIP                                    :{BLACK}Click the start and end to build the preview. Clicking existing rail selects its orientation and reuses its connections. Shift+click shows the estimated cost and keeps the start. A failed build keeps the start for retry. Stays active until Esc or right-click. Hotkey: K
 STR_RAIL_ROUTE_ABORT                                            :{BLACK}Abort construction
 STR_RAIL_ROUTE_ABORT_TOOLTIP                                    :{BLACK}Stop the running construction; what was already built stays
 STR_RAIL_ROUTE_INFO_RAILTYPE                                    :{BLACK}Rail type: {GOLD}{STRING}{BLACK}, signals: {GOLD}{STRING}
@@ -2967,6 +2977,7 @@ STR_RAIL_ROUTE_ERROR_NO_ROUTE                                   :no route found
 STR_RAIL_ROUTE_ERROR_DOES_NOT_FIT                               :the corridor does not fit on the map
 STR_RAIL_ROUTE_ERROR_WRONG_DIRECTION                            :the end must lie in the direction of the start
 STR_RAIL_ROUTE_ERROR_START_MISMATCH                             :the route does not fit the start
+STR_RAIL_ROUTE_ERROR_INVALID_RAILTYPE                          :invalid rail type
 STR_RAIL_ROUTE_ERROR_INVALID_START                              :invalid start orientation
 
 STR_ERROR_RAIL_ROUTE_CAN_T_BUILD                                :{WHITE}Can't build the trunk line...
@@ -3297,6 +3308,10 @@ STR_FUND_INDUSTRY_INDUSTRY_BUILD_COST                           :{BLACK}Cost: {Y
 STR_FUND_INDUSTRY_PROSPECT_NEW_INDUSTRY                         :{BLACK}Prospect
 STR_FUND_INDUSTRY_BUILD_NEW_INDUSTRY                            :{BLACK}Build
 STR_FUND_INDUSTRY_FUND_NEW_INDUSTRY                             :{BLACK}Fund
+STR_FUND_INDUSTRY_FUND_TOOLTIP                                  :{BLACK}Click on the map to build one industry of the selected type. Drag to select an area: it is filled with as many industries as fit, packed tightly
+STR_FUND_INDUSTRY_AREA_CAPTION                                  :{WHITE}Fund industries in an area
+STR_FUND_INDUSTRY_AREA_QUERY                                    :{YELLOW}Build {COMMA} × {STRING} in the selected area for {CURRENCY_LONG}?{}{}{WHITE}The "one industry of a type per town" rule does not apply here. If the money runs out, building stops.
+STR_FUND_INDUSTRY_AREA_QUERY_EDITOR                             :{YELLOW}Build {COMMA} × {STRING} in the selected area?
 STR_FUND_INDUSTRY_REMOVE_ALL_INDUSTRIES                         :{BLACK}Remove all industries
 STR_FUND_INDUSTRY_REMOVE_ALL_INDUSTRIES_TOOLTIP                 :{BLACK}Remove all industries currently present on the map
 STR_FUND_INDUSTRY_REMOVE_ALL_INDUSTRIES_CAPTION                 :{WHITE}Remove all industries
@@ -4401,6 +4416,10 @@ STR_VEHICLE_LIST_SEND_FOR_SERVICING                             :Send for servic
 STR_VEHICLE_LIST_CREATE_GROUP                                   :Create group
 STR_VEHICLE_LIST_PROFIT_THIS_YEAR_LAST_YEAR                     :{TINY_FONT}{BLACK}Profit this year: {CURRENCY_LONG} (last year: {CURRENCY_LONG})
 STR_VEHICLE_LIST_PROFIT_THIS_PERIOD_LAST_PERIOD                 :{TINY_FONT}{BLACK}Profit this period: {CURRENCY_LONG} (last period: {CURRENCY_LONG})
+STR_VEHICLE_LIST_WAIT_PATH_THIS_YEAR_LAST_YEAR                  :{TINY_FONT}{BLACK}Waiting for path: {NUM} days (last year: {NUM} days)
+STR_VEHICLE_LIST_WAIT_PATH_THIS_PERIOD_LAST_PERIOD              :{TINY_FONT}{BLACK}Waiting for path: {NUM} days (last period: {NUM} days)
+STR_VEHICLE_LIST_WAIT_CARGO_THIS_YEAR_LAST_YEAR                 :{TINY_FONT}{BLACK}Waiting for cargo: {NUM} days (last year: {NUM} days)
+STR_VEHICLE_LIST_WAIT_CARGO_THIS_PERIOD_LAST_PERIOD             :{TINY_FONT}{BLACK}Waiting for cargo: {NUM} days (last period: {NUM} days)
 STR_VEHICLE_LIST_CARGO                                          :[{CARGO_LIST}]
 STR_VEHICLE_LIST_NAME_AND_CARGO                                 :{STRING1} {STRING1}
 
@@ -4861,6 +4880,8 @@ STR_VEHICLE_INFO_PROFIT_THIS_YEAR_LAST_YEAR                     :{BLACK}Profit t
 STR_VEHICLE_INFO_PROFIT_THIS_YEAR_LAST_YEAR_MIN_PERFORMANCE     :{BLACK}Profit this year: {LTBLUE}{CURRENCY_LONG} (last year: {CURRENCY_LONG}) {BLACK}Min. performance: {LTBLUE}{POWER_TO_WEIGHT}
 STR_VEHICLE_INFO_PROFIT_THIS_PERIOD_LAST_PERIOD                 :{BLACK}Profit this period: {LTBLUE}{CURRENCY_LONG} (last period: {CURRENCY_LONG})
 STR_VEHICLE_INFO_PROFIT_THIS_PERIOD_LAST_PERIOD_MIN_PERFORMANCE :{BLACK}Profit this period: {LTBLUE}{CURRENCY_LONG} (last period: {CURRENCY_LONG}) {BLACK}Min. performance: {LTBLUE}{POWER_TO_WEIGHT}
+STR_VEHICLE_INFO_WAIT_TIMES_THIS_YEAR_LAST_YEAR                 :{BLACK}Waiting for path: {LTBLUE}{NUM} days {BLACK}(last year: {LTBLUE}{NUM} days{BLACK}) · Waiting for cargo: {LTBLUE}{NUM} days {BLACK}(last year: {LTBLUE}{NUM} days{BLACK})
+STR_VEHICLE_INFO_WAIT_TIMES_THIS_PERIOD_LAST_PERIOD             :{BLACK}Waiting for path: {LTBLUE}{NUM} days {BLACK}(last period: {LTBLUE}{NUM} days{BLACK}) · Waiting for cargo: {LTBLUE}{NUM} days {BLACK}(last period: {LTBLUE}{NUM} days{BLACK})
 STR_VEHICLE_INFO_RELIABILITY_BREAKDOWNS                         :{BLACK}Reliability: {LTBLUE}{COMMA}% (max: {COMMA}%)  {BLACK}Breakdowns since last service: {LTBLUE}{COMMA}
 
 STR_VEHICLE_INFO_BUILT_VALUE                                    :{LTBLUE}{ENGINE} {BLACK}Built: {LTBLUE}{NUM}{BLACK} Value: {LTBLUE}{CURRENCY_LONG}
@@ -5434,6 +5455,7 @@ STR_ERROR_CAN_T_BUILD_HERE                                      :Can't build {ST
 STR_ERROR_CAN_T_CONSTRUCT_THIS_INDUSTRY                         :Can't construct this industry type here...
 STR_ERROR_CAN_T_PROSPECT_INDUSTRY                               :Can't prospect industry...
 STR_ERROR_INDUSTRY_TOO_CLOSE                                    :too close to another industry
+STR_ERROR_INDUSTRY_AREA_TOO_LARGE                               :area too large (at most 256 × 256 tiles)
 STR_ERROR_MUST_FOUND_TOWN_FIRST                                 :must found town first
 STR_ERROR_ONLY_ONE_ALLOWED_PER_TOWN                             :only one allowed per town
 STR_ERROR_CAN_ONLY_BE_BUILT_IN_TOWNS_WITH_POPULATION_OF_1200    :can only be built in towns with a population of at least 1200

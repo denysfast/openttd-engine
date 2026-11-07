@@ -1269,6 +1269,7 @@ void PrepareUnload(Vehicle *front_v)
 
 	/* At this moment loading cannot be finished */
 	front_v->vehicle_flags.Reset(VehicleFlag::LoadingFinished);
+	front_v->vehicle_flags.Reset(VehicleFlag::CargoWait);
 
 	/* Start unloading at the first possible moment */
 	front_v->load_unload_ticks = 1;
@@ -1641,6 +1642,8 @@ static void LoadUnloadVehicle(Vehicle *front)
 	/* We have not waited enough time till the next round of loading/unloading */
 	if (front->load_unload_ticks != 0) return;
 
+	front->vehicle_flags.Reset(VehicleFlag::CargoWait);
+
 	const Vehicle *moving_front = front->GetMovingFront();
 	if (front->type == VehicleType::Train && (!IsTileType(moving_front->tile, TileType::Station) || GetStationIndex(moving_front->tile) != st->index)) {
 		/* The train reversed in the station. Take the "easy" way
@@ -1893,6 +1896,10 @@ static void LoadUnloadVehicle(Vehicle *front)
 		}
 
 		front->vehicle_flags.Set(VehicleFlag::LoadingFinished, finished_loading);
+
+		TimerGameTick::Ticks wait_time = std::max(front->current_order.GetTimetabledWait() - front->lateness_counter, 0);
+		front->vehicle_flags.Set(VehicleFlag::CargoWait,
+				cargo_not_full.Any() && (!finished_loading || front->current_order_time < wait_time));
 	}
 
 	/* Calculate the loading indicator fill percent and display

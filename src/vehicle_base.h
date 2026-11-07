@@ -229,6 +229,10 @@ public:
 
 	Money profit_this_year = 0; ///< Profit this year << 8, low 8 bits are fract
 	Money profit_last_year = 0; ///< Profit last year << 8, low 8 bits are fract
+	uint32_t wait_path_this_year = 0; ///< Number of ticks spent waiting for a path this economy year.
+	uint32_t wait_path_last_year = 0; ///< Number of ticks spent waiting for a path last economy year.
+	uint32_t wait_cargo_this_year = 0; ///< Number of ticks spent waiting for cargo this economy year.
+	uint32_t wait_cargo_last_year = 0; ///< Number of ticks spent waiting for cargo last economy year.
 	Money value = 0; ///< Value of the vehicle
 
 	CargoPayment *cargo_payment = nullptr; ///< The cargo payment we're currently in
@@ -773,12 +777,17 @@ public:
 
 		this->profit_this_year = src->profit_this_year;
 		this->profit_last_year = src->profit_last_year;
+		this->wait_path_this_year = src->wait_path_this_year;
+		this->wait_path_last_year = src->wait_path_last_year;
+		this->wait_cargo_this_year = src->wait_cargo_this_year;
+		this->wait_cargo_last_year = src->wait_cargo_last_year;
 
 		src->unitnumber = 0;
 	}
 
 
 	bool HandleBreakdown();
+	void UpdateWaitStatistics();
 
 	bool NeedsAutorenewing(const Company *c, bool use_renew_setting = true) const;
 

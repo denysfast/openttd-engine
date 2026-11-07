@@ -27,6 +27,7 @@ enum class VehicleFlag : uint8_t {
 	ServiceIntervalIsCustom = 8, ///< Service interval is custom.
 	ServiceIntervalIsPercent = 9, ///< Service interval is percent.
 	DrivingBackwards = 10, ///< Vehicle is driving backwards.
+	CargoWait = 11, ///< Vehicle could load cargo, but none was available during the last loading cycle.
 };
 
 /** Bitset of \c VehicleFlag elements. */

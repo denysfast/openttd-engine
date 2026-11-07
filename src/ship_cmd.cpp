@@ -807,6 +807,7 @@ static void ShipController(Ship *v)
 bool Ship::Tick()
 {
 	PerformanceAccumulator framerate(PerformanceElement::GameLoopShips);
+	this->UpdateWaitStatistics();
 
 	if (!this->vehstatus.Test(VehState::Stopped)) this->running_ticks++;
 
