@@ -70,17 +70,37 @@ static Json Dispatch(std::string_view method, Json params)
 	return *result;
 }
 
+/* The bridge's world ids and epochs are lower case version 4 UUIDs, exactly as GenerateUuid() makes them. */
+static constexpr std::string_view TASK_ID = "0f1c7f0e-6a2b-4d3c-9e58-7b1d2c3a4e60";
+static constexpr std::string_view WORLD_ID = "c2d4b8a6-1f39-4e57-8a02-5d6c7b8e9f10";
+static constexpr std::string_view EPOCH = "9b3e6d21-4c58-4a7f-b0d1-2e3f4a5b6c7d";
+static constexpr std::string_view OTHER_TASK_ID = "7a6b5c4d-3e2f-4a1b-9c8d-0e1f2a3b4c5d";
+static constexpr std::string_view OTHER_WORLD_ID = "5e4d3c2b-1a09-4f8e-9d7c-6b5a4f3e2d1c";
+static constexpr std::string_view OTHER_EPOCH = "1a2b3c4d-5e6f-4a7b-8c9d-0e1f2a3b4c5d";
+
 /**
  * Build the binding fields of a call.
  * @param plan_id The plan id.
  * @param task_id The task id.
  * @param world_id The world id.
- * @param world_epoch The world epoch.
+ * @param epoch The world epoch.
  * @return The parameter object of the call.
  */
-static Json Binding(uint32_t plan_id, std::string_view task_id = "task-1", std::string_view world_id = "world-1", uint64_t world_epoch = 7)
+static Json Binding(uint32_t plan_id, std::string_view task_id = TASK_ID, std::string_view world_id = WORLD_ID, std::string_view epoch = EPOCH)
 {
-	return Json{{"plan_id", plan_id}, {"task_id", task_id}, {"world_id", world_id}, {"world_epoch", world_epoch}};
+	return Json{{"plan_id", plan_id}, {"task_id", task_id}, {"world_id", world_id}, {"epoch", epoch}};
+}
+
+/**
+ * Add the operation to a parameter object.
+ * @param params The parameters.
+ * @param op The operation.
+ * @return The parameters with the operation.
+ */
+static Json WithOp(Json params, std::string_view op)
+{
+	params["op"] = std::string(op);
+	return params;
 }
 
 /**
@@ -107,9 +127,9 @@ static BlueprintToolPlan MakePlan(size_t chunks)
 	plan.name = "synthetic";
 	plan.origin = TileXY(0, 0);
 	plan.company = static_cast<CompanyID>(0);
-	plan.task_id = "task-1";
-	plan.world_id = "world-1";
-	plan.world_epoch = 7;
+	plan.task_id = std::string(TASK_ID);
+	plan.world_id = std::string(WORLD_ID);
+	plan.epoch = std::string(EPOCH);
 	plan.prepare_count = 0;
 	for (size_t i = 0; i < chunks; i++) plan.chunks.push_back(TrackChunk());
 	return plan;
@@ -285,20 +305,20 @@ TEST_CASE("Agent blueprint tools: plan validation")
 	/* The blueprint arguments are validated before the map is touched. */
 	CHECK(Dispatch("world.blueprint", Json::object({{"op", "plan"}}))["error"] == "invalid_arguments");
 	const Json bad_rotation = Dispatch("world.blueprint", Json::object({{"op", "plan"}, {"name", "agent_tools_test_blueprint"},
-			{"rotation", 5}, {"task_id", "task-1"}, {"world_id", "world-1"}, {"world_epoch", 7}}));
+			{"rotation", 5}, {"task_id", TASK_ID}, {"world_id", WORLD_ID}, {"epoch", EPOCH}}));
 	CHECK(bad_rotation["ok"] == false);
 	CHECK(bad_rotation["error"] == "invalid_arguments");
 	CHECK(Dispatch("world.blueprint", Json::object({{"op", "plan"}, {"name", "agent_tools_test_blueprint"},
-			{"mirror", "yes"}, {"task_id", "task-1"}, {"world_id", "world-1"}, {"world_epoch", 7}}))["error"] == "invalid_arguments");
+			{"mirror", "yes"}, {"task_id", TASK_ID}, {"world_id", WORLD_ID}, {"epoch", EPOCH}}))["error"] == "invalid_arguments");
 	CHECK(Dispatch("world.blueprint", Json::object({{"op", "plan"}, {"name", "agent_tools_test_blueprint"},
-			{"railtype", "ZZZZ"}, {"task_id", "task-1"}, {"world_id", "world-1"}, {"world_epoch", 7}}))["error"] == "unknown_railtype");
+			{"railtype", "ZZZZ"}, {"task_id", TASK_ID}, {"world_id", WORLD_ID}, {"epoch", EPOCH}}))["error"] == "unknown_railtype");
 	/* The binding is required: a plan belongs to one task on one world epoch. */
 	CHECK(Dispatch("world.blueprint", Json::object({{"op", "plan"}, {"name", "agent_tools_test_blueprint"}}))["error"] == "invalid_arguments");
 	CHECK(Dispatch("world.blueprint", Json::object({{"op", "plan"}, {"name", "agent_tools_test_blueprint"},
-			{"task_id", "task-1"}, {"world_id", "world-1"}, {"world_epoch", -1}}))["error"] == "invalid_arguments");
+			{"task_id", TASK_ID}, {"world_id", WORLD_ID}, {"epoch", 7}}))["error"] == "invalid_arguments");
 	/* Without a map there is no tile the blueprint could be pasted on. */
 	CHECK(Dispatch("world.blueprint", Json::object({{"op", "plan"}, {"name", "agent_tools_test_blueprint"},
-			{"origin", Json{{"x", 0}, {"y", 0}}}, {"task_id", "task-1"}, {"world_id", "world-1"}, {"world_epoch", 7}}))["error"] == "invalid_arguments");
+			{"origin", Json{{"x", 0}, {"y", 0}}}, {"task_id", TASK_ID}, {"world_id", WORLD_ID}, {"epoch", EPOCH}}))["error"] == "invalid_arguments");
 
 	/* The trunk line arguments are validated before the map is touched too. */
 	CHECK(Dispatch("world.rail_route", Json::object({{"op", "plan"}}))["error"] == "invalid_arguments");
@@ -322,24 +342,40 @@ TEST_CASE("Agent blueprint tools: bounded plan store")
 		ids.push_back(*id);
 	}
 	CHECK(ids[0] != ids[8]);
-	CHECK(Dispatch("world.blueprint", Json::object({{"op", "status"}, {"plan_id", ids[0]}}))["error"] == "unknown_plan");
-	const Json newest = Dispatch("world.blueprint", Json::object({{"op", "status"}, {"plan_id", ids[8]}}));
+	CHECK(Dispatch("world.blueprint", WithOp(Binding(ids[0]), "status"))["error"] == "unknown_plan");
+	const Json newest = Dispatch("world.blueprint", WithOp(Binding(ids[8]), "status"));
 	REQUIRE(newest["ok"] == true);
 	CHECK(newest["kind"] == "blueprint");
 	CHECK(newest["chunks"]["total"] == 1);
 	CHECK(newest["next_chunk_index"] == 0);
 	CHECK(newest["done"] == false);
-	CHECK(newest["binding"]["task_id"] == "task-1");
-	CHECK(newest["binding"]["world_epoch"] == 7);
+	CHECK(newest["binding"]["task_id"] == TASK_ID);
+	CHECK(newest["binding"]["epoch"] == EPOCH);
 
 	/* An empty plan and a plan of too many chunks are refused instead of truncated. */
 	CHECK_FALSE(StoreBlueprintToolPlan(MakePlan(0)).has_value());
 	BlueprintToolPlan big = MakePlan(1025);
 	CHECK_FALSE(StoreBlueprintToolPlan(std::move(big)).has_value());
 
+	/* The id space is 32 bit: the last id is handed out once and the store then refuses instead of reusing one. */
+	const uint64_t counter = BlueprintToolPlanIdCounter();
+	CHECK(counter > 1);
+	SetBlueprintToolPlanIdCounterForTest(UINT32_MAX);
+	const std::optional<uint32_t> last = StoreBlueprintToolPlan(MakePlan(1));
+	REQUIRE(last.has_value());
+	CHECK(*last == UINT32_MAX);
+	CHECK(BlueprintToolPlanIdCounter() == static_cast<uint64_t>(UINT32_MAX) + 1);
+	CHECK_FALSE(StoreBlueprintToolPlan(MakePlan(1)).has_value());
+	/* A refused plan reports the exhaustion, and the ids already handed out stay usable. */
+	const Json exhausted = Dispatch("world.blueprint", WithOp(Binding(*last), "status"));
+	REQUIRE(exhausted["ok"] == true);
+	CHECK(exhausted["plan_id"] == UINT32_MAX);
+	CHECK(Dispatch("world.blueprint", WithOp(Binding(*last), "drop"))["ok"] == true);
+	SetBlueprintToolPlanIdCounterForTest(counter);
+
 	/* Clean up: drop every plan this case made. */
 	for (const uint32_t id : ids) {
-		Dispatch("world.blueprint", Json::object({{"op", "drop"}, {"plan_id", id}, {"task_id", "task-1"}, {"world_id", "world-1"}, {"world_epoch", 7}}));
+		Dispatch("world.blueprint", Json::object({{"op", "drop"}, {"plan_id", id}, {"task_id", TASK_ID}, {"world_id", WORLD_ID}, {"epoch", EPOCH}}));
 	}
 }
 
@@ -352,14 +388,14 @@ TEST_CASE("Agent blueprint tools: chunk execution accounting")
 	/* A plan can only be executed by the task, world and epoch it was made for. */
 	CHECK(Dispatch("world.blueprint", Json::object({{"op", "execute_chunk"}, {"plan_id", plan_id}, {"chunk_index", 0}}))["error"] == "invalid_arguments");
 	const Json other_task = Dispatch("world.blueprint", Json::object({{"op", "execute_chunk"}, {"plan_id", plan_id},
-			{"chunk_index", 0}, {"task_id", "task-2"}, {"world_id", "world-1"}, {"world_epoch", 7}}));
+			{"chunk_index", 0}, {"task_id", OTHER_TASK_ID}, {"world_id", WORLD_ID}, {"epoch", EPOCH}}));
 	CHECK(other_task["ok"] == false);
 	CHECK(other_task["error"] == "plan_binding_mismatch");
 	const Json other_epoch = Dispatch("world.blueprint", Json::object({{"op", "execute_chunk"}, {"plan_id", plan_id},
-			{"chunk_index", 0}, {"task_id", "task-1"}, {"world_id", "world-1"}, {"world_epoch", 8}}));
+			{"chunk_index", 0}, {"task_id", TASK_ID}, {"world_id", WORLD_ID}, {"epoch", OTHER_EPOCH}}));
 	CHECK(other_epoch["error"] == "plan_binding_mismatch");
 	CHECK(Dispatch("world.blueprint", Json::object({{"op", "execute_chunk"}, {"plan_id", 999999},
-			{"chunk_index", 0}, {"task_id", "task-1"}, {"world_id", "world-1"}, {"world_epoch", 7}}))["error"] == "unknown_plan");
+			{"chunk_index", 0}, {"task_id", TASK_ID}, {"world_id", WORLD_ID}, {"epoch", EPOCH}}))["error"] == "unknown_plan");
 
 	/* Chunks are executed in order and inside the plan. */
 	Json params = Binding(plan_id);
@@ -391,15 +427,29 @@ TEST_CASE("Agent blueprint tools: chunk execution accounting")
 	CHECK(chunk["built"] == 0);
 
 	/* The status reports the same state. */
-	const Json status = Dispatch("world.blueprint", Json::object({{"op", "status"}, {"plan_id", plan_id}}));
+	const Json status = Dispatch("world.blueprint", WithOp(Binding(plan_id), "status"));
 	REQUIRE(status["ok"] == true);
 	CHECK(status["next_chunk_index"] == 0);
 	CHECK(status["done"] == false);
 	CHECK(status["stopped"] == false);
+	CHECK(status["binding"]["task_id"] == TASK_ID);
+	CHECK(status["binding"]["world_id"] == WORLD_ID);
+	CHECK(status["binding"]["epoch"] == EPOCH);
+
+	/* A read is bound like a write: another chat, another world or another epoch learns nothing. */
+	CHECK(Dispatch("world.blueprint", WithOp(Binding(plan_id, OTHER_TASK_ID), "status"))["error"] == "plan_binding_mismatch");
+	CHECK(Dispatch("world.blueprint", WithOp(Binding(plan_id, TASK_ID, OTHER_WORLD_ID), "status"))["error"] == "plan_binding_mismatch");
+	const Json old_epoch_status = Dispatch("world.blueprint", WithOp(Binding(plan_id, TASK_ID, WORLD_ID, OTHER_EPOCH), "status"));
+	CHECK(old_epoch_status["ok"] == false);
+	CHECK(old_epoch_status["error"] == "plan_binding_mismatch");
+	CHECK(old_epoch_status["detail"]["epoch"] == EPOCH);
+	CHECK(old_epoch_status["detail"]["task_id"] == TASK_ID);
+	/* The binding itself is required, so a call can never read a plan it did not name. */
+	CHECK(Dispatch("world.blueprint", Json::object({{"op", "status"}, {"plan_id", plan_id}}))["error"] == "invalid_arguments");
 
 	/* Stopping drops the remaining chunks and no chunk can run afterwards. */
 	const Json stopped = Dispatch("world.blueprint", Json::object({{"op", "stop"}, {"plan_id", plan_id},
-			{"task_id", "task-1"}, {"world_id", "world-1"}, {"world_epoch", 7}}));
+			{"task_id", TASK_ID}, {"world_id", WORLD_ID}, {"epoch", EPOCH}}));
 	REQUIRE(stopped["ok"] == true);
 	CHECK(stopped["stopped"] == true);
 	CHECK(stopped["done"] == true);
@@ -409,18 +459,18 @@ TEST_CASE("Agent blueprint tools: chunk execution accounting")
 
 	/* Dropping removes the plan; a stopped plan can still be dropped. */
 	const Json dropped = Dispatch("world.blueprint", Json::object({{"op", "drop"}, {"plan_id", plan_id},
-			{"task_id", "task-1"}, {"world_id", "world-1"}, {"world_epoch", 7}}));
+			{"task_id", TASK_ID}, {"world_id", WORLD_ID}, {"epoch", EPOCH}}));
 	REQUIRE(dropped["ok"] == true);
 	CHECK(dropped["dropped"] == true);
-	CHECK(Dispatch("world.blueprint", Json::object({{"op", "status"}, {"plan_id", plan_id}}))["error"] == "unknown_plan");
+	CHECK(Dispatch("world.blueprint", WithOp(Binding(plan_id), "status"))["error"] == "unknown_plan");
 
 	/* Stopping and dropping belong to the owning task. */
 	const std::optional<uint32_t> owned = StoreBlueprintToolPlan(MakePlan(1));
 	REQUIRE(owned.has_value());
 	CHECK(Dispatch("world.blueprint", Json::object({{"op", "stop"}, {"plan_id", *owned},
-			{"task_id", "task-2"}, {"world_id", "world-1"}, {"world_epoch", 7}}))["error"] == "plan_binding_mismatch");
+			{"task_id", OTHER_TASK_ID}, {"world_id", WORLD_ID}, {"epoch", EPOCH}}))["error"] == "plan_binding_mismatch");
 	CHECK(Dispatch("world.blueprint", Json::object({{"op", "drop"}, {"plan_id", *owned},
-			{"task_id", "task-1"}, {"world_id", "world-1"}, {"world_epoch", 7}}))["ok"] == true);
+			{"task_id", TASK_ID}, {"world_id", WORLD_ID}, {"epoch", EPOCH}}))["ok"] == true);
 }
 
 TEST_CASE("Agent blueprint tools: capture validation")

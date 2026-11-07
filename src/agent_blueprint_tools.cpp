@@ -315,24 +315,26 @@ std::optional<Json> ReadRailTypeLabelParam(const Json &params, std::string_view 
 /**
  * Read the task, world and epoch binding of a call.
  *
- * The binding is what makes a plan belong to one task on one world epoch: the bridge passes the same
- * three fields for every call of the task, and this module refuses a plan of another binding.
+ * The binding is what makes a plan belong to one task on one world and one epoch: the bridge passes the
+ * `task_id`, `world_id` and `epoch` of the request it is executing, and this module refuses a plan of
+ * another binding. `epoch` is the bridge's UUID string of the current load of the world, not a number.
+ * A task is required, so two chats can never share a plan by accident.
  *
- * @param params The method parameters.
- * @param task_id Receives the task id.
- * @param world_id Receives the world id.
- * @param world_epoch Receives the world epoch.
+ * @param params The method parameters, with the binding of the request injected by the bridge.
+ * @param task_id Receives the task id of the call.
+ * @param world_id Receives the world id of the call.
+ * @param epoch Receives the world epoch of the call.
  * @return An error document, or nothing when the binding is usable.
  */
-std::optional<Json> ReadBinding(const Json &params, std::string &task_id, std::string &world_id, uint64_t &world_epoch)
+std::optional<Json> ReadBinding(const Json &params, std::string &task_id, std::string &world_id, std::string &epoch)
 {
 	switch (ReadString(params, "task_id", task_id)) {
 		case ParamState::Invalid: return MakeError("invalid_arguments", "`task_id` must be a string");
-		case ParamState::Absent: return MakeError("invalid_arguments", "`task_id` is required");
+		case ParamState::Absent: return MakeError("invalid_arguments", "`task_id` is required: a plan belongs to one task");
 		case ParamState::Present: break;
 	}
 	if (task_id.empty() || task_id.size() > MAX_BINDING_BYTES) {
-		return MakeError("invalid_arguments", "`task_id` is out of range", {{"max_bytes", MAX_BINDING_BYTES}});
+		return MakeError("invalid_arguments", "`task_id` is out of range", {{"min_bytes", 1}, {"max_bytes", MAX_BINDING_BYTES}});
 	}
 
 	switch (ReadString(params, "world_id", world_id)) {
@@ -341,17 +343,17 @@ std::optional<Json> ReadBinding(const Json &params, std::string &task_id, std::s
 		case ParamState::Present: break;
 	}
 	if (world_id.empty() || world_id.size() > MAX_BINDING_BYTES) {
-		return MakeError("invalid_arguments", "`world_id` is out of range", {{"max_bytes", MAX_BINDING_BYTES}});
+		return MakeError("invalid_arguments", "`world_id` is out of range", {{"min_bytes", 1}, {"max_bytes", MAX_BINDING_BYTES}});
 	}
 
-	int64_t epoch = 0;
-	switch (ReadInt(params, "world_epoch", epoch)) {
-		case ParamState::Invalid: return MakeError("invalid_arguments", "`world_epoch` must be an integer");
-		case ParamState::Absent: return MakeError("invalid_arguments", "`world_epoch` is required");
+	switch (ReadString(params, "epoch", epoch)) {
+		case ParamState::Invalid: return MakeError("invalid_arguments", "`epoch` must be a string");
+		case ParamState::Absent: return MakeError("invalid_arguments", "`epoch` is required");
 		case ParamState::Present: break;
 	}
-	if (epoch < 0) return MakeError("invalid_arguments", "`world_epoch` must not be negative");
-	world_epoch = static_cast<uint64_t>(epoch);
+	if (epoch.empty() || epoch.size() > MAX_BINDING_BYTES) {
+		return MakeError("invalid_arguments", "`epoch` is out of range", {{"min_bytes", 1}, {"max_bytes", MAX_BINDING_BYTES}});
+	}
 	return std::nullopt;
 }
 
@@ -389,6 +391,18 @@ Json TileDocument(TileIndex tile)
 }
 
 /**
+ * Explain why the plan store refused a plan.
+ * @return The error document: the ids are used up, or the store is full.
+ */
+Json PlanStoreRefusal()
+{
+	if (BlueprintToolPlanIdCounter() > UINT32_MAX) {
+		return MakeError("plan_id_exhausted", "the 32 bit plan id space is used up; plan ids are never reused");
+	}
+	return MakeError("plan_store_full", "the plan store is full; stop or drop a plan first");
+}
+
+/**
  * Document of the last error of a plan.
  * @param error The error string, or INVALID_STRING_ID.
  * @return The error text, or null.
@@ -407,8 +421,8 @@ struct InFlightChunk {
 
 /** Plans of this module, oldest first. */
 std::vector<BlueprintToolPlan> _plans;
-/** Id of the next plan; engine-owned and never reused. */
-uint32_t _next_plan_id = 1;
+/** Id the store hands out next; engine-owned, starts at 1 and is never turned back. */
+uint64_t _next_plan_id = 1;
 /** Number of chunk bytes the store holds. */
 size_t _stored_bytes = 0;
 /** Chunk commands waiting for their result. */
@@ -461,7 +475,7 @@ Json BindingDocument(const BlueprintToolPlan &plan)
 	return Json{
 			{"task_id", plan.task_id},
 			{"world_id", plan.world_id},
-			{"world_epoch", plan.world_epoch},
+			{"epoch", plan.epoch},
 			{"company_id", plan.company.base()},
 	};
 }
@@ -670,12 +684,11 @@ std::optional<Json> LoadBlueprintBounded(std::string_view name, Blueprint &bp)
  * @param plan Receives the plan.
  * @param task_id Receives the task id of the call.
  * @param world_id Receives the world id of the call.
- * @param world_epoch Receives the world epoch of the call.
- * @param check_binding Whether the binding of the plan must match the call.
- * @return An error document, or nothing when the plan was found.
+ * @param epoch Receives the world epoch of the call.
+ * @return An error document, or nothing when the plan was found and belongs to the call.
  */
 std::optional<Json> FindBoundPlan(const Json &params, BlueprintToolPlan *&plan, std::string &task_id, std::string &world_id,
-		uint64_t &world_epoch, bool check_binding)
+		std::string &epoch)
 {
 	int64_t id = 0;
 	switch (ReadInt(params, "plan_id", id)) {
@@ -685,15 +698,13 @@ std::optional<Json> FindBoundPlan(const Json &params, BlueprintToolPlan *&plan, 
 	}
 	if (id <= 0 || id > UINT32_MAX) return MakeError("invalid_arguments", "`plan_id` is out of range");
 
-	if (check_binding) {
-		if (const auto error = ReadBinding(params, task_id, world_id, world_epoch)) return error;
-	}
+	if (const auto error = ReadBinding(params, task_id, world_id, epoch)) return error;
 
 	plan = FindPlan(static_cast<uint32_t>(id));
 	if (plan == nullptr) return MakeError("unknown_plan", "there is no plan with that id", {{"plan_id", id}});
 
-	if (check_binding && (plan->task_id != task_id || plan->world_id != world_id || plan->world_epoch != world_epoch)) {
-		return MakeError("plan_binding_mismatch", "the plan belongs to another task, world or world epoch", BindingDocument(*plan));
+	if (plan->task_id != task_id || plan->world_id != world_id || plan->epoch != epoch) {
+		return MakeError("plan_binding_mismatch", "the plan belongs to another task, world or epoch", BindingDocument(*plan));
 	}
 	return std::nullopt;
 }
@@ -866,8 +877,8 @@ Json BlueprintPlanOp(const Json &params, CompanyID company)
 
 	std::string task_id;
 	std::string world_id;
-	uint64_t world_epoch = 0;
-	if (const auto error = ReadBinding(params, task_id, world_id, world_epoch)) return *error;
+	std::string epoch;
+	if (const auto error = ReadBinding(params, task_id, world_id, epoch)) return *error;
 
 	TileIndex origin = INVALID_TILE;
 	switch (ReadTile(params, "origin", origin)) {
@@ -902,12 +913,12 @@ Json BlueprintPlanOp(const Json &params, CompanyID company)
 	plan.company = actor;
 	plan.task_id = std::move(task_id);
 	plan.world_id = std::move(world_id);
-	plan.world_epoch = world_epoch;
+	plan.epoch = std::move(epoch);
 	plan.prepare_count = 0;
 	plan.chunks = std::move(paste.chunks);
 
 	const std::optional<uint32_t> plan_id = StoreBlueprintToolPlan(std::move(plan));
-	if (!plan_id.has_value()) return MakeError("plan_store_full", "the plan store is full; stop or drop a plan first");
+	if (!plan_id.has_value()) return PlanStoreRefusal();
 
 	Json result = PlanDocument(*FindPlan(*plan_id));
 	result["items"] = paste.items;
@@ -1012,8 +1023,8 @@ Json RailRoutePlanOp(const Json &params, CompanyID company)
 
 	std::string task_id;
 	std::string world_id;
-	uint64_t world_epoch = 0;
-	if (const auto error = ReadBinding(params, task_id, world_id, world_epoch)) return *error;
+	std::string epoch;
+	if (const auto error = ReadBinding(params, task_id, world_id, epoch)) return *error;
 
 	CompanyID actor = company;
 	if (const auto error = ReadCompany(params, company, actor)) return *error;
@@ -1047,7 +1058,7 @@ Json RailRoutePlanOp(const Json &params, CompanyID company)
 	plan.company = actor;
 	plan.task_id = std::move(task_id);
 	plan.world_id = std::move(world_id);
-	plan.world_epoch = world_epoch;
+	plan.epoch = std::move(epoch);
 	plan.prepare_count = route.prepare.size();
 	plan.chunks = std::move(route.prepare);
 	for (BlueprintChunkData &chunk : route.build) plan.chunks.push_back(std::move(chunk));
@@ -1058,7 +1069,7 @@ Json RailRoutePlanOp(const Json &params, CompanyID company)
 	}
 
 	const std::optional<uint32_t> plan_id = StoreBlueprintToolPlan(std::move(plan));
-	if (!plan_id.has_value()) return MakeError("plan_store_full", "the plan store is full; stop or drop a plan first");
+	if (!plan_id.has_value()) return PlanStoreRefusal();
 
 	Json result = PlanDocument(*FindPlan(*plan_id));
 	result["length"] = route.length;
@@ -1089,8 +1100,8 @@ Json PlanExecuteChunkOp(const Json &params)
 	BlueprintToolPlan *plan = nullptr;
 	std::string task_id;
 	std::string world_id;
-	uint64_t world_epoch = 0;
-	if (const auto error = FindBoundPlan(params, plan, task_id, world_id, world_epoch, true)) return *error;
+	std::string epoch;
+	if (const auto error = FindBoundPlan(params, plan, task_id, world_id, epoch)) return *error;
 
 	int64_t index = 0;
 	switch (ReadInt(params, "chunk_index", index)) {
@@ -1154,6 +1165,9 @@ Json PlanExecuteChunkOp(const Json &params)
 
 /**
  * Report the progress of a plan.
+ *
+ * The status is bound to the task, world and epoch of the call like every other plan operation, so a
+ * read can never disclose the plan of another chat or of a world that has been left.
  * @param params The method parameters.
  * @return The result document.
  */
@@ -1162,8 +1176,8 @@ Json PlanStatusOp(const Json &params)
 	BlueprintToolPlan *plan = nullptr;
 	std::string task_id;
 	std::string world_id;
-	uint64_t world_epoch = 0;
-	if (const auto error = FindBoundPlan(params, plan, task_id, world_id, world_epoch, false)) return *error;
+	std::string epoch;
+	if (const auto error = FindBoundPlan(params, plan, task_id, world_id, epoch)) return *error;
 	return PlanDocument(*plan);
 }
 
@@ -1177,8 +1191,8 @@ Json PlanStopOp(const Json &params)
 	BlueprintToolPlan *plan = nullptr;
 	std::string task_id;
 	std::string world_id;
-	uint64_t world_epoch = 0;
-	if (const auto error = FindBoundPlan(params, plan, task_id, world_id, world_epoch, true)) return *error;
+	std::string epoch;
+	if (const auto error = FindBoundPlan(params, plan, task_id, world_id, epoch)) return *error;
 	if (plan->pending) {
 		return MakeError("chunk_in_flight", "the previous chunk of this plan has no result yet",
 				{{"plan_id", plan->plan_id}, {"next_chunk_index", plan->next_chunk}});
@@ -1206,8 +1220,8 @@ Json PlanDropOp(const Json &params)
 	BlueprintToolPlan *plan = nullptr;
 	std::string task_id;
 	std::string world_id;
-	uint64_t world_epoch = 0;
-	if (const auto error = FindBoundPlan(params, plan, task_id, world_id, world_epoch, true)) return *error;
+	std::string epoch;
+	if (const auto error = FindBoundPlan(params, plan, task_id, world_id, epoch)) return *error;
 	if (plan->pending) {
 		return MakeError("chunk_in_flight", "the previous chunk of this plan has no result yet",
 				{{"plan_id", plan->plan_id}, {"next_chunk_index", plan->next_chunk}});
@@ -1337,10 +1351,10 @@ Json BlueprintToolCapabilities()
 	result["bounds"] = std::move(bounds);
 	result["notes"] = Json::array({
 			"Blueprints are the engine's own files in the native blueprint directory; names are simple file names, so a call can never read or write another path.",
-			"A plan is a bounded record of one blueprint paste or one trunk line: the module hands out the plan id, keeps at most a fixed number of plans, chunks and bytes, and refuses a plan that does not fit instead of truncating it.",
+			"A plan is a bounded record of one blueprint paste or one trunk line: the module hands out the plan id from a 32 bit counter that never hands out the same id twice and refuses new plans when the id space is used up, keeps at most a fixed number of plans, chunks and bytes, and refuses a plan that does not fit instead of truncating it.",
 			"Every chunk is one normal Commands::PasteBlueprint or Commands::PrepareRailRoute command posted for the plan's company, so the engine's own eligibility, pause and finance checks apply and the reported cost is the engine's cost.",
 			"One chunk per call: execute_chunk executes exactly the next chunk of the plan and reports the engine's result for it; nothing runs in the background, so nothing keeps building after the bridge stops calling and the player's own paste job is not touched.",
-			"A plan is bound to task_id, world_id, world_epoch and company_id; execute_chunk, stop and drop refuse a plan of another binding, and the bridge checks the world epoch and the task barrier before every call.",
+			"A plan is bound to the request binding the bridge uses: task_id, world_id and epoch (the bridge's UUID string of the current load of the world), plus the company the chunks are posted for. plan, status, execute_chunk, stop and drop all require that binding and refuse a plan of another task, world or epoch, so a read can never disclose the plan of another chat; the bridge checks the world, the epoch and the task barrier before every call and injects the three fields from the request, never from the model's parameters.",
 			"capture, plan, execute_chunk, stop and drop are reported as mutations because they change the plan store or the world; list, inspect and status are the read-only operations.",
 			"Chunk indices are executed in order; a chunk that the engine did not build (built and failed both zero) is not counted as done, so submitted work is never reported as done.",
 			"Performance: capture is one pass over at most 8192 tiles, planning a blueprint is linear in its items plus an ordered split of its station tiles, and planning a trunk line runs the engine's route search whose cost grows with the route length times the number of tracks; no call waits for the network or the model, and no call scans the whole map.",
@@ -1377,6 +1391,10 @@ std::optional<uint32_t> StoreBlueprintToolPlan(BlueprintToolPlan plan)
 	const size_t bytes = PlanBytes(plan);
 	if (bytes > MAX_PLAN_BYTES) return std::nullopt;
 
+	/* The id space is 32 bit; once it is used up the store refuses instead of reusing an old id. The
+	 * check comes first, so an exhausted store never evicts a plan it could not replace. */
+	if (_next_plan_id > UINT32_MAX) return std::nullopt;
+
 	/* Make room: finished and stopped plans are dropped first, then the oldest plan without a result in flight. */
 	auto evict = [](bool only_finished) {
 		for (auto it = _plans.begin(); it != _plans.end(); ++it) {
@@ -1392,8 +1410,7 @@ std::optional<uint32_t> StoreBlueprintToolPlan(BlueprintToolPlan plan)
 		if (!evict(true) && !evict(false)) return std::nullopt;
 	}
 
-	if (_next_plan_id == 0) _next_plan_id = 1;
-	plan.plan_id = _next_plan_id++;
+	plan.plan_id = static_cast<uint32_t>(_next_plan_id++);
 	plan.next_chunk = 0;
 	plan.cost = 0;
 	plan.built = 0;
@@ -1405,6 +1422,16 @@ std::optional<uint32_t> StoreBlueprintToolPlan(BlueprintToolPlan plan)
 	_stored_bytes += bytes;
 	_plans.push_back(std::move(plan));
 	return _plans.back().plan_id;
+}
+
+uint64_t BlueprintToolPlanIdCounter()
+{
+	return _next_plan_id;
+}
+
+void SetBlueprintToolPlanIdCounterForTest(uint64_t next_plan_id)
+{
+	_next_plan_id = std::max<uint64_t>(next_plan_id, 1);
 }
 
 void AgentBlueprintChunkCallback(Commands, const CommandCost &result, Money extra_money, uint32_t built, uint32_t failed, StringID last_error)

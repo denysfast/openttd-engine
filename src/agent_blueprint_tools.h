@@ -36,9 +36,12 @@ using Json = nlohmann::json;
  *
  * A plan is the bridge's handle on a piece of work that is built one chunk per call. The module owns
  * the record: it hands out the id, keeps the chunks, and counts the results of the commands it posts.
- * The plan is bound to the task, the world and the world epoch of the call that made it, so a chunk
- * can only be executed by the same task on the same world epoch; the bridge checks the epoch and the
- * task barrier before every call, and this module refuses a plan whose binding does not match.
+ * The plan is bound to the `task_id`, `world_id` and `epoch` of the request that made it, exactly as
+ * the bridge names them in its own request binding (`epoch` is the bridge's UUID string of the current
+ * load of the world), so a chunk can only be executed by the same task on the same world and epoch.
+ * The bridge checks the world, the epoch and the task barrier before every call; this module refuses a
+ * plan whose binding does not match, so a read or a write of one chat can never reach the plan of
+ * another.
  *
  * A plan never runs on its own: there is no timer and no background job, so nothing keeps building
  * after the bridge stops calling, and the player's own blueprint paste job is not touched.
@@ -51,7 +54,7 @@ struct BlueprintToolPlan {
 	CompanyID company = CompanyID::Invalid(); ///< Company the chunks are posted for.
 	std::string task_id{}; ///< Task the plan is bound to.
 	std::string world_id{}; ///< World the plan is bound to.
-	uint64_t world_epoch = 0; ///< World epoch the plan is bound to.
+	std::string epoch{}; ///< World epoch (the bridge's UUID string) the plan is bound to.
 	size_t prepare_count = 0; ///< The first this-many chunks are Commands::PrepareRailRoute chunks.
 	std::vector<BlueprintChunkData> chunks{}; ///< The commands, in execution order.
 
@@ -75,9 +78,11 @@ Json BlueprintToolCapabilities();
 /**
  * Dispatch one rail blueprint or trunk line tool call onto the engine.
  *
- * The bridge validates the world epoch, the task barrier and the expected references before it calls
- * this; the module validates the ids, the enums, the names and the bounds of the call itself before it
- * reads or posts anything. Every world change goes through Command<Commands::PasteBlueprint>::Post or
+ * The bridge validates the world, the epoch, the task barrier and the expected references before it
+ * calls this, and it injects the authoritative binding of the request — `task_id`, `world_id` and
+ * `epoch`, all strings, taken from the request itself and never from the model's parameters — into
+ * `params`; the module validates the ids, the enums, the names and the bounds of the call itself
+ * before it reads or posts anything. Every world change goes through Command<Commands::PasteBlueprint>::Post or
  * Command<Commands::PrepareRailRoute>::Post, so the engine's own eligibility, pause and finance checks
  * apply, and the reported cost is the one the engine returned.
  *
@@ -95,7 +100,8 @@ std::optional<Json> DispatchBlueprintTool(std::string_view method, const Json &p
  * operations are world.blueprint op=list|inspect|status and world.rail_route op=status. Planning and
  * capturing do not change the world either, but they do change this module's plan store, so they are
  * reported as mutations to be safe; only an unknown operation of an owned method is reported as a
- * mutation for the same reason.
+ * mutation for the same reason. A read-only `status` still needs the request binding, because it must
+ * never disclose the plan of another task, world or epoch.
  *
  * @param method The method name.
  * @param params The method parameters.
@@ -107,12 +113,31 @@ bool IsBlueprintMutation(std::string_view method, const Json &params);
  * Store a plan and give it its engine-owned id.
  *
  * The store is bounded: at most a fixed number of plans, of chunks and of bytes are kept. A plan that
- * is too large, or a store that is full, is refused instead of silently truncated.
+ * is too large, or a store that is full, is refused instead of silently truncated. Ids come from a
+ * 32 bit counter that starts at 1: an id is never handed out twice, and once the counter is used up the
+ * store refuses new plans instead of wrapping around and reusing an old id.
  *
  * @param plan The plan; its id is assigned here.
- * @return The plan id, or std::nullopt when the plan does not fit in the store.
+ * @return The plan id, or std::nullopt when the plan does not fit in the store or the ids are used up.
  */
 std::optional<uint32_t> StoreBlueprintToolPlan(BlueprintToolPlan plan);
+
+/**
+ * The id the plan store hands out next.
+ *
+ * Used by the tests, and by a caller that wants to know how close the 32 bit id space is to its end.
+ * @return The next plan id, or one past the id space when it is used up.
+ */
+uint64_t BlueprintToolPlanIdCounter();
+
+/**
+ * Set the id the plan store hands out next.
+ *
+ * Only the tests use this: it makes the end of the 32 bit id space reachable without storing four
+ * billion plans. The counter is engine-owned; no call of the bridge sets it.
+ * @param next_plan_id The next plan id; 1 or more.
+ */
+void SetBlueprintToolPlanIdCounterForTest(uint64_t next_plan_id);
 
 /**
  * Callback of Commands::PasteBlueprint and Commands::PrepareRailRoute.
