@@ -10,8 +10,9 @@
  * resolution of the agent bridge: tile categories, state fingerprints, stale validation, the
  * generic `tile` alias, a house with its town lifetime, a map object with its pool lifetime,
  * ownership, points, the road subtypes (a road depot with its pool lifetime, a tram depot, a level
- * crossing, a road stop and a road bridgehead), the error cases and the calendar conversion
- * `world.info` reports.
+ * crossing, a road stop and a road bridgehead), the pooled structures a station or an industry tile
+ * stands on (read, guarded removal through the real command path, rebuilt lifetime), the error
+ * cases and the calendar conversion `world.info` reports.
  *
  * The bridge reads only the requested tile, so a small allocated map is enough: no game loop, no
  * video driver and no command is needed.
@@ -22,18 +23,25 @@
 #include "../3rdparty/catch2/catch.hpp"
 
 #include "../agent_bridge.h"
+#include "../agent_command_catalog.h"
 #include "../bridge_map.h"
+#include "../company_func.h"
+#include "../core/backup_type.hpp"
 #include "../depot_base.h"
+#include "../industry.h"
+#include "../industry_map.h"
 #include "../map_func.h"
 #include "../object_base.h"
 #include "../object_map.h"
 #include "../openttd.h"
 #include "../rail_map.h"
 #include "../road.h"
+#include "../roadstop_base.h"
 #include "../company_base.h"
 #include "../settings_internal.h"
 #include "../settings_type.h"
 #include "../road_map.h"
+#include "../station_base.h"
 #include "../station_map.h"
 #include "../station_type.h"
 #include "../tile_map.h"
@@ -132,6 +140,141 @@ Town *TestTown(TileIndex tile)
 	for (const Town *existing : Town::Iterate()) return const_cast<Town *>(existing);
 	REQUIRE(Town::CanAllocateItem());
 	return Town::Create(tile);
+}
+
+/** A real company in the engine's own company pool, removed again when the guard goes out of scope. */
+class TestCompany {
+public:
+	TestCompany()
+	{
+		REQUIRE(Company::CanAllocateItem());
+		this->company = Company::Create();
+		REQUIRE(this->company != nullptr);
+		/* The clearing quota a running game gives a company; the demolition below checks it. */
+		this->company->clear_limit = UINT32_MAX;
+	}
+
+	~TestCompany() { delete this->company; }
+
+	CompanyID Id() const { return this->company->index; }
+
+private:
+	Company *company = nullptr; ///< The company the fixture created.
+};
+
+/**
+ * One real bus stop: a `Station` and a `RoadStop` in the engine's own pools, with the bus stop tile
+ * the engine's own builder writes, removed again when the fixture goes out of scope.
+ *
+ * The state is what `CmdBuildRoadStop` writes for a one tile bay stop: the station owns the stop, the
+ * tile carries the station id and the owner, the station lists the tile in its bus area and its
+ * spread, and the company counts one station tile. The removal path of the engine reads exactly
+ * that, so the fixture is the state a real build leaves behind.
+ */
+class TestBusStop {
+public:
+	TestBusStop(TileIndex tile, Owner owner)
+	{
+		REQUIRE(Station::GetNumItems() == 0);
+		REQUIRE(RoadStop::GetNumItems() == 0);
+		Create(tile, owner);
+	}
+
+	~TestBusStop()
+	{
+		_station_pool.CleanPool();
+		_roadstop_pool.CleanPool();
+	}
+
+	/**
+	 * Remove the stop and build it again on the same tile: the pool hands out the same id with a new
+	 * lifetime, so the tile carries a station the caller has never seen.
+	 */
+	Station *Rebuild(TileIndex tile, Owner owner)
+	{
+		_station_pool.CleanPool();
+		_roadstop_pool.CleanPool();
+		return Create(tile, owner);
+	}
+
+	Station *Get() const { return this->station; }
+
+private:
+	Station *station = nullptr; ///< The station the fixture created.
+
+	Station *Create(TileIndex tile, Owner owner)
+	{
+		REQUIRE(Station::CanAllocateItem());
+		REQUIRE(RoadStop::CanAllocateItem());
+		this->station = Station::Create(tile);
+		REQUIRE(this->station != nullptr);
+		this->station->owner = owner;
+
+		MakeRoadStop(tile, owner, this->station->index, RoadStopType::Bus, ROADTYPE_ROAD, INVALID_ROADTYPE, DiagDirection::NE);
+
+		RoadStop *stop = RoadStop::Create(tile);
+		REQUIRE(stop != nullptr);
+		this->station->bus_stops = stop;
+		this->station->bus_station.Add(tile);
+		this->station->AddFacility(StationFacility::BusStop, tile);
+		this->station->spread.Add(tile);
+		Company::Get(owner)->infrastructure.station++;
+		return this->station;
+	}
+};
+
+/** One real industry tile in the engine's own industry pool, removed again with the fixture. */
+class TestIndustry {
+public:
+	TestIndustry(TileIndex tile) { Create(tile); }
+
+	~TestIndustry() { _industry_pool.CleanPool(); }
+
+	/**
+	 * Remove the industry and build it again on the same tile: the pool hands out the same id with a
+	 * new lifetime, so the tile carries an industry the caller has never seen.
+	 */
+	Industry *Rebuild(TileIndex tile)
+	{
+		_industry_pool.CleanPool();
+		return Create(tile);
+	}
+
+	Industry *Get() const { return this->industry; }
+
+private:
+	Industry *industry = nullptr; ///< The industry the fixture created.
+
+	Industry *Create(TileIndex tile)
+	{
+		REQUIRE(Industry::CanAllocateItem());
+		this->industry = Industry::Create(tile);
+		REQUIRE(this->industry != nullptr);
+		MakeIndustry(tile, this->industry->index, IndustryGfx{0}, 0, WaterClass::Invalid);
+		return this->industry;
+	}
+};
+
+/**
+ * The generic tile reference a caller keeps for the structure that stands on `tile`.
+ *
+ * It is the read the agent does: `{type: "tile", tile}`, and the answer is the row the caller then
+ * hands back as the guard of a write.
+ */
+Json ReadStructureRef(TileIndex tile)
+{
+	const Json read = ResolveObjectRef(Json{{"type", "tile"}, {"tile", TilePoint(TileX(tile), TileY(tile))}}, false);
+	REQUIRE(read["found"] == true);
+	Json ref = {{"type", "tile"}, {"tile", read["tile"]}, {"what", read["what"]}, {"fingerprint", read["fingerprint"]}};
+	return ref;
+}
+
+/** Run one engine command through the catalog's own write path, as `world.command` does. */
+Json CallCommandAs(const Json &params, CompanyID company)
+{
+	const std::optional<Json> result = DispatchCommandCatalog("world.command", params, company);
+	REQUIRE(result.has_value());
+	return *result;
 }
 
 } // namespace
@@ -1022,4 +1165,188 @@ TEST_CASE("Agent bridge refs: a setting reference belongs to one world and epoch
 	CHECK(stale["reason"] == "world_mismatch");
 
 	_game_mode = previous_mode;
+}
+
+TEST_CASE("Agent bridge refs: a station structure tile is a generic tile object")
+{
+	MapFixture map;
+	TestCompany company;
+
+	/* A real bus stop: the engine's own station pool item behind a bus stop tile. */
+	const TileIndex tile = TileXY(60, 60);
+	TestBusStop stop(tile, company.Id());
+	REQUIRE(stop.Get() != nullptr);
+
+	/* The generic tile spelling resolves the structure the tile stands on, which is the read the
+	 * agent needs: the tile carries no typed landscape object of its own. */
+	const Json row = ResolveObjectRef(Json{{"type", "tile"}, {"tile", TilePoint(60, 60)}}, false);
+	REQUIRE(row["found"] == true);
+	CHECK(row["type"] == "tile");
+	CHECK(row["what"] == "station");
+	CHECK(row["subtype"] == "bus_stop");
+	CHECK(row["identity"] == "tile");
+	CHECK(row["tile"] == TilePoint(60, 60));
+	CHECK(row["owner"] == company.Id().base());
+	CHECK(row["fingerprint"].is_number_unsigned());
+
+	/* The structure is a tile object, not a pooled one: no pool id and no lifetime is claimed as
+	 * the identity of the tile. */
+	CHECK_FALSE(row.contains("id"));
+	CHECK_FALSE(row.contains("generation"));
+
+	/* The `what` the row reports roundtrips, and it is the state a write is guarded with. */
+	const Json ref = ReadStructureRef(tile);
+	CHECK(ref["what"] == "station");
+	CHECK(ResolveObjectRef(ref, true)["found"] == true);
+
+	/* Another structure kind on the same tile does not silently retarget: the answer names what
+	 * really stands there. */
+	const Json industry_what = ResolveObjectRef(Json{{"type", "tile"}, {"what", "industry"}, {"tile", TilePoint(60, 60)}}, false);
+	CHECK(industry_what["found"] == false);
+	CHECK(industry_what["reason"] == "tile_type_mismatch");
+	REQUIRE(industry_what["what"].is_array());
+	REQUIRE(industry_what["what"].size() == 1);
+	CHECK(industry_what["what"][0] == "station");
+
+	/* A typed landscape category is still not what a station tile carries, and it is not invented. */
+	const Json typed_what = ResolveObjectRef(Json{{"type", "tile"}, {"what", "road"}, {"tile", TilePoint(60, 60)}}, false);
+	CHECK(typed_what["found"] == false);
+	CHECK(typed_what["reason"] == "tile_type_mismatch");
+
+	/* A `what` that names neither a typed category nor a structure stays an invalid argument. */
+	const Json unknown_what = ResolveObjectRef(Json{{"type", "tile"}, {"what", "planet"}, {"tile", TilePoint(60, 60)}}, false);
+	CHECK(unknown_what["found"] == false);
+	CHECK(unknown_what["error"] == "invalid_params");
+	CHECK(unknown_what["reason"] == "unknown_what");
+
+	/* The typed rows are unchanged: a station tile carries no typed landscape object. */
+	CHECK(DescribeTileObjects(tile).empty());
+
+	/* The void at the map edge and a tile off the map stay honest. */
+	const TileIndex void_tile = TileXY(63, 63);
+	SetTileType(void_tile, TileType::Void);
+	const Json void_row = ResolveObjectRef(Json{{"type", "tile"}, {"tile", TilePoint(63, 63)}}, false);
+	CHECK(void_row["found"] == false);
+	CHECK(void_row["reason"] == "tile_type_mismatch");
+	CHECK(ResolveObjectRef(Json{{"type", "tile"}, {"tile", TilePoint(1000, 1000)}}, false)["reason"] == "invalid_tile");
+}
+
+TEST_CASE("Agent bridge refs: a read of a bus stop guards its removal through the command path")
+{
+	MapFixture map;
+	TestCompany company;
+
+	const TileIndex tile = TileXY(61, 61);
+	TestBusStop stop(tile, company.Id());
+	REQUIRE(stop.Get() != nullptr);
+
+	/* The read the task keeps, and the strict guard built from it: the write resolves while the
+	 * stop the read saw still stands on the tile. */
+	const Json ref = ReadStructureRef(tile);
+	CHECK(ResolveObjectRef(ref, true)["found"] == true);
+
+	/* `CmdLandscapeClear` is the engine's own supported path for a demolition: it is the command
+	 * `world.construct op=demolish` posts, and on a road stop tile it removes the stop. */
+	const Json actor_guard = Json{{"entity", "company"}, {"id", company.Id().base()}};
+	Json args = Json::array();
+	args.push_back(tile.base());
+	const Json removed = CallCommandAs({
+		{"command", "CmdLandscapeClear"},
+		{"args", args},
+		{"expected_targets", Json::array({actor_guard})},
+	}, company.Id());
+	REQUIRE(removed["ok"].get<bool>());
+	CHECK_FALSE(IsTileType(tile, TileType::Station));
+	CHECK(RoadStop::GetNumItems() == 0);
+
+	/* The reference the removal was guarded with is stale now: the tile carries no structure, so a
+	 * second removal of the stop the caller saw is rejected instead of clearing whatever is there. */
+	const Json stale = ResolveObjectRef(ref, true);
+	CHECK(stale["found"] == false);
+	CHECK(stale["error"] == "stale_ref");
+	CHECK(stale["reason"] == "tile_type_mismatch");
+}
+
+TEST_CASE("Agent bridge refs: a rebuilt station on the same tile is another structure lifetime")
+{
+	MapFixture map;
+	TestCompany company;
+
+	const TileIndex tile = TileXY(62, 62);
+	TestBusStop stop(tile, company.Id());
+	REQUIRE(stop.Get() != nullptr);
+
+	const Json ref = ReadStructureRef(tile);
+	const StationID id = stop.Get()->index;
+	const uint64_t generation = stop.Get()->generation;
+
+	/* The stop is removed and built again on the same tile: the pool reuses the id, so the tile
+	 * carries a structure the caller has never seen. */
+	Station *rebuilt = stop.Rebuild(tile, company.Id());
+	REQUIRE(rebuilt != nullptr);
+	CHECK(rebuilt->index == id);
+	REQUIRE(rebuilt->generation != generation);
+
+	const Json changed = ResolveObjectRef(ref, true);
+	CHECK(changed["found"] == false);
+	CHECK(changed["error"] == "stale_ref");
+	CHECK(changed["reason"] == "tile_state_changed");
+	CHECK(changed["fingerprint_now"].is_number_unsigned());
+	CHECK(changed["fingerprint_now"] != ref["fingerprint"]);
+
+	/* A read of the old reference still resolves and reports the structure that stands there now. */
+	const Json now = ResolveObjectRef(ref, false);
+	CHECK(now["found"] == true);
+	CHECK(now["fingerprint"] == changed["fingerprint_now"]);
+}
+
+TEST_CASE("Agent bridge refs: an industry structure tile is a generic tile object as well")
+{
+	MapFixture map;
+
+	const TileIndex tile = TileXY(58, 58);
+	TestIndustry industry(tile);
+	REQUIRE(industry.Get() != nullptr);
+
+	const Json row = ResolveObjectRef(Json{{"type", "tile"}, {"tile", TilePoint(58, 58)}}, false);
+	REQUIRE(row["found"] == true);
+	CHECK(row["type"] == "tile");
+	CHECK(row["what"] == "industry");
+	CHECK(row["subtype"] == "type_0");
+	CHECK(row["identity"] == "tile");
+	/* An industry tile stores no company owner. */
+	CHECK(row["owner"].is_null());
+	CHECK(row["fingerprint"].is_number_unsigned());
+
+	const Json ref = ReadStructureRef(tile);
+	CHECK(ResolveObjectRef(ref, true)["found"] == true);
+
+	/* A station `what` on an industry tile is a mismatch, never a retarget. */
+	const Json station_what = ResolveObjectRef(Json{{"type", "tile"}, {"what", "station"}, {"tile", TilePoint(58, 58)}}, false);
+	CHECK(station_what["found"] == false);
+	CHECK(station_what["reason"] == "tile_type_mismatch");
+	REQUIRE(station_what["what"].size() == 1);
+	CHECK(station_what["what"][0] == "industry");
+
+	/* The lifetime of the industry is part of the tile identity: the same id and the same footprint
+	 * with a new lifetime is another industry. */
+	const IndustryID id = industry.Get()->index;
+	const uint64_t generation = industry.Get()->generation;
+	Industry *rebuilt = industry.Rebuild(tile);
+	REQUIRE(rebuilt != nullptr);
+	CHECK(rebuilt->index == id);
+	REQUIRE(rebuilt->generation != generation);
+
+	const Json changed = ResolveObjectRef(ref, true);
+	CHECK(changed["found"] == false);
+	CHECK(changed["reason"] == "tile_state_changed");
+	CHECK(changed["fingerprint_now"] != ref["fingerprint"]);
+
+	/* The tile itself is part of the identity as well: another industry gfx is another state. */
+	const Json rebuilt_ref = ReadStructureRef(tile);
+	CHECK(ResolveObjectRef(rebuilt_ref, true)["found"] == true);
+	MakeIndustry(tile, rebuilt->index, IndustryGfx{1}, 0, WaterClass::Invalid);
+	const Json other_gfx = ResolveObjectRef(rebuilt_ref, true);
+	CHECK(other_gfx["found"] == false);
+	CHECK(other_gfx["reason"] == "tile_state_changed");
 }

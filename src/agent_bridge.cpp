@@ -1966,6 +1966,147 @@ std::string_view StationKindName(StationType type)
 	}
 }
 
+/** The pooled structure a tile stands on, when the tile itself carries no typed landscape object. */
+enum class TileStructureKind : uint8_t {
+	Station,  ///< A station tile: rail station, airport, road stop, dock, buoy or waypoint.
+	Industry, ///< An industry tile.
+};
+
+/**
+ * Get the protocol name of a pooled tile structure.
+ * @param kind The structure kind.
+ * @return The name used as the `what` of a generic tile row.
+ */
+std::string_view TileStructureKindName(TileStructureKind kind)
+{
+	switch (kind) {
+		case TileStructureKind::Station: return "station";
+		case TileStructureKind::Industry: return "industry";
+	}
+	return "unknown";
+}
+
+/**
+ * Map a `what` onto a pooled tile structure kind.
+ * @param name The requested name.
+ * @return The structure kind, or nothing when the name is not one.
+ */
+std::optional<TileStructureKind> TileStructureKindFromName(std::string_view name)
+{
+	if (name == "station") return TileStructureKind::Station;
+	if (name == "industry") return TileStructureKind::Industry;
+	return std::nullopt;
+}
+
+/**
+ * The pooled structure a tile stands on.
+ *
+ * A station tile is a tile of a `BaseStation` of the station pool: a `Station` (rail station,
+ * airport, road stop, dock, buoy, oilrig) or a `Waypoint` (rail or road). An industry tile is a tile
+ * of an `Industry`. A tile whose pool item is gone carries no structure, which is the honest answer
+ * for it.
+ * @param tile The tile.
+ * @return The structure kind, or nothing when the tile carries none.
+ */
+std::optional<TileStructureKind> TileStructureKindAt(TileIndex tile)
+{
+	if (!IsValidTile(tile)) return std::nullopt;
+	switch (GetTileType(tile)) {
+		case TileType::Station:
+			if (BaseStation::GetIfValid(GetStationIndex(tile)) != nullptr) return TileStructureKind::Station;
+			break;
+
+		case TileType::Industry:
+			if (Industry::GetIfValid(GetIndustryIndex(tile)) != nullptr) return TileStructureKind::Industry;
+			break;
+
+		default:
+			break;
+	}
+	return std::nullopt;
+}
+
+/**
+ * Compute the state fingerprint of the pooled structure a tile stands on.
+ *
+ * A structure tile carries no typed landscape object of its own, so its identity is the whole native
+ * state of the tile plus the lifetime of the pool item behind it:
+ * - every field of the tile's map entry (`type`, `height` and `m1`..`m8`), which holds the owner,
+ *   the pool index, the geometry and the NewGRF/random data the engine stores for the tile;
+ * - the pooled id and both halves of the 64 bit generation of the `BaseStation` (station, road stop,
+ *   airport, dock, buoy, waypoint) or of the `Industry` behind it, so the same id on the same
+ *   footprint with a new lifetime is a different structure and an old reference is rejected.
+ * @param tile The tile.
+ * @return The fingerprint.
+ */
+uint32_t TileStructureFingerprint(TileIndex tile)
+{
+	uint32_t hash = FINGERPRINT_SEED;
+	Tile tile_data(tile);
+	MixFingerprint(hash, tile_data.type());
+	MixFingerprint(hash, tile_data.height());
+	MixFingerprint(hash, tile_data.m1());
+	MixFingerprint(hash, tile_data.m2());
+	MixFingerprint(hash, tile_data.m3());
+	MixFingerprint(hash, tile_data.m4());
+	MixFingerprint(hash, tile_data.m5());
+	MixFingerprint(hash, tile_data.m6());
+	MixFingerprint(hash, tile_data.m7());
+	MixFingerprint(hash, tile_data.m8());
+
+	if (GetTileType(tile) == TileType::Station) {
+		const BaseStation *station = BaseStation::GetIfValid(GetStationIndex(tile));
+		MixFingerprint(hash, station == nullptr ? 0 : station->index.base());
+		MixFingerprint64(hash, station == nullptr ? 0 : station->generation);
+	} else if (GetTileType(tile) == TileType::Industry) {
+		const Industry *industry = Industry::GetIfValid(GetIndustryIndex(tile));
+		MixFingerprint(hash, industry == nullptr ? 0 : industry->index.base());
+		MixFingerprint64(hash, industry == nullptr ? 0 : industry->generation);
+	}
+
+	return hash;
+}
+
+/**
+ * Describe the pooled structure a tile stands on as a generic tile row.
+ *
+ * A station or an industry tile carries no typed landscape object of its own, so the generic `tile`
+ * spelling resolves the structure that actually stands there: `what` is the structure kind
+ * (`station` or `industry`), `subtype` the readable station kind (`bus_stop`, `airport`, ...) or the
+ * industry type, and the fingerprint covers the tile and the pool lifetime behind it. The row is
+ * neither a typed landscape category nor a pooled reference: it carries the tile identity only, so
+ * it never claims a pool id as the identity of a tile.
+ * @param tile The tile.
+ * @return The row, or nothing when the tile carries no pooled structure.
+ */
+std::optional<Json> TileStructureRow(TileIndex tile)
+{
+	const std::optional<TileStructureKind> kind = TileStructureKindAt(tile);
+	if (!kind.has_value()) return std::nullopt;
+
+	Json row = {
+		{"type", "tile"},
+		{"what", std::string(TileStructureKindName(*kind))},
+		{"identity", "tile"},
+		{"tile", Json{{"x", TileX(tile)}, {"y", TileY(tile)}}},
+		{"fingerprint", TileStructureFingerprint(tile)},
+	};
+
+	if (*kind == TileStructureKind::Station) {
+		/* A station tile is owned by the company the station belongs to. */
+		const Owner owner = GetTileOwner(tile);
+		row["subtype"] = std::string(StationKindName(GetStationType(tile)));
+		row["owner"] = (owner == INVALID_OWNER || owner == OWNER_NONE || owner == OWNER_WATER) ? Json(nullptr) : Json(owner.base());
+	} else {
+		/* An industry tile stores no company owner: the industry is not a company's. */
+		const Industry *industry = Industry::GetIfValid(GetIndustryIndex(tile));
+		row["subtype"] = industry == nullptr ? std::string("industry") : fmt::format("type_{}", industry->type);
+		row["owner"] = nullptr;
+	}
+
+	return row;
+}
+
 /**
  * Resolve a reference to an object the tile itself carries.
  *
@@ -1973,7 +2114,10 @@ std::string_view StationKindName(StationType type)
  * is one of the typed tile categories (`terrain`, `water`, `tree`, `rail`, `signal`, `road`,
  * `tram`, `bridge`, `tunnel`, `mapobject`, `house`), the generic `tile` spelling — then `what`
  * names the category, or the most specific object of the tile is used — or `point`, which names a
- * location only.
+ * location only. The generic spelling also resolves the pooled structure that stands on a station or
+ * an industry tile, which carries no typed object of its own: its row has `what` = `station` or
+ * `industry` and a fingerprint over the whole tile and the lifetime of the `BaseStation` or
+ * `Industry` behind it, so a removal of that structure can be guarded by a read of the tile.
  *
  * A read resolves whatever the tile carries now and reports the current fingerprint, so a caller
  * can build a strict reference from the answer. A write (`require_identity`) has to name the
@@ -2006,14 +2150,20 @@ Json ResolveTileObjectRef(std::string_view ref_type, const Json &ref, bool requi
 
 	/* The category the reference names; the generic `tile` spelling may leave it to the answer. */
 	std::optional<TileObjectKind> requested;
+	/* A `what` that names a pooled structure instead of a typed landscape category. */
+	std::optional<TileStructureKind> requested_structure;
+	std::string named_what;
 	if (ref_type != "tile") {
 		requested = TileObjectKindFromName(ref_type);
 		if (!requested.has_value()) return RefFailure(ref_type, "unknown_type", "unsupported_ref_type");
 	} else {
-		const std::string what = JsonString(ref, "what");
-		if (!what.empty()) {
-			requested = TileObjectKindFromName(what);
-			if (!requested.has_value()) return RefFailure(ref_type, "unknown_what", "invalid_params");
+		named_what = JsonString(ref, "what");
+		if (!named_what.empty()) {
+			requested = TileObjectKindFromName(named_what);
+			if (!requested.has_value()) {
+				requested_structure = TileStructureKindFromName(named_what);
+				if (!requested_structure.has_value()) return RefFailure(ref_type, "unknown_what", "invalid_params");
+			}
 		}
 	}
 
@@ -2025,9 +2175,24 @@ Json ResolveTileObjectRef(std::string_view ref_type, const Json &ref, bool requi
 				found = &object;
 				break;
 			}
-		} else if (found == nullptr) {
+		} else if (!requested_structure.has_value() && found == nullptr) {
 			/* The generic spelling without `what` names the most specific object of the tile. */
 			found = &object;
+		}
+	}
+
+	/*
+	 * A station or an industry tile carries no typed landscape object: the pooled structure that
+	 * stands on it is what the generic `tile` spelling names, and its fingerprint covers the whole
+	 * tile and the lifetime of the pool item behind it. A named `what` has to be the structure kind
+	 * of this very tile, so a station reference never resolves an industry and a rebuilt structure is
+	 * never silently followed.
+	 */
+	std::optional<Json> structure_row;
+	if (found == nullptr && ref_type == "tile") {
+		structure_row = TileStructureRow(tile);
+		if (structure_row.has_value() && (named_what.empty() || (*structure_row)["what"] == named_what)) {
+			found = &*structure_row;
 		}
 	}
 
@@ -2037,6 +2202,8 @@ Json ResolveTileObjectRef(std::string_view ref_type, const Json &ref, bool requi
 		row["tile"] = location;
 		row["what"] = Json::array();
 		for (const Json &object : objects) row["what"].push_back(object["type"]);
+		/* A structure tile carries no typed object, but the structure itself is what stands there. */
+		if (structure_row.has_value()) row["what"].push_back((*structure_row)["what"]);
 		return row;
 	}
 

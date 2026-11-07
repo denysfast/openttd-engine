@@ -151,7 +151,11 @@ Json DescribeTileObjects(TileIndex tile);
  * (`require_identity`) additionally rejects a pooled reference without a generation, a tile object
  * without a fingerprint (or, for a house, without the generation of its town, or for a map object
  * without the generation of the pooled object behind it) and any reference whose recorded state is
- * no longer current. A `point` reference names a location only and has no identity to check. A
+ * no longer current. The generic `tile` spelling also resolves the pooled structure that stands on
+ * a station or an industry tile (such a tile carries no typed landscape object of its own): the row
+ * has `what` = `station` or `industry` and a fingerprint over the whole tile and the lifetime of
+ * the `BaseStation` or `Industry` behind it, so a removal of that structure is guarded by a read.
+ * A `point` reference names a location only and has no identity to check. A
  * `setting` reference is identified by its exact engine key (`setting_name`) and its `scope`, and
  * both are mandatory: its value may change while the reference stays current, a key this build does
  * not have is rejected as `unknown_setting`, a reference without a scope as `missing_scope` and a
