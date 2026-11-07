@@ -99,8 +99,13 @@ static constexpr auto _callback_tuple = std::make_tuple(
 	&InGameAgent::AgentCommandCallback,
 	&InGameAgent::AgentBuildVehicleCallback,
 	&InGameAgent::AgentAddVehicleToGroupCallback,
+	&InGameAgent::AgentRefitVehicleCallback,
+	&InGameAgent::AgentCloneVehicleCallback,
 	&InGameAgent::CcAgentTransportCommand,
-	&InGameAgent::AgentAdminCommandCallback
+	&InGameAgent::AgentAdminCommandCallback,
+	&InGameAgent::AgentAdminFoundTownCallback,
+	&InGameAgent::AgentAdminPlaceSignCallback,
+	&InGameAgent::AgentAdminBuildIndustryAreaCallback
 );
 
 #ifdef SILENCE_GCC_FUNCTION_POINTER_CAST

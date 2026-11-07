@@ -22,7 +22,11 @@
 #include "core/backup_type.hpp"
 #include "core/math_func.hpp"
 #include "debug.h"
+#include "depot_base.h"
+#include "depot_map.h"
+#include "engine_base.h"
 #include "genworld.h"
+#include "group.h"
 #include "industry.h"
 #include "map_func.h"
 #include "misc_cmd.h"
@@ -34,6 +38,7 @@
 #include "signs_base.h"
 #include "station_base.h"
 #include "station_cmd.h"
+#include "station_map.h"
 #include "strings_func.h"
 #include "table/strings.h"
 #include "timer/timer_game_calendar.h"
@@ -43,6 +48,7 @@
 #include "town_cmd.h"
 #include "vehicle_base.h"
 #include "video/video_driver.hpp"
+#include "waypoint_base.h"
 
 #include "3rdparty/fmt/format.h"
 
@@ -51,6 +57,7 @@
 #include <cstdlib>
 #include <deque>
 #include <fstream>
+#include <limits>
 #include <map>
 #include <memory>
 #include <optional>
@@ -71,7 +78,14 @@ using Clock = std::chrono::steady_clock;
 /** Delay before retrying a failed hello. */
 constexpr auto HELLO_RETRY = std::chrono::seconds(5);
 /** Delay before retrying a failed poll. */
-constexpr auto POLL_RETRY = std::chrono::seconds(2);
+constexpr auto POLL_RETRY = std::chrono::milliseconds(2000);
+/**
+ * Delay between two polls while the backend is healthy. This is the tool latency, not the
+ * heartbeat: a request waits at most one idle interval before the engine picks it up, while the
+ * heartbeat the backend asks for stays a separate, much slower connection signal. The floor keeps
+ * the loop from turning into a busy poll of the HTTP layer.
+ */
+constexpr auto POLL_IDLE = std::chrono::milliseconds(150);
 /** Delay before retrying a failed result delivery. */
 constexpr auto RESULT_RETRY = std::chrono::seconds(1);
 /** Maximum number of results kept while the backend is unreachable. */
@@ -250,7 +264,7 @@ struct BridgeState {
 	std::string epoch;         ///< Identity of this load of the world.
 	std::string connection_id; ///< Connection handed out by the backend.
 	bool connected = false;    ///< Whether the backend accepted our hello.
-	int heartbeat_seconds = 5; ///< Poll interval requested by the backend.
+	int heartbeat_seconds = 5; ///< Liveness interval requested by the backend; unrelated to the poll cadence.
 	int64_t cursor = 0;        ///< Highest request sequence we have received.
 
 	bool hello_in_flight = false;  ///< Whether a hello is in flight.
@@ -669,6 +683,7 @@ std::string_view CanonicalQueryKind(std::string_view kind)
 	if (kind == "stations" || kind == "station") return "stations";
 	if (kind == "industries" || kind == "industry") return "industries";
 	if (kind == "vehicles" || kind == "vehicle") return "vehicles";
+	if (kind == "engines" || kind == "engine") return "engines";
 	if (kind == "signs" || kind == "sign") return "signs";
 	if (kind == "tiles" || kind == "tile") return "tiles";
 	return {};
@@ -891,33 +906,112 @@ Json WorldQuery(const Json &params)
 }
 
 /**
+ * Build the resolution of a reference that is not current.
+ * @param type The reference type.
+ * @param reason Machine readable reason, e.g. `deleted` or `generation_mismatch`.
+ * @param error The protocol error code.
+ * @return The resolution row.
+ */
+Json RefFailure(std::string_view type, std::string_view reason, std::string_view error = "stale_ref")
+{
+	return {{"type", std::string(type)}, {"found", false}, {"error", std::string(error)}, {"reason", std::string(reason)}};
+}
+
+/**
+ * Read an integer member of a reference without narrowing it first.
+ *
+ * Ids and generations travel as JSON integers. A member of another type, a negative value or a
+ * value above \a maximum is reported as unusable instead of being truncated into a pool index:
+ * truncation would silently resolve a different object.
+ * @param object The object to read from.
+ * @param key The member name.
+ * @param maximum The largest accepted value.
+ * @param value Receives the value.
+ * @return True iff the member is present and a usable integer.
+ */
+bool ReadRefInteger(const Json &object, const char *key, int64_t maximum, int64_t &value)
+{
+	if (!object.is_object() || !object.contains(key)) return false;
+	const Json &member = object[key];
+	if (member.is_number_unsigned()) {
+		const uint64_t raw = member.get<uint64_t>();
+		if (raw > static_cast<uint64_t>(maximum)) return false;
+		value = static_cast<int64_t>(raw);
+		return true;
+	}
+	if (member.is_number_integer()) {
+		const int64_t raw = member.get<int64_t>();
+		if (raw < 0 || raw > maximum) return false;
+		value = raw;
+		return true;
+	}
+	return false;
+}
+
+/**
+ * Read the tile location of a reference.
+ *
+ * The canonical form is the object `{"x": .., "y": ..}`, which is what the protocol schema and
+ * this bridge emit. The first kernel version used a two element array `[x, y]`, and a bare point
+ * (`type` = `point`) is a tile without an object, so both shapes are accepted. The coordinates are
+ * range checked against the map before they are narrowed to a TileIndex.
+ * @param ref The reference.
+ * @param tile Receives the tile.
+ * @return True iff the reference carries a usable tile.
+ */
+bool ReadRefTile(const Json &ref, TileIndex &tile)
+{
+	if (!ref.contains("tile")) return false;
+	const Json &location = ref["tile"];
+	const int64_t max_x = static_cast<int64_t>(Map::MaxX());
+	const int64_t max_y = static_cast<int64_t>(Map::MaxY());
+
+	int64_t x = 0;
+	int64_t y = 0;
+	if (location.is_object()) {
+		if (!ReadRefInteger(location, "x", max_x, x)) return false;
+		if (!ReadRefInteger(location, "y", max_y, y)) return false;
+	} else if (location.is_array() && location.size() == 2 && location[0].is_number_integer() && location[1].is_number_integer()) {
+		x = location[0].get<int64_t>();
+		y = location[1].get<int64_t>();
+		if (x < 0 || y < 0 || x > max_x || y > max_y) return false;
+	} else {
+		return false;
+	}
+
+	tile = TileXY(static_cast<uint>(x), static_cast<uint>(y));
+	return true;
+}
+
+/**
  * Describe a resolved pool item, or report why the reference is stale.
  * @tparam T The pool item type.
  * @tparam F Type of the function that adds the type specific fields.
  * @param type The protocol name of the type.
  * @param item The item, or nullptr when no such object exists.
- * @param generation The generation the reference was made for, or 0 when it carried none.
+ * @param generation The generation the reference named, if it named one.
+ * @param require_identity True for a write: the reference must name a lifetime.
  * @param fill Adds the type specific fields of \a item to the row.
  * @return The resolution of the reference.
  */
 template <typename T, typename F>
-Json ResolvePoolItem(std::string_view type, const T *item, uint64_t generation, F fill)
+Json ResolvePoolItem(std::string_view type, const T *item, std::optional<uint64_t> generation, bool require_identity, F fill)
 {
-	Json row = {{"type", std::string(type)}};
-	if (item == nullptr) {
-		row["found"] = false;
-		row["error"] = "stale_ref";
-		row["reason"] = "deleted";
-		return row;
-	}
+	if (item == nullptr) return RefFailure(type, "deleted");
 
-	row["found"] = true;
-	row["id"] = item->index.base();
-	row["generation"] = item->generation;
+	/*
+	 * A write has to be planned for one lifetime of one object. A pooled reference without a
+	 * generation names whatever object holds the id now, so a mutation must not accept it: it
+	 * would be applied to a recreated object. A read may resolve it, and reports the generation so
+	 * the caller can build a strict reference from the answer.
+	 */
+	if (require_identity && !generation.has_value()) return RefFailure(type, "generation_required");
+
+	Json row = {{"type", std::string(type)}, {"found", true}, {"id", item->index.base()}, {"generation", item->generation}};
 	fill(row, *item);
 
 	/* A reference that names a generation is only current while it is the same lifetime of the object. */
-	if (generation != 0 && generation != item->generation) {
+	if (generation.has_value() && *generation != item->generation) {
 		row["found"] = false;
 		row["error"] = "stale_ref";
 		row["reason"] = "generation_mismatch";
@@ -926,82 +1020,214 @@ Json ResolvePoolItem(std::string_view type, const T *item, uint64_t generation, 
 }
 
 /**
+ * Resolve a reference to a pooled object of one type.
+ *
+ * The id is bounded by the pool before it is narrowed to the pool index type, so an id from
+ * another pool, a negative id or a value that would truncate is an invalid reference and not a
+ * lookup of a random object.
+ * @tparam Tindex The pool index type of the object.
+ * @tparam Titem The pool item type of the object.
+ * @tparam F Type of the function that adds the type specific fields.
+ * @param type The protocol name of the type.
+ * @param ref The reference to resolve.
+ * @param generation The generation the reference named, if it named one.
+ * @param require_identity True for a write: the reference must name a lifetime.
+ * @param fill Adds the type specific fields of the resolved object to the row.
+ * @return The resolution of the reference.
+ */
+template <typename Tindex, typename Titem, typename F>
+Json ResolveTypedRef(std::string_view type, const Json &ref, std::optional<uint64_t> generation, bool require_identity, F fill)
+{
+	int64_t id = 0;
+	if (!ReadRefInteger(ref, "id", static_cast<int64_t>(Tindex::End().base()) - 1, id)) return RefFailure(type, "invalid_id", "invalid_params");
+	return ResolvePoolItem(type, Titem::GetIfValid(static_cast<Tindex>(id)), generation, require_identity, fill);
+}
+
+/**
+ * Name of a vehicle type, as used in the protocol.
+ * @param type The vehicle type.
+ * @return The protocol name.
+ */
+std::string_view VehicleKindName(VehicleType type)
+{
+	switch (type) {
+		case VehicleType::Train: return "train";
+		case VehicleType::Road: return "road";
+		case VehicleType::Ship: return "ship";
+		case VehicleType::Aircraft: return "aircraft";
+		default: return "unknown";
+	}
+}
+
+/**
+ * Name of a station type, as used in the protocol.
+ * @param type The station type.
+ * @return The protocol name.
+ */
+std::string_view StationKindName(StationType type)
+{
+	switch (type) {
+		case StationType::Rail: return "rail";
+		case StationType::Airport: return "airport";
+		case StationType::Truck: return "truck_stop";
+		case StationType::Bus: return "bus_stop";
+		case StationType::Oilrig: return "oilrig";
+		case StationType::Dock: return "dock";
+		case StationType::Buoy: return "buoy";
+		case StationType::RailWaypoint: return "rail_waypoint";
+		case StationType::RoadWaypoint: return "road_waypoint";
+		default: return "unknown";
+	}
+}
+
+/**
  * Resolve one typed object reference against the current world.
  *
- * A reference is {type, id?, generation?, tile?}. When it carries a
- * generation, an object that was deleted and recreated at the same id is
- * reported as stale instead of being silently resolved to the new object.
+ * A reference is `{type, id?, tile?, generation?, world_id?, epoch?}`, exactly as the protocol
+ * schema and `PickObjects()` describe it. The world and the epoch are checked first: a reference
+ * read from another world or epoch can never resolve to a current object, so it is reported as
+ * stale instead of being matched by id. Then the id and the generation are read as bounded
+ * integers, and only then narrowed into the pool.
+ *
+ * A pooled reference that names a generation is stale when that lifetime is gone, even if the id
+ * has been reused. `require_identity` is set for a write: there a pooled reference must name a
+ * generation, because a write to "whatever object has this id now" is not the object the caller
+ * planned for. Reads stay lenient and report the current generation, so a caller can build a
+ * strict reference from a read.
+ *
  * @param ref The reference to resolve.
+ * @param require_identity True for a write's `expected_refs`: pooled types must carry a generation.
  * @return The resolved object, or a stale_ref / unsupported_ref_type entry.
  */
-Json ResolveRef(const Json &ref)
+Json ResolveRef(const Json &ref, bool require_identity)
 {
+	if (!ref.is_object()) return RefFailure({}, "invalid_ref", "invalid_params");
+
 	const std::string type = JsonString(ref, "type");
-	const int id = JsonInt(ref, "id", -1);
-	const bool has_generation = ref.contains("generation") && (ref["generation"].is_number_unsigned() || ref["generation"].is_number_integer());
-	const uint64_t generation = has_generation ? ref["generation"].get<uint64_t>() : 0;
+	if (type.empty()) return RefFailure(type, "missing_type", "invalid_params");
+
+	/* A reference is only usable in the world and epoch it was observed in. */
+	const std::string world_id = JsonString(ref, "world_id");
+	const std::string epoch = JsonString(ref, "epoch");
+	if (!world_id.empty() || !epoch.empty()) ResolveWorldId();
+	if (!world_id.empty() && world_id != _state.world_id) return RefFailure(type, "world_mismatch");
+	if (!epoch.empty() && epoch != _state.epoch) return RefFailure(type, "epoch_mismatch");
+
+	std::optional<uint64_t> generation;
+	if (ref.contains("generation") && !ref["generation"].is_null()) {
+		int64_t value = 0;
+		if (!ReadRefInteger(ref, "generation", std::numeric_limits<int64_t>::max(), value)) return RefFailure(type, "invalid_generation", "invalid_params");
+		generation = static_cast<uint64_t>(value);
+	}
 
 	if (type == "town") {
-		return ResolvePoolItem("town", id >= 0 ? Town::GetIfValid(static_cast<TownID>(id)) : nullptr, generation, [](Json &row, const Town &t) {
+		return ResolveTypedRef<TownID, Town>(type, ref, generation, require_identity, [](Json &row, const Town &t) {
 			row["name"] = t.GetCachedName();
-			row["tile"] = {TileX(t.xy), TileY(t.xy)};
+			row["tile"] = Json{{"x", TileX(t.xy)}, {"y", TileY(t.xy)}};
 			row["population"] = t.cache.population;
 		});
 	}
 	if (type == "company") {
-		return ResolvePoolItem("company", id >= 0 ? Company::GetIfValid(static_cast<CompanyID>(id)) : nullptr, generation, [](Json &row, const Company &c) {
+		return ResolveTypedRef<CompanyID, Company>(type, ref, generation, require_identity, [](Json &row, const Company &c) {
 			row["name"] = c.name.empty() ? GetString(STR_COMPANY_NAME, c.index) : c.name;
 			row["is_ai"] = c.is_ai;
 			row["money"] = static_cast<int64_t>(c.money);
 		});
 	}
 	if (type == "station") {
-		return ResolvePoolItem("station", id >= 0 ? Station::GetIfValid(static_cast<StationID>(id)) : nullptr, generation, [](Json &row, const Station &st) {
+		return ResolveTypedRef<StationID, Station>(type, ref, generation, require_identity, [](Json &row, const Station &st) {
 			row["name"] = st.GetCachedName();
-			row["tile"] = {TileX(st.xy), TileY(st.xy)};
+			row["tile"] = Json{{"x", TileX(st.xy)}, {"y", TileY(st.xy)}};
 			row["owner"] = st.owner.base();
 			row["town_id"] = st.town != nullptr ? st.town->index.base() : -1;
 		});
 	}
+	if (type == "waypoint") {
+		/* A waypoint is a station pool item; the schema names it separately. */
+		return ResolveTypedRef<StationID, Waypoint>(type, ref, generation, require_identity, [](Json &row, const Waypoint &wp) {
+			row["name"] = wp.GetCachedName();
+			row["tile"] = Json{{"x", TileX(wp.xy)}, {"y", TileY(wp.xy)}};
+			row["owner"] = wp.owner.base();
+		});
+	}
 	if (type == "industry") {
-		return ResolvePoolItem("industry", id >= 0 ? Industry::GetIfValid(static_cast<IndustryID>(id)) : nullptr, generation, [](Json &row, const Industry &ind) {
+		return ResolveTypedRef<IndustryID, Industry>(type, ref, generation, require_identity, [](Json &row, const Industry &ind) {
 			row["name"] = ind.GetCachedName();
-			row["tile"] = {TileX(ind.location.tile), TileY(ind.location.tile)};
+			row["tile"] = Json{{"x", TileX(ind.location.tile)}, {"y", TileY(ind.location.tile)}};
 			row["town_id"] = ind.town != nullptr ? ind.town->index.base() : -1;
 		});
 	}
 	if (type == "vehicle") {
-		return ResolvePoolItem("vehicle", id >= 0 ? Vehicle::GetIfValid(static_cast<VehicleID>(id)) : nullptr, generation, [](Json &row, const Vehicle &v) {
+		return ResolveTypedRef<VehicleID, Vehicle>(type, ref, generation, require_identity, [](Json &row, const Vehicle &v) {
 			row["name"] = v.name;
+			row["what"] = std::string(VehicleKindName(v.type));
 			row["owner"] = v.owner.base();
-			row["tile"] = {TileX(v.tile), TileY(v.tile)};
+			row["tile"] = Json{{"x", TileX(v.tile)}, {"y", TileY(v.tile)}};
+		});
+	}
+	if (type == "depot") {
+		return ResolveTypedRef<DepotID, Depot>(type, ref, generation, require_identity, [](Json &row, const Depot &d) {
+			row["name"] = d.name;
+			row["what"] = std::string(TileTypeName(GetTileType(d.xy)));
+			row["tile"] = Json{{"x", TileX(d.xy)}, {"y", TileY(d.xy)}};
+			row["town_id"] = d.town != nullptr ? d.town->index.base() : -1;
+		});
+	}
+	if (type == "engine") {
+		return ResolveTypedRef<EngineID, Engine>(type, ref, generation, require_identity, [](Json &row, const Engine &e) {
+			row["name"] = e.name;
+			row["what"] = std::string(VehicleKindName(e.type));
 		});
 	}
 	if (type == "sign") {
-		return ResolvePoolItem("sign", id >= 0 ? Sign::GetIfValid(static_cast<SignID>(id)) : nullptr, generation, [](Json &row, const Sign &sign) {
+		return ResolveTypedRef<SignID, Sign>(type, ref, generation, require_identity, [](Json &row, const Sign &sign) {
 			row["name"] = sign.name;
 			row["owner"] = sign.owner.base();
 			const TileIndex tile = TileVirtXY(static_cast<uint>(std::max(0, sign.x)), static_cast<uint>(std::max(0, sign.y)));
-			row["tile"] = {TileX(tile), TileY(tile)};
+			row["tile"] = Json{{"x", TileX(tile)}, {"y", TileY(tile)}};
 		});
 	}
-	if (type == "tile") {
-		const Json location = ref.contains("tile") && ref["tile"].is_object() ? ref["tile"] : Json::object();
-		const int x = JsonInt(location, "x", -1);
-		const int y = JsonInt(location, "y", -1);
-		if (x < 0 || y < 0 || x > static_cast<int>(Map::MaxX()) || y > static_cast<int>(Map::MaxY())) {
-			return {{"type", "tile"}, {"found", false}, {"error", "stale_ref"}, {"reason", "deleted"}};
-		}
-		Json row = TileRow(TileXY(static_cast<uint>(x), static_cast<uint>(y)));
-		/* TileRow names the tile type in `type`; a reference is typed `tile`, so the tile type moves to `what`. */
+	if (type == "group") {
+		return ResolveTypedRef<GroupID, Group>(type, ref, generation, require_identity, [](Json &row, const Group &g) {
+			row["name"] = g.name;
+			row["owner"] = g.owner.base();
+		});
+	}
+	if (type == "house") {
+		/*
+		 * A house is tile data without a pool of its own, so its lifetime is the lifetime of the
+		 * town it belongs to: the row carries the town id and the town's generation, and a write
+		 * must name that generation like any other pooled reference.
+		 */
+		TileIndex tile = INVALID_TILE;
+		if (!ReadRefTile(ref, tile)) return RefFailure(type, "invalid_tile", "invalid_params");
+		const Town *town = Town::GetByTile(tile);
+		if (town == nullptr) return RefFailure(type, "deleted");
+		Json row = ResolvePoolItem("house", town, generation, require_identity, [&](Json &r, const Town &t) {
+			r["town_id"] = t.index.base();
+			r["tile"] = Json{{"x", TileX(tile)}, {"y", TileY(tile)}};
+		});
+		row["generation_of"] = "town";
+		return row;
+	}
+	if (type == "tile" || type == "point") {
+		TileIndex tile = INVALID_TILE;
+		if (!ReadRefTile(ref, tile)) return RefFailure(type, "invalid_tile", "invalid_params");
+
+		Json row = TileRow(tile);
+		/* TileRow names the tile type in `type`; a reference is typed `tile`/`point`, so the tile type moves to `what`. */
 		row["what"] = row["type"];
-		row["type"] = "tile";
+		row["type"] = type;
+		row["tile"] = Json{{"x", TileX(tile)}, {"y", TileY(tile)}};
 		row["found"] = true;
 		return row;
 	}
 
-	/* Types the kernel does not resolve yet are an explicit gap, never a silent success. */
-	return {{"type", type}, {"found", false}, {"error", "unsupported_ref_type"}};
+	/*
+	 * Types the kernel cannot resolve are an explicit gap, never a silent success: `cargo` is not a
+	 * pooled object at all, so it has neither an id nor a lifetime to check.
+	 */
+	return RefFailure(type, type == "cargo" ? "not_a_pooled_object" : "unknown_type", "unsupported_ref_type");
 }
 
 /**
@@ -1018,7 +1244,8 @@ Json WorldObjects(const Json &params)
 	Json objects = Json::array();
 	for (const Json &ref : refs) {
 		if (!ref.is_object()) return Error("invalid_params", "every ref must be an object");
-		objects.push_back(ResolveRef(ref));
+		/* world.objects is a read: it resolves the current object and reports its generation. */
+		objects.push_back(ResolveRef(ref, false));
 	}
 
 	Json value = {{"objects", objects}};
@@ -1100,7 +1327,8 @@ std::optional<Json> CheckExpectedRefs(const Json &params)
 
 	for (const Json &ref : refs) {
 		if (!ref.is_object()) return Error("invalid_params", "every expected ref must be an object");
-		Json resolved = ResolveRef(ref);
+		/* A write must name the lifetime it was planned for: a reference without a generation is rejected. */
+		Json resolved = ResolveRef(ref, true);
 		if (!resolved.value("found", false)) {
 			Json error = Error("stale_ref", "an expected object is no longer the one the request was made for");
 			error["detail"] = std::move(resolved);
@@ -1108,6 +1336,34 @@ std::optional<Json> CheckExpectedRefs(const Json &params)
 		}
 	}
 	return std::nullopt;
+}
+
+/**
+ * Add the lifetime generation to the rows of a delegated read.
+ *
+ * A query row is what a caller turns into a reference, and a write's reference must name the
+ * lifetime it was planned for. The tool modules report the inventory without a generation, so the
+ * bridge completes the rows from the pool; a row whose id does not resolve keeps no generation and
+ * stays a read-only hint.
+ * @param kind The canonical query kind.
+ * @param rows The rows to complete in place.
+ */
+void AddRowGenerations(std::string_view kind, Json &rows)
+{
+	for (Json &row : rows) {
+		if (!row.is_object() || row.contains("generation")) continue;
+
+		int64_t id = 0;
+		if (!ReadRefInteger(row, "id", std::numeric_limits<int64_t>::max(), id)) continue;
+
+		if (kind == "vehicles") {
+			if (id >= static_cast<int64_t>(VehicleID::End().base())) continue;
+			if (const Vehicle *v = Vehicle::GetIfValid(static_cast<VehicleID>(id)); v != nullptr) row["generation"] = v->generation;
+		} else if (kind == "engines") {
+			if (id >= static_cast<int64_t>(EngineID::End().base())) continue;
+			if (const Engine *e = Engine::GetIfValid(static_cast<EngineID>(id)); e != nullptr) row["generation"] = e->generation;
+		}
+	}
 }
 
 /**
@@ -1345,18 +1601,27 @@ Json ExecuteRequest(const Json &request, bool &deferred)
 		/*
 		 * The game tool module owns the vehicle and engine inventory, which is richer than the
 		 * core rows; the core query keeps the other kinds and stays the fallback when the module
-		 * does not claim the kind, so a kind is never shadowed by a thinner answer.
+		 * does not claim the kind, so a kind is never shadowed by a thinner answer. The module knows
+		 * the canonical plural kind only, so the legacy singular alias is normalised for it.
 		 */
-		const std::string_view kind = CanonicalQueryKind(JsonString(params, "kind"));
+		const std::string requested = JsonString(params, "kind");
+		const std::string_view kind = CanonicalQueryKind(requested);
 		if (kind == "vehicles" || kind == "engines") {
-			if (std::optional<Json> result = DispatchGameTool(method, params, company); result.has_value()) {
+			Json module_params = params;
+			module_params["kind"] = std::string(kind);
+
+			if (std::optional<Json> result = DispatchGameTool(method, module_params, company); result.has_value()) {
 				Json mapped = FromModule(std::move(*result));
-				/* Every read is bound to the world and epoch it was taken in, whoever produced it. */
 				if (mapped["ok"].is_boolean() && mapped["ok"].get<bool>() && mapped.contains("value") && mapped["value"].is_object()) {
-					mapped["value"].update(WorldBinding());
+					Json &value = mapped["value"];
+					/* A row has to carry its lifetime, so a reference built from it can be strict. */
+					if (value.contains("rows") && value["rows"].is_array()) AddRowGenerations(kind, value["rows"]);
+					/* Every read is bound to the world and epoch it was taken in, whoever produced it. */
+					value.update(WorldBinding());
 				}
 				return mapped;
 			}
+			return Error("unsupported_query_kind", requested);
 		}
 		return WorldQuery(params);
 	}
@@ -1483,7 +1748,8 @@ void HandlePollResponse(bool ok, const Json &body)
 		_state.cursor = body["cursor"].get<int64_t>();
 	}
 
-	_state.next_poll = Clock::now() + std::chrono::seconds(complete ? _state.heartbeat_seconds : 1);
+	/* A healthy poll repeats on the idle cadence; the heartbeat stays a separate, slower signal. */
+	_state.next_poll = Clock::now() + (complete ? POLL_IDLE : POLL_RETRY);
 }
 
 /**
@@ -1802,7 +2068,7 @@ Json PickObjects(TileIndex tile)
 	if (!IsValidTile(tile)) return objects;
 
 	const TileType type = GetTileType(tile);
-	const Json location = {TileX(tile), TileY(tile)};
+	const Json location = {{"x", TileX(tile)}, {"y", TileY(tile)}};
 	const Json binding = WorldBinding();
 
 	auto add = [&](Json entry) {
@@ -1810,24 +2076,58 @@ Json PickObjects(TileIndex tile)
 		objects.push_back(std::move(entry));
 	};
 
+	/* The object the tile itself carries, most specific first. */
 	if (type == TileType::Station) {
-		const Station *st = Station::GetByTile(tile);
-		if (st != nullptr) {
-			add({{"type", "station"}, {"id", st->index.base()}, {"generation", st->generation}, {"name", st->GetCachedName()}, {"tile", location}});
+		/* A waypoint, a buoy and a station share the station pool but are separate protocol types. */
+		if (const Waypoint *wp = Waypoint::GetByTile(tile); wp != nullptr) {
+			add({{"type", "waypoint"}, {"id", wp->index.base()}, {"generation", wp->generation},
+					{"name", wp->GetCachedName()}, {"what", std::string(StationKindName(GetStationType(tile)))}, {"tile", location}});
+		} else if (const Station *st = Station::GetByTile(tile); st != nullptr) {
+			add({{"type", "station"}, {"id", st->index.base()}, {"generation", st->generation},
+					{"name", st->GetCachedName()}, {"what", std::string(StationKindName(GetStationType(tile)))}, {"tile", location}});
 		}
 	} else if (type == TileType::Industry) {
-		const Industry *ind = Industry::GetByTile(tile);
-		if (ind != nullptr) {
+		if (const Industry *ind = Industry::GetByTile(tile); ind != nullptr) {
 			add({{"type", "industry"}, {"id", ind->index.base()}, {"generation", ind->generation}, {"tile", location}});
 		}
 	} else if (type == TileType::House) {
-		const Town *town = Town::GetByTile(tile);
-		if (town != nullptr) {
-			add({{"type", "town"}, {"id", town->index.base()}, {"generation", town->generation}, {"name", town->GetCachedName()}, {"tile", location}});
+		/* A house is tile data without a pool of its own, so the town is the lifetime it belongs to. */
+		if (const Town *town = Town::GetByTile(tile); town != nullptr) {
+			add({{"type", "town"}, {"id", town->index.base()}, {"generation", town->generation},
+					{"name", town->GetCachedName()}, {"what", "house"}, {"tile", location}});
 		}
 	}
 
-	add({{"type", "tile"}, {"tile", location}, {"what", std::string(TileTypeName(type))}});
+	/* A rail, road or ship depot is a pool object of its own. A hangar is not: see the gap below. */
+	if (IsRailDepotTile(tile) || IsRoadDepotTile(tile) || IsShipDepotTile(tile)) {
+		if (const Depot *depot = Depot::GetByTile(tile); depot != nullptr) {
+			add({{"type", "depot"}, {"id", depot->index.base()}, {"generation", depot->generation},
+					{"name", depot->name}, {"what", std::string(TileTypeName(GetTileType(depot->xy)))}, {"tile", location}});
+		}
+	}
+
+	/* Every vehicle standing on the tile: it is a pool object with its own lifetime. */
+	for (const Vehicle *v : Vehicle::Iterate()) {
+		if (v->tile != tile) continue;
+		add({{"type", "vehicle"}, {"id", v->index.base()}, {"generation", v->generation},
+				{"name", v->name}, {"what", std::string(VehicleKindName(v->type))}, {"tile", location}});
+	}
+
+	/* Every sign on the tile. Signs are stored by world coordinate, not by tile. */
+	for (const Sign *sign : Sign::Iterate()) {
+		const TileIndex sign_tile = TileVirtXY(static_cast<uint>(std::max(0, sign->x)), static_cast<uint>(std::max(0, sign->y)));
+		if (sign_tile != tile) continue;
+		add({{"type", "sign"}, {"id", sign->index.base()}, {"generation", sign->generation},
+				{"name", sign->name}, {"tile", location}});
+	}
+
+	/*
+	 * The tile itself is always selectable, and is the honest answer for what has no type of its
+	 * own in the protocol: a NewGRF object (the pool exists, the schema has no `object` type), a
+	 * hangar (an air depot has no Depot object) and plain landscape. `cargo` is never offered: a
+	 * cargo packet is not attached to a tile but to a vehicle or a station.
+	 */
+	add({{"type", "tile"}, {"what", std::string(TileTypeName(type))}, {"tile", location}});
 	return objects;
 }
 

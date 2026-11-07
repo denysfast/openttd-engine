@@ -49,9 +49,13 @@ Json Context();
  * Describe the objects attached to a tile, as typed attachment candidates.
  *
  * Every entry carries the generation of the object and the world/epoch it was
- * read in, so a later request can name the exact object it was planned for.
+ * read in, so a later request can name the exact object it was planned for: the
+ * object the tile carries (station, waypoint or buoy, industry, the town of a
+ * house, rail/road/ship depot), then every vehicle and every sign standing on it,
+ * then the tile itself. The tile is named in the canonical `{"x": .., "y": ..}`
+ * shape the protocol schema uses.
  * @param tile The tile to inspect.
- * @return Array of {type, id?, generation?, name?, tile?, world_id, epoch} entries, most specific first.
+ * @return Array of {type, id?, generation?, name?, what?, tile, world_id, epoch} entries, most specific first.
  */
 Json PickObjects(TileIndex tile);
 
