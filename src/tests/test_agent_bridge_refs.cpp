@@ -260,6 +260,74 @@ TEST_CASE("Agent bridge refs: a house carries the lifetime of its town")
 	CHECK(changed["reason"] == "tile_state_changed");
 }
 
+TEST_CASE("Agent bridge refs: the anchor tile of a town names the town as a pooled candidate")
+{
+	MapFixture map;
+
+	/* A town whose anchor tile carries a road: the tile object alone answered "road", so the town
+	 * itself was not selectable on the tile it is placed on. The custom name keeps the row off the
+	 * town name generator, which needs the game's name data. */
+	const TileIndex anchor = TileXY(30, 30);
+	MakeRoadNormal(anchor, ROAD_X, ROADTYPE_ROAD, ROADTYPE_TRAM, TownID::Invalid(), OWNER_NONE, OWNER_NONE);
+	REQUIRE(Town::CanAllocateItem());
+	Town *town = Town::Create(anchor);
+	REQUIRE(town != nullptr);
+	town->name = "Testville";
+	REQUIRE(town->xy == anchor);
+
+	const Json candidates = PickObjects(anchor);
+
+	/* Both candidates are offered, and the town exactly once. */
+	Json town_row = Json::object();
+	Json road_row = Json::object();
+	int town_count = 0;
+	for (const Json &candidate : candidates) {
+		if (candidate["type"] == "town") {
+			town_row = candidate;
+			town_count++;
+		}
+		if (candidate["type"] == "road") road_row = candidate;
+	}
+	REQUIRE(!town_row.empty());
+	REQUIRE(!road_row.empty());
+	CHECK(town_count == 1);
+
+	/* The town is a canonical pooled reference: the pool lifetime, the name, the anchor tile and the
+	 * world it was read in. A town is not a tile object, so it carries no fingerprint. */
+	CHECK(town_row["identity"] == "pool");
+	CHECK(town_row["id"] == town->index.base());
+	CHECK(town_row["generation"] == town->generation);
+	CHECK(town_row["name"] == "Testville");
+	CHECK(town_row["tile"] == TilePoint(30, 30));
+	CHECK(town_row["world_id"].is_string());
+	CHECK(town_row["epoch"].is_string());
+	CHECK_FALSE(town_row.contains("fingerprint"));
+
+	/* The reference resolves, and a stale lifetime of the same id does not. */
+	const Json ref = {{"type", "town"}, {"id", town->index.base()}, {"generation", town->generation}};
+	CHECK(ResolveObjectRef(ref, true)["found"] == true);
+	Json stale = ref;
+	stale["generation"] = town->generation + 1;
+	CHECK(ResolveObjectRef(stale, true)["found"] == false);
+
+	/* A house of the town carries the association in its own row, and does not repeat the town as a
+	 * second candidate, because the house tile is not the town's anchor. */
+	const TileIndex house = TileXY(31, 31);
+	SetTileType(house, TileType::House);
+	SetHouseType(house, 0);
+	SetTownIndex(house, town->index);
+	const Json house_row = FindTileObject(house, "house");
+	REQUIRE(!house_row.empty());
+	CHECK(house_row["town_id"] == town->index.base());
+	CHECK(house_row["town_generation"] == town->generation);
+	for (const Json &candidate : PickObjects(house)) CHECK(candidate["type"] != "town");
+
+	/* Terrain that belongs to no town invents none. */
+	const Json plain = PickObjects(TileXY(40, 40));
+	REQUIRE(!plain.empty());
+	for (const Json &candidate : plain) CHECK(candidate["type"] != "town");
+}
+
 TEST_CASE("Agent bridge refs: the error cases are explicit")
 {
 	MapFixture map;

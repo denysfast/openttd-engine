@@ -3137,6 +3137,19 @@ Json PickObjects(TileIndex tile)
 	}
 
 	/*
+	 * The town whose anchor tile this is: a town is a pool object with its own lifetime, and its
+	 * anchor is `Town::xy`, the tile the town itself is placed on. Only that tile names the town —
+	 * not a tile that merely belongs to it and never a nearest-town guess, which would attach a town
+	 * to terrain that carries none. A house names its town through the `town_id` of its own row, so
+	 * this adds at most one entry and never a second reference to the same town.
+	 */
+	for (const Town *town : Town::Iterate()) {
+		if (town->xy != tile) continue;
+		add({{"type", "town"}, {"identity", "pool"}, {"id", town->index.base()}, {"generation", town->generation},
+				{"name", town->GetCachedName()}, {"tile", location}});
+	}
+
+	/*
 	 * The objects the tile itself carries, as typed categories with a state fingerprint: a house
 	 * (with the lifetime of its town), rail, signal, road, tram, bridge, tunnel, mapobject, tree,
 	 * water or terrain. Each is identified by the tile and its fingerprint, not by a pool index.
