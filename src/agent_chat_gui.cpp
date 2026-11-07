@@ -1893,7 +1893,7 @@ static void AgentChatEnsurePreviews()
 	const AgentChatEntry *chat = GetActiveChat();
 	if (chat == nullptr) return;
 
-	const Rect area = w->GetInnerRect(WID_AC_TRANSCRIPT);
+	const Rect area = w->GetWidget<NWidgetBase>(WID_AC_TRANSCRIPT)->GetCurrentRect().Shrink(WidgetDimensions::scaled.framerect);
 	const std::vector<Rect> layout = LayoutTranscript(chat, area, _agent_chat.scroll);
 	if (layout.size() != chat->messages.size()) return;
 
