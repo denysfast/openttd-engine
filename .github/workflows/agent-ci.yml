@@ -8,9 +8,9 @@ name: Agent CI (engine)
 #
 # Two rules decide whether the job runs at all:
 #
-#  * `github.repository_owner == 'denysfast'` - the repository is still `mapuamap/openttd-engine`
-#    until the owner approves the transfer. Under the old owner the guard keeps the job off the
-#    pool entirely (a skipped job costs no slot), instead of queueing work the estate cannot serve.
+#  * `github.repository_owner == 'denysfast'` - the guard pins the job to this account's copy of
+#    the repository. Under any other owner it keeps the job off the pool entirely (a skipped job
+#    costs no slot), instead of queueing work the estate cannot serve.
 #  * a pull request must come from the same repository. The fork is public, and the runner is
 #    self-hosted, so untrusted fork code must not be checked out and built here. External fork PRs
 #    stay unverified until the owner decides how to gate them.
@@ -23,6 +23,10 @@ name: Agent CI (engine)
 # pool host already has cmake, ninja, a C++ toolchain and the OpenTTD build dependencies), any
 # deploy step, and any HOME override. No artifact bundle is published either: the build and CTest
 # output is tee-ed to stdout, so the logs are ordinary job output and need no upload step.
+#
+# The regression suites start a real game, which refuses to run without a base graphics set, so the
+# job stages a pinned OpenGFX inside the per-run build directory (see the Graphics set step); no
+# home directory and no shared system path is involved.
 
 on:
   push:
@@ -123,6 +127,41 @@ jobs:
           LAUNCHER
           chmod +x "$launcher"
           echo "compiler launcher: $launcher"
+
+      - name: Graphics set (OpenGFX)
+        shell: bash
+        run: |
+          set -euo pipefail
+          # The regression suites run a real game and it stops with "Failed to find a graphics set"
+          # when no base graphics set is reachable. A developer has one in a personal directory; a
+          # runner has no home directory to rely on. OpenTTD searches `baseset/` next to its own
+          # executable, so the set is staged inside the per-run build directory, where it is
+          # neither shared between runs nor installed into a system path.
+          # Version and digest are the ones the engine's own CI installs (OpenGFX 0.6.0 in
+          # .github/workflows/ci-linux.yml); the digest is the published one from
+          # https://cdn.openttd.org/opengfx-releases/0.6.0/manifest.yaml.
+          OPENGFX_URL="https://cdn.openttd.org/opengfx-releases/0.6.0/opengfx-0.6.0-all.zip"
+          OPENGFX_SHA256="d419c0f5f22131de15f66ebefde464df3b34eb10e0645fe218c59cbc26c20774"
+
+          stage=$(mktemp -d "${RUNNER_TEMP:-${TMPDIR:-/tmp}}/opengfx-XXXXXXXX")
+          trap 'rm -rf "$stage"' EXIT
+
+          curl -fsSL --retry 2 --max-time 300 "$OPENGFX_URL" -o "$stage/opengfx.zip"
+          echo "$OPENGFX_SHA256  $stage/opengfx.zip" | sha256sum -c -
+
+          # The "-all" archive is a zip that holds one tar of the baseset. Only members of that
+          # exact shape are unpacked, and only into the staging directory, so a tampered archive
+          # cannot write outside it.
+          test "$(unzip -Z1 "$stage/opengfx.zip")" = "opengfx-0.6.0.tar"
+          unzip -q "$stage/opengfx.zip" -d "$stage"
+          test -z "$(tar -tf "$stage/opengfx-0.6.0.tar" | grep -v '^opengfx-0\.6\.0/')"
+          tar -xf "$stage/opengfx-0.6.0.tar" -C "$stage"
+
+          mkdir -p "$BUILD_DIR/baseset"
+          mv "$stage/opengfx-0.6.0" "$BUILD_DIR/baseset/opengfx-0.6.0"
+          # Fail here, not inside CTest, if the set did not land where the engine looks for it.
+          test -f "$BUILD_DIR/baseset/opengfx-0.6.0/opengfx.obg"
+          echo "graphics set: $BUILD_DIR/baseset/opengfx-0.6.0"
 
       - name: Configure
         shell: bash
