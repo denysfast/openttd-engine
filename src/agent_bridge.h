@@ -14,7 +14,9 @@
 #include "company_type.h"
 #include "tile_type.h"
 
+#include <algorithm>
 #include <chrono>
+#include <cstdint>
 #include <functional>
 #include <string>
 #include <string_view>
@@ -48,6 +50,41 @@ inline constexpr std::chrono::milliseconds POLL_IDLE{25};
 
 /** Delay before retrying a poll that failed; a backend that is down is not hammered. */
 inline constexpr std::chrono::milliseconds POLL_RETRY{2000};
+
+/**
+ * Accumulated durations of one measured class, in microseconds.
+ *
+ * It is a plain accumulator with no budget and nothing enforced, so the reset and the boundary
+ * behaviour of the transport diagnostics can be tested without a running backend. It is not a
+ * measurement of its own: the bridge records a real elapsed time into it.
+ */
+struct DurationStats {
+	uint64_t count = 0; ///< Number of recorded durations.
+	uint64_t last = 0;  ///< The last recorded duration, in microseconds.
+	uint64_t max = 0;   ///< The longest recorded duration since the epoch started, in microseconds.
+	uint64_t total = 0; ///< Sum of all recorded durations, in microseconds.
+
+	/**
+	 * Record one duration.
+	 * @param micros The duration, in microseconds.
+	 */
+	void Record(uint64_t micros)
+	{
+		this->count++;
+		this->last = micros;
+		this->max = std::max(this->max, micros);
+		this->total += micros;
+	}
+
+	/**
+	 * Average of the recorded durations.
+	 * @return The average in microseconds, or 0 when nothing was recorded.
+	 */
+	uint64_t Average() const
+	{
+		return this->count == 0 ? 0 : this->total / this->count;
+	}
+};
 
 /**
  * Run one step of the bridge. Must be called from the main thread once per

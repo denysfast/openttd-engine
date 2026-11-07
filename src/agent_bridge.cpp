@@ -267,6 +267,7 @@ enum class RequestKind {
 struct PendingRequest {
 	RequestKind kind;                                ///< The kind of request.
 	std::string epoch;                               ///< The epoch the request was issued for.
+	Clock::time_point sent_at;                       ///< When the request was handed to the HTTP layer.
 	std::function<void(bool, const Json &)> callback;///< Callback for UI requests.
 };
 
@@ -290,6 +291,40 @@ struct TimingStats {
 	uint64_t total = 0;    ///< Sum of all measured executions, in microseconds.
 	uint64_t overruns = 0; ///< Executions that took longer than the budget of their class.
 };
+
+/**
+ * Measured time from sending a request to the completion of that request on the game thread.
+ *
+ * The numbers are not isolated network latency: they span the shared HTTP queue of the process (one
+ * request at a time), the network, the backend and the wait for the game-thread tick that drains the
+ * completion. They are recorded to tell the tick cadence apart from the transport, not to claim a
+ * network round trip, and they carry no budget.
+ */
+struct TransportStats {
+	DurationStats hello;  ///< POST /v1/engine/hello.
+	DurationStats poll;   ///< POST /v1/engine/poll.
+	DurationStats result; ///< POST /v1/engine/result.
+	DurationStats ui;     ///< Requests the native UI made.
+	uint64_t pending = 0;     ///< Requests in flight right now, whatever epoch they belong to.
+	uint64_t pending_max = 0; ///< Highest number of requests in flight at once since the epoch started.
+};
+
+/**
+ * The measurement a kind of request is recorded in.
+ * @param transport The transport measurements.
+ * @param kind The kind of the request.
+ * @return The measurement of that kind.
+ */
+DurationStats &TransportFor(TransportStats &transport, RequestKind kind)
+{
+	switch (kind) {
+		case RequestKind::Hello: return transport.hello;
+		case RequestKind::Poll: return transport.poll;
+		case RequestKind::Result: return transport.result;
+		case RequestKind::Ui: break;
+	}
+	return transport.ui;
+}
 
 /**
  * A savegame load that was accepted but not started yet.
@@ -344,6 +379,9 @@ struct BridgeState {
 	TimingStats command_timing;           ///< Inline writes executed on the game thread.
 	TimingStats batch_timing;             ///< One poll's request batch on the game thread.
 	TimingStats deferred_timing;          ///< Capture and camera jobs run on the draw tick.
+	DurationStats tick_gap;               ///< Interval between two bridge ticks on the game thread.
+	Clock::time_point last_tick{};        ///< Time of the previous tick of this epoch; empty before the first.
+	TransportStats transport;             ///< Send to completion times of the requests, per kind.
 };
 
 BridgeState _state;                                        ///< The bridge state.
@@ -382,6 +420,51 @@ Json TimingJson(const TimingStats &stats, uint64_t budget)
 		{"average", stats.count == 0 ? 0 : stats.total / stats.count},
 		{"overruns", stats.overruns},
 		{"budget", budget},
+	};
+}
+
+/**
+ * Describe one measured duration that has no budget of its own.
+ * @param stats The measured class.
+ * @return The read-only description of the class.
+ */
+Json DurationJson(const DurationStats &stats)
+{
+	return {
+		{"count", stats.count},
+		{"last", stats.last},
+		{"max", stats.max},
+		{"total", stats.total},
+		{"average", stats.Average()},
+	};
+}
+
+/**
+ * Describe the transport diagnostics of the bridge.
+ *
+ * `tick_gap` is the interval between two bridge ticks on the game thread, which is the floor of
+ * every latency the bridge can offer because a tick is the only place where a completion is drained
+ * and a request is sent. `requests.<kind>` is the time from sending a request to its completion on
+ * the game thread; it spans the shared HTTP queue, the network, the backend and the wait for the
+ * tick that drains the completion, so it is a turn-around and not isolated network latency. No
+ * number here is a budget: nothing is enforced or aborted.
+ * @return The read-only transport document.
+ */
+Json TransportJson()
+{
+	return {
+		{"unit", "microseconds"},
+		{"clock", "steady_clock"},
+		{"scope", "same process only: interval between two bridge ticks, and send to completion of one request on the game thread"},
+		{"tick_gap", DurationJson(_state.tick_gap)},
+		{"requests", {
+			{"hello", DurationJson(_state.transport.hello)},
+			{"poll", DurationJson(_state.transport.poll)},
+			{"result", DurationJson(_state.transport.result)},
+			{"ui", DurationJson(_state.transport.ui)},
+		}},
+		{"pending", _state.transport.pending},
+		{"pending_max", _state.transport.pending_max},
 	};
 }
 
@@ -560,7 +643,13 @@ void Send(RequestKind kind, const std::string &path, std::string payload, const 
 {
 	const uint64_t id = ++_next_request_id;
 	_callbacks[id] = std::make_unique<BridgeHTTPCallback>(id);
-	_pending[id] = PendingRequest{kind, epoch, std::move(callback)};
+	_pending[id] = PendingRequest{kind, epoch, Clock::now(), std::move(callback)};
+
+	/* The gauge is read from the requests that really are in flight and never kept by hand, so it
+	 * counts every epoch (those requests exist) and an epoch reset can never leave it out of step with
+	 * the map. Only the maximum is per epoch. */
+	_state.transport.pending = _pending.size();
+	_state.transport.pending_max = std::max(_state.transport.pending_max, _state.transport.pending);
 
 	HTTPHeaders headers;
 	headers.emplace_back("Authorization", "Bearer " + token);
@@ -1352,6 +1441,9 @@ Json WorldInfo()
 			/* The plan's target is a query/batch slice, so the whole batch of one poll is measured too. */
 			{"batches", TimingJson(_state.batch_timing, INLINE_BUDGET_US)},
 			{"deferred", TimingJson(_state.deferred_timing, DEFERRED_BUDGET_US)},
+			/* Additive diagnostics: the cadence of the bridge tick and the turn-around of each kind of
+			 * request, so a live run can tell the tick cadence apart from the shared HTTP queue. */
+			{"transport", TransportJson()},
 			/* The chat window's own Send acknowledgement: measured with the same steady clock in
 			 * this process, from the Send handler to the first paint of its feedback, and kept
 			 * apart from the answer latency and from the game-thread slices above. */
@@ -3012,6 +3104,8 @@ void ProcessCompletions()
 		if (pending == _pending.end()) continue;
 		const PendingRequest request = std::move(pending->second);
 		_pending.erase(pending);
+		/* Derived from the map again, so a late completion of an older epoch cannot eat a newer count. */
+		_state.transport.pending = _pending.size();
 		_callbacks.erase(completion.id);
 
 		Json body = Json::object();
@@ -3025,6 +3119,12 @@ void ProcessCompletions()
 
 		/* A completion of an older epoch must not touch the state of the current one. */
 		const bool current = request.epoch == _state.epoch;
+
+		/* Only the current epoch is measured: a request of a world that is gone says nothing about the
+		 * latency of this one. */
+		if (current) {
+			TransportFor(_state.transport, request.kind).Record(static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(Clock::now() - request.sent_at).count()));
+		}
 
 		switch (request.kind) {
 			case RequestKind::Hello:
@@ -3155,7 +3255,8 @@ Json CoreContracts()
 	contracts["timing"] = {
 		{"read", "world.info.timing = {unit, clock, scope, enforced, since_epoch, queries, commands, batches, deferred}"},
 		{"measured", "game-thread slices: one inline request execution (reads and writes separately), one poll's whole request batch, or one deferred draw-tick job"},
-		{"not_measured", "HTTP latency, poll cadence and queue waiting"},
+		{"not_measured", "the HTTP round trip, the poll cadence and the queue waiting are not part of the game-thread slices below"},
+		{"transport", "world.info.timing.transport = {unit, clock, scope, tick_gap, requests{hello, poll, result, ui}, pending, pending_max}: tick_gap and requests.<kind> are {count, last, max, total, average} in microseconds, tick_gap is the interval between two bridge ticks on the game thread, requests.<kind> is the time from sending that request to its completion on the game thread, pending is the number of requests in flight at this moment (every epoch, read from the requests that really exist) and pending_max its highest value since the epoch started; a transport number spans the shared HTTP queue (one request at a time), the network, the backend and the wait for the tick that drains the completion, so it is a turn-around and not isolated network latency, it has no budget, and it is recorded only for requests of the current epoch"},
 		{"budget", "a threshold that counts overruns; nothing is aborted when it is exceeded"},
 		{"ordering", "a world.info answer reports the executions that finished before it"},
 		{"chat_ack", "world.info.timing.chat_ack = {unit, clock, scope, target_us, pending, last_send, chat_id, world_id, epoch, outcome, client_message_id, painted, handler_to_paint_us, ack_to_paint_us, handler_to_ack_us}: the in-game chat window's Send, measured with this process's steady clock; handler_to_paint_us is the feedback the player waits for, ack_to_paint_us and handler_to_ack_us keep the backend's answer latency separate, outcome is painted, accepted, not_sent or uncertain, and every duration is null until it was measured"},
@@ -3304,6 +3405,15 @@ void Tick()
 	if (!EnsureInitialised()) return;
 	if (!_network_available) return;
 
+	/* The interval between two ticks is the floor of every latency the bridge can offer, because a
+	 * tick is the only place where a completion is drained and a request is sent. It is measured
+	 * before any work of this tick, so the number is the cadence and not the work inside one tick. */
+	const Clock::time_point tick_now = Clock::now();
+	if (_state.last_tick.time_since_epoch().count() != 0) {
+		_state.tick_gap.Record(static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(tick_now - _state.last_tick).count()));
+	}
+	_state.last_tick = tick_now;
+
 	/* Make sure responses are handled even when the network background loop is not running. */
 	NetworkHTTPSocketHandler::HTTPReceive();
 	ProcessCompletions();
@@ -3340,6 +3450,13 @@ void ResetWorld()
 	_state.command_timing = TimingStats{};
 	_state.batch_timing = TimingStats{};
 	_state.deferred_timing = TimingStats{};
+	_state.tick_gap = DurationStats{};
+	_state.last_tick = Clock::time_point{};
+	_state.transport = TransportStats{};
+	/* Requests of the world that is gone stay in flight, so the gauge is rebased on the map that is
+	 * really there instead of assuming it is empty. */
+	_state.transport.pending = _pending.size();
+	_state.transport.pending_max = _state.transport.pending;
 	_state.connection_id.clear();
 	_state.connected = false;
 	_state.cursor = 0;
