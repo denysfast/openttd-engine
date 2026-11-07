@@ -1,0 +1,160 @@
+/*
+ * This file is part of OpenTTD.
+ * OpenTTD is free software; you can redistribute it and/or modify it under the terms of the GNU General Public License as published by the Free Software Foundation, version 2.
+ * OpenTTD is distributed in the hope that it will be useful, but WITHOUT ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.
+ * See the GNU General Public License for more details. You should have received a copy of the GNU General Public License along with OpenTTD. If not, see <https://www.gnu.org/licenses/old-licenses/gpl-2.0>.
+ */
+
+/** @file test_agent_capture.cpp Test the camera and projection helpers of the agent bridge. */
+
+#include "../stdafx.h"
+
+#include "../3rdparty/catch2/catch.hpp"
+
+#include "../agent_capture.h"
+#include "../core/math_func.hpp"
+#include "../tile_type.h"
+#include "../viewport_type.h"
+#include "../window_func.h"
+#include "../window_type.h"
+#include "../zoom_func.h"
+
+#include "../safeguards.h"
+
+/**
+ * A viewport that is not attached to a window, with a scroll position that is not a
+ * multiple of the zoom scale, like a real one.
+ */
+static Viewport MakeTestViewport(ZoomLevel zoom)
+{
+	Viewport vp{};
+	vp.left = 0;
+	vp.top = 0;
+	vp.width = 800;
+	vp.height = 600;
+	vp.zoom = zoom;
+	vp.virtual_width = ScaleByZoom(vp.width, vp.zoom);
+	vp.virtual_height = ScaleByZoom(vp.height, vp.zoom);
+	vp.virtual_left = 12345;
+	vp.virtual_top = 6789;
+	return vp;
+}
+
+TEST_CASE("Agent capture: WorldToScreen round-trips through the game's inverse")
+{
+	for (int z = 0; z <= 6; z++) {
+		const Viewport vp = MakeTestViewport(static_cast<ZoomLevel>(z));
+
+		for (int tx = 0; tx < 64; tx++) {
+			for (int ty = 0; ty < 64; ty++) {
+				const int wx = tx * static_cast<int>(TILE_SIZE) + static_cast<int>(TILE_SIZE) / 2;
+				const int wy = ty * static_cast<int>(TILE_SIZE) + static_cast<int>(TILE_SIZE) / 2;
+
+				const Point screen = InGameAgent::WorldToScreen(vp, wx, wy, 0);
+
+				/* Exactly what TranslateXYToTileCoord() does with a screen pixel. */
+				const int vx = ScaleByZoom(screen.x - vp.left, vp.zoom) + vp.virtual_left;
+				const int vy = ScaleByZoom(screen.y - vp.top, vp.zoom) + vp.virtual_top;
+				const Point back = InverseRemapCoords(vx, vy);
+
+				/* The zoom scaling rounds, so the world position may be off by less than a
+				 * quarter tile, but the tile itself must be the same. */
+				CHECK(std::abs(back.x - wx) < static_cast<int>(TILE_SIZE) / 2);
+				CHECK(std::abs(back.y - wy) < static_cast<int>(TILE_SIZE) / 2);
+				CHECK(back.x / static_cast<int>(TILE_SIZE) == tx);
+				CHECK(back.y / static_cast<int>(TILE_SIZE) == ty);
+			}
+		}
+	}
+}
+
+TEST_CASE("Agent capture: WorldToScreen puts the viewport centre in the middle")
+{
+	for (int z = 0; z <= 6; z++) {
+		const Viewport vp = MakeTestViewport(static_cast<ZoomLevel>(z));
+
+		const Point world = InverseRemapCoords(vp.virtual_left + vp.virtual_width / 2, vp.virtual_top + vp.virtual_height / 2);
+		const Point screen = InGameAgent::WorldToScreen(vp, world.x, world.y, 0);
+
+		/* InverseRemapCoords() rounds down, so allow the rounding of the zoom scale. */
+		CHECK(std::abs(screen.x - (vp.left + vp.width / 2)) <= 8);
+		CHECK(std::abs(screen.y - (vp.top + vp.height / 2)) <= 8);
+	}
+}
+
+TEST_CASE("Agent capture: camera queries without a main window")
+{
+	/* The test binary has no window system, so there is no main viewport. */
+	CHECK(FindWindowById(WindowClass::MainWindow, 0) == nullptr);
+
+	SECTION("InspectGameViewport reports the missing viewport") {
+		const InGameAgent::Json result = InGameAgent::InspectGameViewport(InGameAgent::Json::object());
+		CHECK(result["ok"] == false);
+		CHECK(result["error"] == "viewport_unavailable");
+		CHECK(result.contains("tick"));
+	}
+
+	SECTION("SetGameCamera reports the missing viewport") {
+		const InGameAgent::Json result = InGameAgent::SetGameCamera(InGameAgent::Json{{"zoom", 2}});
+		CHECK(result["ok"] == false);
+		CHECK(result["error"] == "viewport_unavailable");
+		CHECK(result.contains("tick"));
+	}
+}
+
+TEST_CASE("Agent capture: camera requests are validated before the viewport is used")
+{
+	SECTION("InspectGameViewport rejects a negative tile") {
+		const InGameAgent::Json result = InGameAgent::InspectGameViewport(InGameAgent::Json{{"tile", -1}});
+		CHECK(result["ok"] == false);
+		CHECK(result["error"] == "invalid_params");
+	}
+
+	SECTION("InspectGameViewport rejects a tile that is not on any map") {
+		const InGameAgent::Json result = InGameAgent::InspectGameViewport(InGameAgent::Json{{"tile", 0xFFFFFFF}});
+		CHECK(result["ok"] == false);
+		CHECK(result["error"] == "out_of_bounds");
+	}
+
+	SECTION("InspectGameViewport rejects half a screen position") {
+		const InGameAgent::Json result = InGameAgent::InspectGameViewport(InGameAgent::Json{{"screen_x", 10}});
+		CHECK(result["ok"] == false);
+		CHECK(result["error"] == "invalid_params");
+	}
+
+	SECTION("InspectGameViewport rejects two projections at once") {
+		const InGameAgent::Json result = InGameAgent::InspectGameViewport(InGameAgent::Json{{"tile", 0}, {"screen_x", 10}, {"screen_y", 10}});
+		CHECK(result["ok"] == false);
+		CHECK(result["error"] == "invalid_params");
+	}
+
+	SECTION("InspectGameViewport rejects a tile of the wrong type") {
+		const InGameAgent::Json result = InGameAgent::InspectGameViewport(InGameAgent::Json{{"tile", "zero"}});
+		CHECK(result["ok"] == false);
+		CHECK(result["error"] == "invalid_params");
+	}
+
+	SECTION("SetGameCamera rejects a request that changes nothing") {
+		const InGameAgent::Json result = InGameAgent::SetGameCamera(InGameAgent::Json::object());
+		CHECK(result["ok"] == false);
+		CHECK(result["error"] == "invalid_params");
+	}
+
+	SECTION("SetGameCamera rejects a zoom of the wrong type") {
+		const InGameAgent::Json result = InGameAgent::SetGameCamera(InGameAgent::Json{{"zoom", "far"}});
+		CHECK(result["ok"] == false);
+		CHECK(result["error"] == "invalid_params");
+	}
+
+	SECTION("SetGameCamera rejects a tile and a scroll at once") {
+		const InGameAgent::Json result = InGameAgent::SetGameCamera(InGameAgent::Json{{"tile", 0}, {"scroll", {{"dx", 1}, {"dy", 1}}}});
+		CHECK(result["ok"] == false);
+		CHECK(result["error"] == "invalid_params");
+	}
+
+	SECTION("SetGameCamera rejects a tile that is not on any map") {
+		const InGameAgent::Json result = InGameAgent::SetGameCamera(InGameAgent::Json{{"tile", 0xFFFFFFF}});
+		CHECK(result["ok"] == false);
+		CHECK(result["error"] == "out_of_bounds");
+	}
+}

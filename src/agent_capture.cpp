@@ -11,13 +11,23 @@
 #include "agent_capture.h"
 #include "blitter/factory.hpp"
 #include "core/format.hpp"
+#include "core/math_func.hpp"
 #include "gfx_func.h"
+#include "map_func.h"
+#include "openttd.h"
 #include "palette_func.h"
 #include "screenshot_gui.h"
 #include "screenshot_type.h"
+#include "settings_type.h"
 #include "string_func.h"
+#include "tile_type.h"
 #include "timer/timer_game_tick.h"
+#include "town.h"
 #include "video/video_driver.hpp"
+#include "viewport_func.h"
+#include "window_func.h"
+#include "window_gui.h"
+#include "window_type.h"
 #include "3rdparty/md5/md5.h"
 
 #include <atomic>
@@ -324,6 +334,373 @@ Json CaptureGameFrame(const Json &params)
 	if (include_png) result["png_base64"] = Base64Encode(png);
 
 	_last_capture_hash = hash_hex;
+	return result;
+}
+
+/**
+ * Name of a zoom level, for the JSON results.
+ * @param zoom The zoom level.
+ * @return The name of the zoom level.
+ */
+static std::string_view ZoomLevelName(ZoomLevel zoom)
+{
+	switch (zoom) {
+		case ZoomLevel::In4x: return "in4x";
+		case ZoomLevel::In2x: return "in2x";
+		case ZoomLevel::Normal: return "normal";
+		case ZoomLevel::Out2x: return "out2x";
+		case ZoomLevel::Out4x: return "out4x";
+		case ZoomLevel::Out8x: return "out8x";
+		case ZoomLevel::End: break;
+	}
+	return "unknown";
+}
+
+/**
+ * Name of the game mode, for the JSON results.
+ * @param mode The game mode.
+ * @return The name of the game mode.
+ */
+static std::string_view GameModeName(GameMode mode)
+{
+	switch (mode) {
+		case GameMode::Menu: return "menu";
+		case GameMode::Normal: return "normal";
+		case GameMode::Editor: return "editor";
+		case GameMode::Bootstrap: return "bootstrap";
+	}
+	return "unknown";
+}
+
+/**
+ * The main window, when it has a viewport.
+ * @return The main window, or nullptr when the game shows no main viewport.
+ */
+static Window *GetMainViewportWindow()
+{
+	Window *w = FindWindowById(WindowClass::MainWindow, 0);
+	return (w != nullptr && w->viewport != nullptr) ? w : nullptr;
+}
+
+/**
+ * Describe the rectangle and the zoom of a viewport, in screen pixels.
+ * @param vp The viewport.
+ * @return The JSON description.
+ */
+static Json ViewportJson(const Viewport &vp)
+{
+	return Json{
+		{"left", vp.left},
+		{"top", vp.top},
+		{"width", vp.width},
+		{"height", vp.height},
+		{"virtual_left", vp.virtual_left},
+		{"virtual_top", vp.virtual_top},
+		{"virtual_width", vp.virtual_width},
+		{"virtual_height", vp.virtual_height},
+		{"zoom", to_underlying(vp.zoom)},
+		{"zoom_name", ZoomLevelName(vp.zoom)},
+	};
+}
+
+/**
+ * Describe where a viewport looks and how far it is zoomed in.
+ * @param vp The viewport data of the main window.
+ * @return The JSON description.
+ */
+static Json CameraJson(const ViewportData &vp)
+{
+	const int center_x = vp.virtual_left + vp.virtual_width / 2;
+	const int center_y = vp.virtual_top + vp.virtual_height / 2;
+	const bool center_on_map = center_x >= 0 && center_y >= 0 &&
+			center_x < static_cast<int>(Map::SizeX()) * static_cast<int>(TILE_SIZE) &&
+			center_y < static_cast<int>(Map::SizeY()) * static_cast<int>(TILE_SIZE);
+
+	return Json{
+		{"center_world", {{"x", center_x}, {"y", center_y}}},
+		{"center_tile", center_on_map ? Json{{"x", center_x / static_cast<int>(TILE_SIZE)}, {"y", center_y / static_cast<int>(TILE_SIZE)}} : Json(nullptr)},
+		{"scrollpos", {{"x", vp.scrollpos_x}, {"y", vp.scrollpos_y}}},
+		{"dest_scrollpos", {{"x", vp.dest_scrollpos_x}, {"y", vp.dest_scrollpos_y}}},
+		{"zoom", to_underlying(vp.zoom)},
+		{"zoom_name", ZoomLevelName(vp.zoom)},
+	};
+}
+
+/**
+ * The window that covers a screen position, when it is not the main window.
+ * @param x Screen x.
+ * @param y Screen y.
+ * @return The occluding window as JSON, or null when the main window is on top there.
+ */
+static Json OccludingWindowJson(int x, int y)
+{
+	const Window *w = FindWindowFromPt(x, y);
+	if (w == nullptr || w->window_class == WindowClass::MainWindow) return Json(nullptr);
+	return Json{
+		{"class", to_underlying(w->window_class)},
+		{"number", static_cast<int32_t>(w->window_number)},
+	};
+}
+
+/**
+ * Project a tile to the screen.
+ * @param vp   The viewport to project into.
+ * @param tile The tile to project.
+ * @return The projection as JSON.
+ */
+static Json ProjectTile(const Viewport &vp, TileIndex tile)
+{
+	/* The centre of the tile at ground height, the same point ScrollMainWindowToTile() centres on. */
+	const int x = TileX(tile) * TILE_SIZE + TILE_SIZE / 2;
+	const int y = TileY(tile) * TILE_SIZE + TILE_SIZE / 2;
+	const int z = GetSlopePixelZ(x, y);
+	const Point screen = WorldToScreen(vp, x, y, z);
+	const bool in_viewport = screen.x >= vp.left && screen.x < vp.left + vp.width && screen.y >= vp.top && screen.y < vp.top + vp.height;
+	const Json occluding = OccludingWindowJson(screen.x, screen.y);
+
+	return Json{
+		{"coordinate_space", "screen_pixels"},
+		{"tile", {{"index", tile.base()}, {"x", TileX(tile)}, {"y", TileY(tile)}}},
+		{"world", {{"x", x}, {"y", y}, {"z", z}}},
+		{"screen", {{"x", screen.x}, {"y", screen.y}}},
+		{"in_viewport", in_viewport},
+		{"visible", in_viewport && occluding.is_null()},
+		{"occluding_window", occluding},
+		{"zoom", to_underlying(vp.zoom)},
+	};
+}
+
+/**
+ * Project a screen pixel to the map.
+ * @param vp           The viewport to project into.
+ * @param x            Screen x.
+ * @param y            Screen y.
+ * @param clamp_to_map Clamp the result to the map.
+ * @return The projection as JSON.
+ */
+static Json ProjectScreen(const Viewport &vp, int x, int y, bool clamp_to_map)
+{
+	const bool in_viewport = x >= vp.left && x < vp.left + vp.width && y >= vp.top && y < vp.top + vp.height;
+	const Json occluding = OccludingWindowJson(x, y);
+
+	/* TranslateXYToTileCoord() returns the world position under the pixel, not a tile index. */
+	Json world = Json(nullptr);
+	Json tile = Json(nullptr);
+	Json tile_index = Json(nullptr);
+	if (in_viewport) {
+		const Point pt = TranslateXYToTileCoord(vp, x, y, clamp_to_map);
+		world = {{"x", pt.x}, {"y", pt.y}};
+		if (pt.x >= 0 && pt.y >= 0 &&
+				pt.x < static_cast<int>(Map::SizeX()) * static_cast<int>(TILE_SIZE) &&
+				pt.y < static_cast<int>(Map::SizeY()) * static_cast<int>(TILE_SIZE)) {
+			tile = {{"x", pt.x / static_cast<int>(TILE_SIZE)}, {"y", pt.y / static_cast<int>(TILE_SIZE)}};
+			tile_index = TileVirtXY(pt.x, pt.y).base();
+		}
+	}
+
+	return Json{
+		{"coordinate_space", "world"},
+		{"screen", {{"x", x}, {"y", y}}},
+		{"world", world},
+		{"tile", tile},
+		{"tile_index", tile_index},
+		{"in_viewport", in_viewport},
+		{"visible", in_viewport && occluding.is_null()},
+		{"occluding_window", occluding},
+		{"clamp_to_map", clamp_to_map},
+		{"zoom", to_underlying(vp.zoom)},
+	};
+}
+
+/**
+ * Resolve the tile a request refers to.
+ *
+ * Accepts "tile" (a tile index), "tile_x"/"tile_y" (tile coordinates), "town" (a town id,
+ * resolved to the town centre tile) and "center" (an object with tile coordinates "x"/"y").
+ *
+ * @param params The request parameters.
+ * @param tile   Receives the resolved tile.
+ * @param error  Receives the error to report when the tile cannot be resolved.
+ * @return True iff a tile was requested and resolved.
+ */
+static bool ResolveTile(const Json &params, TileIndex &tile, std::string_view &error)
+{
+	if (params.contains("tile")) {
+		const int64_t index = params.value("tile", int64_t{-1});
+		if (index < 0 || index > UINT32_MAX) {
+			error = "invalid_params";
+			return false;
+		}
+		tile = static_cast<TileIndex>(index);
+	} else if (params.contains("town")) {
+		const int64_t town_id = params.value("town", int64_t{-1});
+		if (town_id < 0 || town_id > UINT16_MAX || !Town::IsValidID(static_cast<TownID>(town_id))) {
+			error = "out_of_bounds";
+			return false;
+		}
+		tile = Town::Get(static_cast<TownID>(town_id))->xy;
+	} else {
+		int64_t x;
+		int64_t y;
+		if (params.contains("center")) {
+			if (!params["center"].is_object()) {
+				error = "invalid_params";
+				return false;
+			}
+			x = params["center"].value("x", int64_t{-1});
+			y = params["center"].value("y", int64_t{-1});
+		} else {
+			if (!params.contains("tile_x") || !params.contains("tile_y")) {
+				error = "invalid_params";
+				return false;
+			}
+			x = params.value("tile_x", int64_t{-1});
+			y = params.value("tile_y", int64_t{-1});
+		}
+		if (x < 0 || y < 0 || x >= Map::SizeX() || y >= Map::SizeY()) {
+			error = "out_of_bounds";
+			return false;
+		}
+		tile = TileXY(static_cast<uint>(x), static_cast<uint>(y));
+	}
+
+	if (!IsValidTile(tile)) {
+		error = "out_of_bounds";
+		return false;
+	}
+	return true;
+}
+
+Json InspectGameViewport(const Json &params)
+{
+	/* Parse and validate the request before touching any game state. */
+	const bool project_tile = params.contains("tile") || params.contains("tile_x") || params.contains("tile_y") || params.contains("town") || params.contains("center");
+	const bool project_screen = params.contains("screen_x") || params.contains("screen_y");
+	if (project_tile && project_screen) return Failure("invalid_params");
+	if (project_screen && (!params.contains("screen_x") || !params.contains("screen_y"))) return Failure("invalid_params");
+
+	TileIndex tile = INVALID_TILE;
+	int screen_x = 0;
+	int screen_y = 0;
+	bool clamp_to_map = true;
+	try {
+		if (project_tile) {
+			std::string_view error;
+			if (!ResolveTile(params, tile, error)) return Failure(error);
+		}
+		if (project_screen) {
+			screen_x = params.value("screen_x", 0);
+			screen_y = params.value("screen_y", 0);
+		}
+		clamp_to_map = params.value("clamp_to_map", true);
+	} catch (const Json::exception &) {
+		return Failure("invalid_params");
+	}
+
+	Window *w = GetMainViewportWindow();
+	if (w == nullptr) return Failure("viewport_unavailable");
+	const ViewportData &vp = *w->viewport;
+
+	Json result = Json::object();
+	result["ok"] = true;
+	result["tick"] = TimerGameTick::counter;
+	result["coordinate_space"] = "screen_pixels";
+	result["game_mode"] = GameModeName(_game_mode);
+	result["in_game"] = _game_mode != GameMode::Menu;
+	result["screen"] = {{"width", _screen.width}, {"height", _screen.height}};
+	result["viewport"] = ViewportJson(vp);
+	result["camera"] = CameraJson(vp);
+	if (project_tile) result["projection"] = ProjectTile(vp, tile);
+	if (project_screen) result["projection"] = ProjectScreen(vp, screen_x, screen_y, clamp_to_map);
+	return result;
+}
+
+Json SetGameCamera(const Json &params)
+{
+	/* Parse and validate the request before touching any game state. */
+	const bool has_tile = params.contains("tile") || params.contains("tile_x") || params.contains("tile_y") || params.contains("town") || params.contains("center");
+	const bool has_scroll = params.contains("scroll");
+	const bool has_zoom = params.contains("zoom");
+	const bool has_zoom_delta = params.contains("zoom_delta");
+	if (!has_tile && !has_scroll && !has_zoom && !has_zoom_delta) return Failure("invalid_params");
+	if (has_zoom && has_zoom_delta) return Failure("invalid_params");
+	if (has_tile && has_scroll) return Failure("invalid_params");
+
+	bool instant = true;
+	int zoom = 0;
+	int zoom_delta = 0;
+	int scroll_x = 0;
+	int scroll_y = 0;
+	TileIndex tile = INVALID_TILE;
+	try {
+		instant = params.value("instant", true);
+		if (has_zoom) zoom = params.value("zoom", 0);
+		if (has_zoom_delta) zoom_delta = params.value("zoom_delta", 0);
+		if (has_scroll) {
+			if (!params["scroll"].is_object()) return Failure("invalid_params");
+			scroll_x = params["scroll"].value("dx", 0);
+			scroll_y = params["scroll"].value("dy", 0);
+		}
+		if (has_tile) {
+			std::string_view error;
+			if (!ResolveTile(params, tile, error)) return Failure(error);
+		}
+	} catch (const Json::exception &) {
+		return Failure("invalid_params");
+	}
+
+	Window *w = GetMainViewportWindow();
+	if (w == nullptr) return Failure("viewport_unavailable");
+	ViewportData &vp = *w->viewport;
+
+	const int old_zoom = to_underlying(vp.zoom);
+	const int old_scroll_x = vp.scrollpos_x;
+	const int old_scroll_y = vp.scrollpos_y;
+
+	/* Zoom through the normal UI zoom path, bounded by the user's zoom limits. */
+	bool zoom_clamped = false;
+	if (has_zoom || has_zoom_delta) {
+		const int min_zoom = to_underlying(std::max(_settings_client.gui.zoom_min, ZoomLevel::Min));
+		const int max_zoom = to_underlying(std::min(_settings_client.gui.zoom_max, ZoomLevel::Max));
+		const int wanted = has_zoom ? zoom : old_zoom + zoom_delta;
+		const int target = Clamp(wanted, min_zoom, max_zoom);
+		zoom_clamped = target != wanted;
+		while (to_underlying(vp.zoom) > target) {
+			if (!DoZoomInOutWindow(ZOOM_IN, w)) break;
+		}
+		while (to_underlying(vp.zoom) < target) {
+			if (!DoZoomInOutWindow(ZOOM_OUT, w)) break;
+		}
+	}
+
+	/* Move through the normal UI scroll path; the requested centre is validated above and the
+	 * viewport update clamps the destination to the map. */
+	if (has_tile) {
+		ScrollMainWindowToTile(tile, instant);
+	} else if (has_scroll) {
+		const int center_x = vp.virtual_left + vp.virtual_width / 2;
+		const int center_y = vp.virtual_top + vp.virtual_height / 2;
+		const int max_x = static_cast<int>(Map::SizeX()) * static_cast<int>(TILE_SIZE) - 1;
+		const int max_y = static_cast<int>(Map::SizeY()) * static_cast<int>(TILE_SIZE) - 1;
+		const int x = Clamp(center_x + ScaleByZoom(scroll_x, vp.zoom), 0, max_x);
+		const int y = Clamp(center_y + ScaleByZoom(scroll_y, vp.zoom), 0, max_y);
+		ScrollMainWindowTo(x, y, -1, instant);
+	}
+
+	/* An instant move only sets the destination; apply it now, so the reported state and the
+	 * projection are the state the next frame is drawn from. */
+	if (instant) UpdateViewportPosition(w, 0);
+
+	Json result = Json::object();
+	result["ok"] = true;
+	result["tick"] = TimerGameTick::counter;
+	result["changed"] = to_underlying(vp.zoom) != old_zoom || vp.scrollpos_x != old_scroll_x || vp.scrollpos_y != old_scroll_y;
+	result["instant"] = instant;
+	result["zoom_clamped"] = zoom_clamped;
+	result["coordinate_space"] = "screen_pixels";
+	result["screen"] = {{"width", _screen.width}, {"height", _screen.height}};
+	result["viewport"] = ViewportJson(vp);
+	result["camera"] = CameraJson(vp);
 	return result;
 }
 
