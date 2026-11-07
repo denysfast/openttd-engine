@@ -2,7 +2,7 @@
  * This file is part of OpenTTD.
  * OpenTTD is free software; you can redistribute it and/or modify it under the terms of the GNU General Public License as published by the Free Software Foundation, version 2.
  * OpenTTD is distributed in the hope that it will be useful, but WITHOUT ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.
- * See the GNU General Public License for more details. You should have received a copy of the GNU General Public License along with OpenTTD. If not, see <https://www.gnu.org/licenses/old-licenses/gpl-2.0>.
+ * See the GNU General Public License for more details. You should have received a copy of the GNU General Public License along with OpenTTD. If not, see <https://www.gnu.org/licenses/gpl-2.0>.
  */
 
 /**
@@ -11,8 +11,12 @@
  * The selection is a pair of byte offsets in the cached transcript, so these cases run without a
  * window, a font or a backend: they cover the promises the player is given, i.e. that a drag
  * selects the glyphs that are on screen, that copying returns the text exactly as it was rendered
- * (Cyrillic, newlines and all), that a reversed drag selects the same text, and that a selection
- * never survives a chat or world switch as a stale range of somebody else's text.
+ * (Cyrillic, emoji, newlines and all), that a reversed drag selects the same text, and that a
+ * selection never survives a chat or world switch as a stale range of somebody else's text.
+ *
+ * The expected character boundaries are never derived from a fixed character width: they are
+ * decoded from the text by #Utf8Boundaries, so a text that mixes one byte ASCII, two byte
+ * Cyrillic and four byte emoji characters is checked against what its bytes really are.
  */
 
 #include "../stdafx.h"
@@ -22,6 +26,7 @@
 #include "../agent_chat_selection.h"
 #include "../core/utf8.hpp"
 
+#include <algorithm>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -43,33 +48,147 @@ static int MeasureMonospace(std::string_view text)
 	return width;
 }
 
-/** A UTF-8 text of several characters, none of them one byte long. */
+/**
+ * The UTF-8 character boundaries of a text, decoded from the text itself.
+ *
+ * This is the independent reference the selection helpers are checked against: the offset of
+ * every code point the iterator finds, followed by the end of the text. Nothing here assumes a
+ * character width, so ASCII, Cyrillic and emoji are all measured by decoding them.
+ * @param text The text to decode.
+ * @return The byte offsets that are character boundaries, in increasing order.
+ */
+static std::vector<size_t> Utf8Boundaries(std::string_view text)
+{
+	std::vector<size_t> boundaries;
+	Utf8View view(text);
+	for (auto it = view.begin(); it != view.end(); ++it) boundaries.push_back(it.GetByteOffset());
+	boundaries.push_back(text.size());
+	return boundaries;
+}
+
+/**
+ * The greatest boundary at or before an offset.
+ * @param boundaries The boundaries of the text, in increasing order.
+ * @param offset The offset to look up.
+ * @return The boundary.
+ */
+static size_t BoundaryAtOrBefore(const std::vector<size_t> &boundaries, size_t offset)
+{
+	size_t result = 0;
+	for (const size_t boundary : boundaries) {
+		if (boundary > offset) break;
+		result = boundary;
+	}
+	return result;
+}
+
+/**
+ * The smallest boundary after an offset.
+ * @param boundaries The boundaries of the text, in increasing order.
+ * @param offset The offset to look up.
+ * @return The boundary, or the end of the text when there is none.
+ */
+static size_t BoundaryAfter(const std::vector<size_t> &boundaries, size_t offset)
+{
+	for (const size_t boundary : boundaries) {
+		if (boundary > offset) return boundary;
+	}
+	return boundaries.back();
+}
+
+/**
+ * The greatest boundary before an offset.
+ * @param boundaries The boundaries of the text, in increasing order.
+ * @param offset The offset to look up.
+ * @return The boundary, or 0 when there is none.
+ */
+static size_t BoundaryBefore(const std::vector<size_t> &boundaries, size_t offset)
+{
+	size_t result = 0;
+	for (const size_t boundary : boundaries) {
+		if (boundary >= offset) break;
+		result = boundary;
+	}
+	return result;
+}
+
+/**
+ * Count the code points of a text by decoding it.
+ * @param text The text.
+ * @return The number of code points.
+ */
+static size_t CountCodePoints(std::string_view text)
+{
+	size_t count = 0;
+	Utf8View view(text);
+	for (auto it = view.begin(); it != view.end(); ++it) count++;
+	return count;
+}
+
+/** A text of two byte characters only. */
 static const std::string CYRILLIC = "Привет, мир";
+
+/** Texts whose characters are not all the same number of bytes. */
+static const std::vector<std::string> MIXED_TEXTS = {
+	"hello world",                       // one byte characters only
+	"Привет, мир",                       // two byte Cyrillic next to one byte ", "
+	"Привет, world",                     // the two kinds in one line
+	"ok \xF0\x9F\x99\x82 done",          // a four byte emoji between ASCII
+	"строка\nвторая \xF0\x9F\x98\x80",   // a newline and an emoji in Cyrillic text
+	"",
+};
 
 TEST_CASE("agent_chat_selection: an offset never cuts a character")
 {
-	const std::string_view text = CYRILLIC;
+	for (const std::string &sample : MIXED_TEXTS) {
+		const std::string_view text = sample;
+		const std::vector<size_t> boundaries = Utf8Boundaries(text);
 
-	/* Every character of the text is two bytes, so the boundaries are the even offsets. */
-	for (size_t offset = 0; offset <= text.size(); offset++) {
-		const size_t snapped = SnapUtf8Boundary(text, offset);
-		CHECK(snapped <= offset);
-		CHECK(snapped % 2 == 0);
-		CHECK(offset - snapped < 2);
+		REQUIRE(boundaries.front() == 0);
+		REQUIRE(boundaries.back() == text.size());
+
+		/* The reference list itself is strictly increasing and holds real boundaries. */
+		for (size_t i = 0; i < boundaries.size(); i++) {
+			CHECK(boundaries[i] <= text.size());
+			CHECK((boundaries[i] == text.size() || !IsUtf8Part(text[boundaries[i]])));
+			if (i > 0) CHECK(boundaries[i - 1] < boundaries[i]);
+		}
+
+		/* Every offset of the text is mapped onto the boundary list, whatever the byte lengths. */
+		for (size_t offset = 0; offset <= text.size(); offset++) {
+			CHECK(SnapUtf8Boundary(text, offset) == BoundaryAtOrBefore(boundaries, offset));
+			CHECK(NextUtf8Boundary(text, offset) == BoundaryAfter(boundaries, offset));
+			CHECK(PrevUtf8Boundary(text, offset) == BoundaryBefore(boundaries, offset));
+		}
+
+		/* An offset beyond the end is clamped to the end. */
+		CHECK(SnapUtf8Boundary(text, text.size() + 100) == text.size());
+		CHECK(NextUtf8Boundary(text, text.size() + 100) == text.size());
+		/* The boundary before the end of the text, i.e. the start of its last character. */
+		CHECK(PrevUtf8Boundary(text, text.size() + 100) == BoundaryBefore(boundaries, text.size()));
 	}
 
+	/* The first characters of the Cyrillic text are two bytes each, so these offsets are the
+	 * ones a drag produces on the rendered glyphs. */
+	const std::string_view text = CYRILLIC;
 	CHECK(SnapUtf8Boundary(text, 0) == 0);
 	CHECK(SnapUtf8Boundary(text, 1) == 0);
 	CHECK(SnapUtf8Boundary(text, 3) == 2);
 	CHECK(SnapUtf8Boundary(text, text.size()) == text.size());
-	CHECK(SnapUtf8Boundary(text, text.size() + 100) == text.size());
-
 	CHECK(NextUtf8Boundary(text, 0) == 2);
 	CHECK(NextUtf8Boundary(text, 1) == 2);
-	CHECK(NextUtf8Boundary(text, text.size()) == text.size());
 	CHECK(PrevUtf8Boundary(text, 2) == 0);
 	CHECK(PrevUtf8Boundary(text, 3) == 2);
 	CHECK(PrevUtf8Boundary(text, 0) == 0);
+
+	/* The ASCII characters of the same text are one byte each. */
+	const std::vector<size_t> boundaries = Utf8Boundaries(text);
+	const size_t comma = text.find(',');
+	REQUIRE(comma != std::string_view::npos);
+	CHECK(BoundaryAtOrBefore(boundaries, comma) == comma);
+	CHECK(SnapUtf8Boundary(text, comma) == comma);
+	CHECK(SnapUtf8Boundary(text, comma + 1) == comma + 1);
+	CHECK(NextUtf8Boundary(text, comma) == comma + 1);
 
 	/* A plain ASCII text has a boundary on every byte. */
 	CHECK(NextUtf8Boundary("abc", 0) == 1);
@@ -105,6 +224,14 @@ TEST_CASE("agent_chat_selection: hit testing lands on the glyph under the pointe
 	CHECK(WidthForOffset(cyrillic, 2, MeasureMonospace) == 10);
 	CHECK(WidthForOffset(cyrillic, 3, MeasureMonospace) == 10);
 	CHECK(WidthForOffset(cyrillic, cyrillic.size(), MeasureMonospace) == 60);
+
+	/* The same holds for a line that mixes one byte and four byte characters. */
+	const std::string_view mixed = "a \xF0\x9F\x99\x82 b";
+	const std::vector<size_t> boundaries = Utf8Boundaries(mixed);
+	for (int x = -10; x <= 100; x += 1) {
+		const size_t offset = OffsetForX(mixed, x, MeasureMonospace);
+		CHECK(std::find(boundaries.begin(), boundaries.end(), offset) != boundaries.end());
+	}
 }
 
 TEST_CASE("agent_chat_selection: a single message keeps every byte")
@@ -248,10 +375,11 @@ TEST_CASE("agent_chat_selection: the same chat in another world or epoch is anot
 	CHECK(selection.Empty());
 	CHECK(selection.GetText(texts).empty());
 
-	/* The same chat id in another epoch of the same world as well. */
+	/* The same chat id in another epoch of the same world as well. Offset 4 is the end of the
+	 * second two byte character, so the selection covers "Пр". */
 	selection.Start({0, 0});
 	selection.Extend({0, 4});
-	REQUIRE(selection.GetText(texts) == "П");
+	REQUIRE(selection.GetText(texts) == "Пр");
 	selection.BindChat("chat-a", "world-2", "epoch-2");
 	CHECK(selection.Empty());
 	CHECK(selection.GetText(texts).empty());
@@ -314,24 +442,47 @@ TEST_CASE("agent_chat_selection: a reloaded transcript keeps the ends inside it"
 
 TEST_CASE("agent_chat_selection: every selected range is valid UTF-8")
 {
-	const std::vector<std::string_view> texts = {"Привет, мир", "second line"};
+	for (const std::string &sample : MIXED_TEXTS) {
+		const std::string_view text = sample;
+		const std::vector<size_t> boundaries = Utf8Boundaries(text);
+
+		for (const size_t begin : boundaries) {
+			for (const size_t end : boundaries) {
+				if (end < begin) continue;
+
+				AgentChatSelection selection;
+				selection.BindChat("chat-a", "world-1", "epoch-1");
+				selection.Start({0, begin});
+				selection.Extend({0, end});
+
+				const std::string copied = selection.GetText({text});
+				const std::string_view expected = text.substr(begin, end - begin);
+
+				/* Byte for byte the range of the message, so no character is cut. */
+				CHECK(copied == expected);
+				/* The same number of code points as that range of the source. */
+				CHECK(CountCodePoints(copied) == CountCodePoints(expected));
+				/* And nothing was replaced by the invalid encoding placeholder. */
+				CHECK(copied.find("\xEF\xBF\xBD") == std::string::npos);
+				/* Both ends of the copy are boundaries of the source text. */
+				CHECK(std::find(boundaries.begin(), boundaries.end(), begin) != boundaries.end());
+				CHECK(std::find(boundaries.begin(), boundaries.end(), end) != boundaries.end());
+			}
+		}
+	}
+
+	/* A selection across two messages of different character widths: the parts are copied
+	 * verbatim and joined with one newline. */
+	const std::string first = "Привет, мир";
+	const std::string second = "ok \xF0\x9F\x99\x82";
+	const std::vector<std::string_view> texts = {first, second};
 
 	AgentChatSelection selection;
 	selection.BindChat("chat-a", "world-1", "epoch-1");
-	for (size_t begin = 0; begin <= texts[0].size(); begin += 2) {
-		for (size_t end = begin; end <= texts[0].size(); end += 2) {
-			selection.Start({0, begin});
-			selection.Extend({0, end});
-
-			const std::string copied = selection.GetText(texts);
-			/* A selection inside one message is a byte range of that message, exactly. */
-			CHECK(copied == texts[0].substr(begin, end - begin));
-
-			/* And it decodes to as many characters as the same range of the source. */
-			size_t copied_characters = 0;
-			Utf8View copied_view(copied);
-			for (auto it = copied_view.begin(); it != copied_view.end(); ++it) copied_characters++;
-			CHECK(copied_characters * 2 == copied.size());
-		}
-	}
+	selection.Start({0, 6});
+	selection.Extend({1, second.size()});
+	const std::string copied = selection.GetText(texts);
+	CHECK(copied == first.substr(6) + "\n" + second);
+	CHECK(CountCodePoints(copied) == CountCodePoints(first.substr(6)) + 1 + CountCodePoints(second));
+	CHECK(copied.find("\xEF\xBF\xBD") == std::string::npos);
 }
