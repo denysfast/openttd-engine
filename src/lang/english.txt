@@ -2941,6 +2941,8 @@ STR_RAIL_ROUTE_START_Y_TOOLTIP                                  :{BLACK}Start st
 STR_RAIL_ROUTE_SIGNALS                                          :{BLACK}Signals, every (tiles):
 STR_RAIL_ROUTE_SIGNALS_TOOLTIP                                  :{BLACK}Build one-way path signals on every track, in the direction from the start to the end
 STR_RAIL_ROUTE_INTERVAL_TOOLTIP                                 :{BLACK}Distance between signals along the line, 1 to 20 tiles
+STR_RAIL_ROUTE_TERRAFORM                                       :{BLACK}Allow earthworks
+STR_RAIL_ROUTE_TERRAFORM_TOOLTIP                               :{BLACK}Keep usable natural slopes. When enabled, reshape only the terrain needed for a continuous route; when disabled, build entirely on the existing terrain using normal rail foundations
 STR_RAIL_ROUTE_WATER                                            :{BLACK}Remove water
 STR_RAIL_ROUTE_WATER_TOOLTIP                                    :{BLACK}Fill sea, lakes, rivers and canals in the corridor; otherwise water tiles block the line
 STR_RAIL_ROUTE_DEMOLISH                                         :{BLACK}Demolish houses, industries and town roads
@@ -2948,7 +2950,7 @@ STR_RAIL_ROUTE_DEMOLISH_TOOLTIP                                 :{BLACK}Demolish
 STR_RAIL_ROUTE_SEA                                              :{BLACK}Raise land at sea level
 STR_RAIL_ROUTE_SEA_TOOLTIP                                      :{BLACK}Keep the line at least one level above the sea, raising the land where needed
 STR_RAIL_ROUTE_BUILD                                            :{BLACK}Build
-STR_RAIL_ROUTE_BUILD_TOOLTIP                                    :{BLACK}Choose the orientation of the start, then aim the start of the line with the mouse and click: the start is fixed. Then click the end: the line follows the mouse as a preview and is built at the second click with the rail type of the railway toolbar. Stays active for more lines until Esc or right-click. Hotkey: K
+STR_RAIL_ROUTE_BUILD_TOOLTIP                                    :{BLACK}Click the start and end to build the preview. Clicking existing rail selects its orientation and reuses its connections. Shift+click shows the estimated cost and keeps the start. A failed build keeps the start for retry. Stays active until Esc or right-click. Hotkey: K
 STR_RAIL_ROUTE_ABORT                                            :{BLACK}Abort construction
 STR_RAIL_ROUTE_ABORT_TOOLTIP                                    :{BLACK}Stop the running construction; what was already built stays
 STR_RAIL_ROUTE_INFO_RAILTYPE                                    :{BLACK}Rail type: {GOLD}{STRING}{BLACK}, signals: {GOLD}{STRING}
@@ -2975,6 +2977,7 @@ STR_RAIL_ROUTE_ERROR_NO_ROUTE                                   :no route found
 STR_RAIL_ROUTE_ERROR_DOES_NOT_FIT                               :the corridor does not fit on the map
 STR_RAIL_ROUTE_ERROR_WRONG_DIRECTION                            :the end must lie in the direction of the start
 STR_RAIL_ROUTE_ERROR_START_MISMATCH                             :the route does not fit the start
+STR_RAIL_ROUTE_ERROR_INVALID_RAILTYPE                          :invalid rail type
 STR_RAIL_ROUTE_ERROR_INVALID_START                              :invalid start orientation
 
 STR_ERROR_RAIL_ROUTE_CAN_T_BUILD                                :{WHITE}Can't build the trunk line...

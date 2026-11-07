@@ -3939,7 +3939,7 @@ static bool ConRailRoute(std::span<std::string_view> argv)
 {
 	if (argv.empty()) {
 		IConsolePrint(CC_HELP, "Build a rail trunk line of parallel one-way tracks from x1,y1 to x2,y2. Usage: 'rail_route <x1> <y1> <x2> <y2> <tracks 1-30> [<company> [<options>]]'.");
-		IConsolePrint(CC_HELP, "Options, comma separated: start=x|y|ns|ew (fixed start orientation), signals=<interval|0>, water=0|1, demolish=0|1, sea=0|1, rt=<rail type label>, type=<signal type 0-5>, semaphore, plan (only show the plan).");
+		IConsolePrint(CC_HELP, "Options, comma separated: start=auto|x|y|ns|ew, terraform=0|1, signals=<interval|0>, water=0|1, demolish=0|1, sea=0|1, rt=<rail type label>, type=<signal type 0-5>, semaphore, plan (only show the plan).");
 		IConsolePrint(CC_HELP, "Company: 1-based; defaults to your company. Progress: 'blueprint_status'.");
 		return true;
 	}
@@ -3985,12 +3985,13 @@ static bool ConRailRoute(std::span<std::string_view> argv)
 			if (key == "plan") {
 				plan_only = true;
 			} else if (key == "start") {
-				if (val == "x") options.start = RailRouteStart::X;
+				if (val == "auto") options.start = RailRouteStart::Auto;
+				else if (val == "x") options.start = RailRouteStart::X;
 				else if (val == "y") options.start = RailRouteStart::Y;
 				else if (val == "ns") options.start = RailRouteStart::NS;
 				else if (val == "ew") options.start = RailRouteStart::EW;
 				else {
-					IConsolePrint(CC_ERROR, "Start must be x, y, ns or ew.");
+					IConsolePrint(CC_ERROR, "Start must be auto, x, y, ns or ew.");
 					return true;
 				}
 			} else if (key == "semaphore") {
@@ -4000,6 +4001,8 @@ static bool ConRailRoute(std::span<std::string_view> argv)
 				options.signal_interval = static_cast<uint8_t>(std::clamp<uint>(*num, 1, 255));
 			} else if (key == "type" && num.has_value() && *num < to_underlying(SignalType::End)) {
 				options.signal_type = static_cast<SignalType>(*num);
+			} else if (key == "terraform" && num.has_value()) {
+				options.terraform = *num != 0;
 			} else if (key == "water" && num.has_value()) {
 				options.remove_water = *num != 0;
 			} else if (key == "demolish" && num.has_value()) {
@@ -4021,6 +4024,7 @@ static bool ConRailRoute(std::span<std::string_view> argv)
 		}
 	}
 
+	AutoRestoreBackup<CompanyID> route_company(_current_company, company);
 	auto start = std::chrono::steady_clock::now();
 	RailRoutePlan plan = PlanRailRoute(TileXY(*x1, *y1), TileXY(*x2, *y2), options);
 	auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - start).count();
@@ -4055,6 +4059,10 @@ static bool ConRailRoute(std::span<std::string_view> argv)
 	Money available = Company::Get(company)->money;
 	if (available < e.Total()) {
 		IConsolePrint(CC_ERROR, "Not enough money: the trunk line needs about {}, the company has {}.", static_cast<int64_t>(e.Total()), static_cast<int64_t>(available));
+		return true;
+	}
+	if (plan.prepare.empty() && plan.build.empty()) {
+		IConsolePrint(CC_INFO, "The trunk line is already built.");
 		return true;
 	}
 	if (!StartConstructionJob(fmt::format("{},{} - {},{}", *x1, *y1, *x2, *y2), plan.origin, std::move(plan.prepare), std::move(plan.build), company, true)) {
