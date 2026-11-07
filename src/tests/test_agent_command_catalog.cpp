@@ -14,7 +14,12 @@
 #include "../agent_command_catalog.h"
 #include "../command_func.h"
 #include "../command_type.h"
+#include "../company_base.h"
+#include "../company_func.h"
 #include "../company_type.h"
+#include "../core/backup_type.hpp"
+#include "../goal_base.h"
+#include "../goal_type.h"
 
 #include "../safeguards.h"
 
@@ -41,6 +46,14 @@ static Json ReadCatalog(const Json &params)
 static Json CallCommand(const Json &params)
 {
 	const std::optional<Json> result = DispatchCommandCatalog("world.command", params, CompanyID::Invalid());
+	REQUIRE(result.has_value());
+	return *result;
+}
+
+/** Call world.command as a real company, the way the bridge sends a write. */
+static Json CallCommandAs(const Json &params, CompanyID company)
+{
+	const std::optional<Json> result = DispatchCommandCatalog("world.command", params, company);
 	REQUIRE(result.has_value());
 	return *result;
 }
@@ -624,4 +637,130 @@ TEST_CASE("AgentCommandCatalogReportsTruthfulCapabilities")
 
 	/* Other methods are not ours. */
 	CHECK_FALSE(DispatchCommandCatalog("world.info", Json::object(), CompanyID::Invalid()).has_value());
+}
+
+namespace {
+
+/**
+ * A real company in the engine's own company pool, removed again when the guard goes out of scope.
+ *
+ * The deity cases need a real logical actor: the company the request names has to exist, it stays in
+ * the guard, and the engine's own company lookups have to find it.
+ */
+class CatalogCompanyGuard {
+public:
+	CatalogCompanyGuard()
+	{
+		/* The pool asserts that the allocation was checked, as the other agent cases do. */
+		REQUIRE(Company::CanAllocateItem());
+		this->company = Company::Create();
+		REQUIRE(this->company != nullptr);
+	}
+
+	~CatalogCompanyGuard()
+	{
+		if (this->company != nullptr) delete this->company;
+	}
+
+	CompanyID Id() const { return this->company->index; }
+
+private:
+	Company *company = nullptr; ///< The company, or nullptr when it was not created.
+};
+
+} // namespace
+
+TEST_CASE("AgentCommandCatalogRunsDeityCommandsInTheDeityContext")
+{
+	CatalogCompanyGuard company;
+	/* The caller's company has to survive both a success and a rejection unchanged. */
+	Backup<CompanyID> restore_company(_current_company, company.Id());
+
+	const uint64_t actor = company.Id().base();
+	/* GoalType::None with destination 0 needs no map object, so the command only touches its own pool. */
+	const Json goal_args = Arguments(actor, 0, 0, "Deity goal");
+	const Json actor_guard = Arguments(Ref("company", actor));
+
+	/* The goal command is a deity command: the engine rejects it unless the proc runs as OWNER_DEITY
+	 * (`CmdCreateGoal`: `_current_company != OWNER_DEITY` -> CMD_ERROR), so the company context fails
+	 * and the deity context is the one that really executes it. */
+	const size_t goals_before = Goal::GetNumItems();
+
+	const Json rejected = CallCommandAs({
+		{"command", "CmdCreateGoal"},
+		{"args", goal_args},
+		{"expected_targets", actor_guard},
+	}, company.Id());
+	CHECK_FALSE(rejected["ok"].get<bool>());
+	CHECK(rejected["error"].get<std::string>() == "command_failed");
+	CHECK(rejected["execution_context"].get<std::string>() == "company");
+	CHECK(Goal::GetNumItems() == goals_before);
+	CHECK(_current_company == company.Id());
+
+	const Json created = CallCommandAs({
+		{"command", "CmdCreateGoal"},
+		{"args", goal_args},
+		{"execution_context", "deity"},
+		{"expected_targets", actor_guard},
+	}, company.Id());
+	REQUIRE(created["ok"].get<bool>());
+	CHECK(created["execution_context"].get<std::string>() == "deity");
+	CHECK(created["guard"].get<std::string>() == "checked");
+	CHECK(_current_company == company.Id());
+
+	/* The pool state is the proof: one real goal, owned by the logical actor. */
+	REQUIRE(Goal::GetNumItems() == goals_before + 1);
+	const Goal *goal = nullptr;
+	for (const Goal *existing : Goal::Iterate()) goal = existing;
+	REQUIRE(goal != nullptr);
+	CHECK(goal->type == GoalType::None);
+	CHECK(goal->dst == 0);
+	CHECK(goal->company == company.Id());
+
+	/* The deity context is not a licence for every command: a command without the Deity flag is
+	 * refused before Post, with the context it asked for in the detail. */
+	const Json not_deity = CallCommandAs({
+		{"command", "CmdMoneyCheat"},
+		{"args", Arguments(100)},
+		{"execution_context", "deity"},
+		{"expected_targets", actor_guard},
+	}, company.Id());
+	CHECK_FALSE(not_deity["ok"].get<bool>());
+	CHECK(not_deity["error"].get<std::string>() == "execution_context_not_allowed");
+	CHECK(not_deity["detail"]["execution_context"].get<std::string>() == "deity");
+	CHECK(not_deity["detail"]["command"].get<std::string>() == "CmdMoneyCheat");
+
+	/* An unknown context fails closed instead of being read as the default. */
+	CHECK(CallCommandAs({{"command", "CmdCreateGoal"}, {"args", goal_args}, {"execution_context", "script"}, {"expected_targets", actor_guard}}, company.Id())["error"].get<std::string>() == "unknown_execution_context");
+	CHECK(CallCommandAs({{"command", "CmdCreateGoal"}, {"args", goal_args}, {"execution_context", 7}, {"expected_targets", actor_guard}}, company.Id())["error"].get<std::string>() == "invalid_params");
+
+	/* The logical actor is still required and still guarded in the deity context: an empty guard is a
+	 * target mismatch that names the missing company, an absent guard is refused, and a company that
+	 * does not exist is not accepted just because the command runs as the deity. */
+	const Json unguarded = CallCommandAs({
+		{"command", "CmdCreateGoal"},
+		{"args", goal_args},
+		{"execution_context", "deity"},
+		{"expected_targets", Arguments()},
+	}, company.Id());
+	CHECK(unguarded["error"].get<std::string>() == "target_mismatch");
+	REQUIRE(unguarded["detail"]["missing"].is_array());
+	REQUIRE(!unguarded["detail"]["missing"].empty());
+	CHECK(unguarded["detail"]["missing"].front()["entity"].get<std::string>() == "company");
+	CHECK(unguarded["detail"]["missing"].front()["id"] == actor);
+
+	CHECK(CallCommandAs({{"command", "CmdCreateGoal"}, {"args", goal_args}, {"execution_context", "deity"}}, company.Id())["error"].get<std::string>() == "missing_expected_targets");
+	CHECK(CallCommandAs({{"command", "CmdCreateGoal"}, {"args", goal_args}, {"execution_context", "deity"}, {"expected_targets", actor_guard}}, CompanyID{14})["error"].get<std::string>() == "invalid_company");
+
+	/* op=validate checks the same context, so a validate that passes cannot be refused by the write. */
+	const Json validated = ReadCatalog({{"op", "validate"}, {"command", "CmdCreateGoal"}, {"args", goal_args}, {"execution_context", "deity"}, {"company", actor}});
+	REQUIRE(validated["ok"].get<bool>());
+	CHECK(validated["execution_context"].get<std::string>() == "deity");
+	CHECK(ReadCatalog({{"op", "validate"}, {"command", "CmdMoneyCheat"}, {"args", Arguments(1)}, {"execution_context", "deity"}})["error"].get<std::string>() == "execution_context_not_allowed");
+	CHECK(ReadCatalog({{"op", "validate"}, {"command", "CmdMoneyCheat"}, {"args", Arguments(1)}, {"execution_context", "nope"}})["error"].get<std::string>() == "unknown_execution_context");
+	/* The default is still the company context, reported as such. */
+	CHECK(ReadCatalog({{"op", "validate"}, {"command", "CmdMoneyCheat"}, {"args", Arguments(1)}})["execution_context"].get<std::string>() == "company");
+
+	/* The case created one goal; remove it so the pool is as empty as it was. */
+	delete const_cast<Goal *>(goal);
 }

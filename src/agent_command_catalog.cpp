@@ -1748,7 +1748,7 @@ struct DispatchCall {
 	const Json *args = nullptr; ///< Ordered arguments of the request.
 	const Json *expected_targets = nullptr; ///< Entities the arguments must reference, or nullptr.
 	TileIndex location{}; ///< Tile for commands with an implicit location argument.
-	CompanyID company = CompanyID::Invalid(); ///< Company that pays and owns the result.
+	CompanyID company = CompanyID::Invalid(); ///< Company that is the logical actor of the write.
 	bool dry_run = false; ///< Estimate only.
 	CommandCost cost; ///< The actual result of the command.
 	Json normalized = Json::array(); ///< The arguments as they were decoded.
@@ -1762,8 +1762,10 @@ struct DispatchCall {
 /**
  * Add the actor company as a target.
  *
- * The company pays for and owns the result of every command, so it is an entity the write acts on
- * even when no argument names it.
+ * The company is the logical actor of the write: the identity the request names and the guard
+ * covers, so it is an entity the write acts on even when no argument names it. What the engine then
+ * bills and which company an object ends up owned by is decided by the command's own proc, not by
+ * this target.
  * @param company The company that runs the command.
  * @param targets Receives the company target, when a company is set.
  */
@@ -1849,7 +1851,7 @@ bool DispatchTypedCommand(DispatchCall &call)
 		return false;
 	}
 
-	/* The company is the implicit target of every command: it pays and owns the result. */
+	/* The company is the implicit target of every command: it is the logical actor the guard covers. */
 	CollectCompanyTarget(call.company, call.targets);
 	CollectTargets<Args>(call.normalized, call.targets, std::make_index_sequence<std::tuple_size_v<Args>>{});
 	/* The guard is mandatory for a write: the refs the arguments name have to be exactly the refs
@@ -2032,13 +2034,92 @@ Json MakeError(std::string_view code, std::string_view message, Json detail = Js
 	return result;
 }
 
+/** The native company a catalog command runs as. */
+enum class ExecutionContext : uint8_t {
+	Company, ///< The command runs as the actor company: the normal player path, so it is billed there.
+	Deity,   ///< The command runs as `OWNER_DEITY`, the engine's own superuser context.
+};
+
 /**
- * Switch the company that pays and owns the result of a command, and restore the previous company
- * when the call returns.
+ * The protocol name of an execution context.
+ * @param context The context.
+ * @return `"company"` or `"deity"`.
  */
-class CompanyContext {
+std::string_view ExecutionContextName(ExecutionContext context)
+{
+	return context == ExecutionContext::Deity ? "deity" : "company";
+}
+
+/**
+ * Read the `execution_context` parameter of a request.
+ *
+ * An absent value means `company`, the normal player path. Any other value than `company` or `deity`
+ * is rejected instead of being read as the default, so a misspelt or unknown context can never
+ * silently run as a company.
+ * @param params The method parameters.
+ * @param context Receives the requested context.
+ * @return The error result, or nothing when the parameter is absent or names a known context.
+ */
+std::optional<Json> ReadExecutionContext(const Json &params, ExecutionContext &context)
+{
+	context = ExecutionContext::Company;
+	if (!params.is_object() || !params.contains("execution_context")) return std::nullopt;
+
+	const Json &value = params["execution_context"];
+	if (!value.is_string()) return MakeError("invalid_params", "'execution_context' must be \"company\" or \"deity\"");
+	const std::string name = value.get<std::string>();
+	if (name == "company") {
+		context = ExecutionContext::Company;
+		return std::nullopt;
+	}
+	if (name == "deity") {
+		context = ExecutionContext::Deity;
+		return std::nullopt;
+	}
+	return MakeError("unknown_execution_context", "'execution_context' must be \"company\" or \"deity\"", {{"execution_context", name}});
+}
+
+/**
+ * Check that a command may run in the requested context.
+ *
+ * `deity` is only allowed for commands whose flags carry `CommandFlag::Deity`: that is the same gate
+ * the engine itself applies before it executes a command for `OWNER_DEITY`
+ * (`CommandHelperBase::InternalExecutePrepTest`), so a command that is not a deity command is
+ * refused here with its own error instead of failing later without an explanation. `company` is
+ * always allowed, and it never turns into a deity run: there is no automatic escalation.
+ * @param cmd The command.
+ * @param context The requested context.
+ * @return The error result, or nothing when the command may run in the context.
+ */
+std::optional<Json> CheckExecutionContext(Commands cmd, ExecutionContext context)
+{
+	if (context != ExecutionContext::Deity) return std::nullopt;
+	if (GetCommandFlags(cmd).Test(CommandFlag::Deity)) return std::nullopt;
+	return MakeError("execution_context_not_allowed", "this command does not permit the deity execution context: its flags carry no Deity flag", {
+		{"command", std::string(GetCommandName(cmd))},
+		{"id", to_underlying(cmd)},
+		{"execution_context", "deity"},
+	});
+}
+
+/**
+ * Switch the company a command runs as, and restore the previous company when the call returns.
+ *
+ * `company` runs as the actor company, so the normal player path bills that company. `deity` runs as
+ * `OWNER_DEITY`, the context the engine's console and game script use, which is what the goal and
+ * story commands require; the engine's own Post then decides about money and ownership, so a deity
+ * run can be free where a company run is charged, and a goal or object owner comes from the explicit
+ * arguments. The actor company stays the logical actor and stays in the guard; only the native
+ * execution company differs.
+ */
+class CommandContext {
 public:
-	explicit CompanyContext(CompanyID company) : backup(_current_company, company) {}
+	/**
+	 * Enter the context.
+	 * @param company The actor company: the logical actor of the request.
+	 * @param context The native company to run as.
+	 */
+	CommandContext(CompanyID company, ExecutionContext context) : backup(_current_company, context == ExecutionContext::Deity ? OWNER_DEITY : company) {}
 
 private:
 	Backup<CompanyID> backup; ///< Restores the previous company on destruction.
@@ -2079,6 +2160,12 @@ Json ReadCommandCatalog(const Json &params)
 			return MakeError("unsupported_argument_types", "this command has arguments the generic decoder does not support yet", _command_ops[*cmd].describe(true)["support"]);
 		}
 
+		/* The context is checked exactly as the write checks it, so a validate that passes cannot be
+		 * refused by the write for the context it validated. */
+		ExecutionContext execution = ExecutionContext::Company;
+		if (const std::optional<Json> invalid = ReadExecutionContext(params, execution); invalid.has_value()) return *invalid;
+		if (const std::optional<Json> refused = CheckExecutionContext(*cmd, execution); refused.has_value()) return *refused;
+
 		DispatchCall call;
 		call.args = &args;
 		/* A company makes the check exactly the one a write does: the actor company is a target. */
@@ -2101,6 +2188,7 @@ Json ReadCommandCatalog(const Json &params)
 			{"op", op},
 			{"command", std::string(GetCommandName(*cmd))},
 			{"id", to_underlying(*cmd)},
+			{"execution_context", std::string(ExecutionContextName(execution))},
 			{"arguments", std::move(call.normalized)},
 			{"targets", std::move(call.targets)},
 		};
@@ -2161,7 +2249,7 @@ Json CallDetail(Commands cmd, const DispatchCall &call)
 /**
  * Run one engine command through the normal player command path.
  * @param params The method parameters.
- * @param company Company that pays and owns the result.
+ * @param company Company that is the logical actor of the write.
  * @return The method result.
  */
 Json DispatchWorldCommand(const Json &params, CompanyID company)
@@ -2195,6 +2283,11 @@ Json DispatchWorldCommand(const Json &params, CompanyID company)
 		location = TileIndex{tile};
 	}
 
+	/* The native company the command runs as. It is read before the guard, so an unknown context is
+	 * rejected as such instead of being reported as a guard problem. */
+	ExecutionContext execution = ExecutionContext::Company;
+	if (const std::optional<Json> invalid = ReadExecutionContext(params, execution); invalid.has_value()) return *invalid;
+
 	/* The entities the bridge has resolved and guarded; the arguments have to name exactly those. */
 	const Json *expected_targets = nullptr;
 	if (params.contains("expected_targets")) {
@@ -2207,6 +2300,9 @@ Json DispatchWorldCommand(const Json &params, CompanyID company)
 		return MakeError("unsupported_argument_types", "this command has arguments the generic decoder does not support yet", _command_ops[*cmd].describe(true)["support"]);
 	}
 
+	/* A deity run is only allowed where the engine's own flags permit it. */
+	if (const std::optional<Json> refused = CheckExecutionContext(*cmd, execution); refused.has_value()) return *refused;
+
 	/* A write always has to declare the refs it acts on: the bridge only checks the refs it was
 	 * given, so an absent list would leave the arguments unchecked. */
 	if (expected_targets == nullptr) {
@@ -2216,7 +2312,7 @@ Json DispatchWorldCommand(const Json &params, CompanyID company)
 		});
 	}
 
-	/* The company pays and owns the result, so it has to exist before anything is estimated or run. */
+	/* The logical actor has to exist before anything is estimated or run, in either context. */
 	if (!Company::IsValidID(company)) return MakeError("invalid_company", "company does not exist", {{"company_id", company.base()}});
 
 	/* Post is the player command path: in a network game it only queues the command for the server,
@@ -2230,7 +2326,9 @@ Json DispatchWorldCommand(const Json &params, CompanyID company)
 	call.company = company;
 	call.dry_run = dry_run;
 	{
-		const CompanyContext context(company);
+		/* The logical actor stays the request company in both contexts; only the native company the
+		 * command runs as changes, and the previous one is restored on every path. */
+		const CommandContext context(company, execution);
 		if (!dispatch(call)) {
 			return MakeError(call.error_code, call.error, CallDetail(*cmd, call));
 		}
@@ -2241,6 +2339,7 @@ Json DispatchWorldCommand(const Json &params, CompanyID company)
 		{"command", std::string(GetCommandName(*cmd))},
 		{"id", to_underlying(*cmd)},
 		{"dry_run", dry_run},
+		{"execution_context", std::string(ExecutionContextName(execution))},
 		{"cost", static_cast<int64_t>(call.cost.GetCost())},
 		{"expense_type", to_underlying(call.cost.GetExpensesType())},
 		{"arguments", std::move(call.normalized)},
@@ -2318,18 +2417,19 @@ Json CommandCatalogCapabilities()
 		{"method", "world.commands"},
 		{"op", "validate"},
 		{"access", "read"},
-		{"description", "decode one command's arguments without running it, and report the arguments and the entities they name"},
+		{"description", "decode one command's arguments without running it, and report the arguments, the entities they name and the execution context the write would run in"},
 	});
 	methods.push_back({
 		{"method", "world.command"},
 		{"access", "write"},
-		{"description", "post one engine command through the normal player command path, optionally as a cost estimate only"},
+		{"description", "post one engine command through the normal player command path, optionally as a cost estimate only, in the company or the deity execution context"},
 		{"params", {
 			{"command", "engine command name, alias or numeric id"},
 			{"args", "ordered positional arguments, as op=describe reports them"},
 			{"dry_run", "estimate the cost only, never execute; estimate_reliable says whether the engine can estimate this command"},
 			{"location", "tile for commands whose location_argument is true"},
 			{"expected_targets", "[{\"entity\": kind, \"id\": N}]: the entities the bridge resolved; the typed arguments must name every one of them"},
+			{"execution_context", "\"company\" (default) or \"deity\"; the actor company stays the logical actor and the guarded target in both"},
 		}},
 	});
 
@@ -2380,6 +2480,16 @@ Json CommandCatalogCapabilities()
 			{"engine_end", static_cast<size_t>(to_underlying(Commands::End))},
 		}},
 		{"argument_kinds", std::move(argument_kinds)},
+		{"execution_context", {
+			{"values", Json::array({"company", "deity"})},
+			{"default", "company"},
+			{"actor", "the request company stays the logical actor in both contexts: it is the guarded identity, it is part of expected_targets (via company_context) and it is validated in both contexts; the execution context only changes the native company the command runs as, so billing and object ownership follow the engine's own Post (in the deity context _current_company is OWNER_DEITY, which can make a command free where the company context charges it), and an owner a command takes from an argument comes from that argument"},
+			{"deity", "runs the command as OWNER_DEITY, the engine's own superuser context (the one the console and the game script use), and is allowed only for commands whose flags carry the Deity flag, the same gate the engine applies; any other command is refused with execution_context_not_allowed before Post"},
+			{"company", "the normal player path: the command runs as the actor company and nothing is escalated automatically"},
+			{"fail_closed", "a value that is neither company nor deity is rejected with unknown_execution_context, never read as the default"},
+			{"native_scope", "the context is a scoped switch of _current_company around the single Post (or the cost query of a dry run) and is restored on every path, including an engine rejection"},
+			{"deity_commands", "the commands the engine itself restricts to OWNER_DEITY (the goal and story commands) are the ones that only succeed in the deity context; in the company context the engine rejects them and the result is command_failed"},
+		}},
 		{"targets", {
 			{"kinds", std::move(target_kinds)},
 			{"argument_metadata", "every argument carries \"target\": {\"entity\": kind, \"id_path\": null} when the value itself is the id, or {\"entity_by\": {\"field\": field, \"map\": {value: kind}}, \"id_path\": field} when the id sits inside a structured argument"},

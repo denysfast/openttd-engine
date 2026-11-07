@@ -152,11 +152,13 @@
  * types have no JSON decoding yet.
  *
  * `world.command` (write, needs a valid company):
- *   `{"command": <name|id>, "args": [...], "dry_run": false, "location": <tile>}`
+ *   `{"command": <name|id>, "args": [...], "dry_run": false, "location": <tile>,
+ *     "execution_context": "company"|"deity"}`
  *   - `command`: proc name (`CmdBuildRoad`), alias (`BuildRoad`) or numeric id, case insensitive.
  *   - `args`: ordered positional arguments; the order and types are the ones `op=describe` reports.
  *   - `dry_run`: estimate only (`DoCommandFlag::QueryCost`, no execution).
  *   - `location`: tile for commands whose `location_argument` is true; defaults to 0 (no location).
+ *   - `execution_context`: the native company the command runs as; see below.
  *   - `expected_targets` (required): `[{"entity": kind, "id": N}]`, the entities the bridge has
  *     resolved and guarded, complete. The call is rejected before `Post` with
  *     `missing_expected_targets` when the list is absent and with `target_mismatch` unless the typed
@@ -172,7 +174,29 @@
  *   `invalid_arguments` (wrong arity, wrong type, overflow, bits outside the enum),
  *   `command_not_run` (Post refused before the proc ran, e.g. the game is paused for it),
  *   `missing_expected_targets`, `target_mismatch`, `invalid_company`, `multiplayer_unsupported`,
- *   `invalid_params`.
+ *   `unknown_execution_context`, `execution_context_not_allowed`, `invalid_params`.
+ *
+ * ## Execution context: the logical actor is not the native company
+ *
+ * The request company is the logical actor: the guarded identity of the write. It is part of
+ * `expected_targets` (`via: "company_context"`) and it is validated in every context. The execution
+ * context only decides which company the command's proc sees as `_current_company`, so the engine's
+ * own `Post` decides about money and ownership: a deity run can be free where a company run is
+ * charged, and an owner a command takes from an argument comes from that argument, not from the
+ * actor.
+ *   - `"company"` (the default) runs as the actor company: the normal player command path.
+ *   - `"deity"` runs as `OWNER_DEITY`, the engine's own superuser context, which is what the goal and
+ *     story commands require (they reject anything else with `_current_company != OWNER_DEITY`). It
+ *     is allowed only for commands whose flags carry `CommandFlag::Deity` - the same gate the engine
+ *     applies before it executes a command for `OWNER_DEITY` - and any other command is refused with
+ *     `execution_context_not_allowed` before `Post`. The actor company is still required and still
+ *     guarded; `OWNER_DEITY` is never reported as a target and never replaces the actor.
+ * The switch is scoped to the one `Post` (or the cost query of a dry run) and restored on every
+ * path, including an engine rejection, so the caller's `_current_company` is unchanged afterwards.
+ * Nothing escalates automatically: a `company` call never becomes a deity call, and an unknown
+ * `execution_context` is rejected with `unknown_execution_context` instead of being read as the
+ * default. `op=validate` accepts and checks the same field, so a validate that passes cannot be
+ * refused by the write for its context.
  *
  * Argument names are positional (`"name": null`): the engine's own headers carry them, but reading
  * them needs a generator. The smallest useful one emits `template <Commands> struct CommandArgNames;`
@@ -223,7 +247,9 @@ Json CommandCatalogCapabilities();
  *
  * @param method Engine method name: `world.commands` or `world.command`.
  * @param params Method parameters as sent by the backend.
- * @param company Company that pays and owns the result; must be a valid company for `world.command`.
+ * @param company Company that is the logical actor of the write; must be a valid company for
+ * `world.command`. The native command runs as it in the company context and as `OWNER_DEITY` in the
+ * deity context, which is what decides billing.
  * @return The method result, or `std::nullopt` when the method is not a catalog method at all.
  */
 std::optional<Json> DispatchCommandCatalog(std::string_view method, const Json &params, CompanyID company);
