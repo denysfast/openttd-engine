@@ -1300,18 +1300,20 @@ Json DispatchRailRoute(const Json &params, CompanyID company)
  * Add one method to a capability document.
  * @param methods The method list to add to.
  * @param method The method name.
- * @param kind The kind of method.
+ * @param authority "read" or "write", as the other tool modules publish it.
  * @param implemented The implemented operations.
  * @param gaps The known gaps.
  */
-void AddCapability(Json &methods, std::string_view method, std::string_view kind,
+void AddCapability(Json &methods, std::string_view method, std::string_view authority,
 		std::initializer_list<const char *> implemented, std::initializer_list<const char *> gaps)
 {
 	Json ops = Json::array();
 	for (const char *op : implemented) ops.push_back(op);
 	Json missing = Json::array();
 	for (const char *op : gaps) missing.push_back(op);
-	methods.push_back(Json{{"method", std::string(method)}, {"kind", std::string(kind)}, {"implemented", std::move(ops)}, {"gaps", std::move(missing)}});
+	/* `authority` is the field the other modules publish; `kind` is kept as the same value for readers
+	 * of the older spelling. */
+	methods.push_back(Json{{"method", std::string(method)}, {"authority", std::string(authority)}, {"kind", std::string(authority)}, {"implemented", std::move(ops)}, {"gaps", std::move(missing)}});
 }
 
 } // anonymous namespace
@@ -1346,6 +1348,7 @@ Json BlueprintToolCapabilities()
 
 	Json result = Json::object();
 	result["ok"] = true;
+	result["module"] = "agent_blueprint_tools";
 	result["methods"] = std::move(methods);
 	result["query_ops"] = std::move(query_ops);
 	result["bounds"] = std::move(bounds);

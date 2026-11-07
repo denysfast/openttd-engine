@@ -17,6 +17,9 @@
 
 #include "../stdafx.h"
 
+#include <filesystem>
+#include <fstream>
+
 #include "../3rdparty/catch2/catch.hpp"
 
 #include "../agent_blueprint_tools.h"
@@ -135,6 +138,65 @@ static BlueprintToolPlan MakePlan(size_t chunks)
 	return plan;
 }
 
+/**
+ * A scratch personal directory that belongs to one test invocation only.
+ *
+ * The directory is created exclusively in the system temporary directory: the name is tried in turn
+ * and only the invocation that really creates it keeps it, so two test binaries of two users (or two
+ * runs of the same binary) never share a directory, and no fixed path is reused. Writability is proven
+ * with a probe file, because the case really saves a blueprint there. The guard removes the directory
+ * when it goes out of scope; it is declared before the AutoRestoreBackup of the personal directory, so
+ * the engine's path is restored first and the directory is removed afterwards.
+ */
+class ScratchDirectory {
+public:
+	ScratchDirectory()
+	{
+		std::error_code error_code;
+		const std::filesystem::path base = std::filesystem::temp_directory_path(error_code);
+		REQUIRE(!error_code);
+
+		static uint32_t serial = 0;
+		for (uint32_t attempt = 0; attempt < 1000 && this->path.empty(); attempt++) {
+			const std::filesystem::path candidate = base / fmt::format("openttd_agent_blueprint_test_{}", serial++);
+			if (std::filesystem::create_directory(candidate, error_code)) this->path = candidate;
+			error_code.clear();
+		}
+		REQUIRE_FALSE(this->path.empty());
+
+		/* A real permission check: this user must be able to write in the directory it just made. */
+		const std::filesystem::path probe = this->path / "write_probe";
+		{
+			std::ofstream file(probe, std::ios::binary);
+			REQUIRE(file.good());
+			file.put('x');
+			file.flush();
+			REQUIRE(file.good());
+		}
+		REQUIRE(std::filesystem::exists(probe, error_code));
+		REQUIRE(std::filesystem::remove(probe, error_code));
+		REQUIRE(!error_code);
+	}
+
+	~ScratchDirectory()
+	{
+		std::error_code error_code;
+		std::filesystem::remove_all(this->path, error_code);
+	}
+
+	/**
+	 * The directory as the engine's personal directory, with the trailing separator it expects.
+	 * @return The path of the directory.
+	 */
+	std::string Path() const
+	{
+		return this->path.string() + "/";
+	}
+
+private:
+	std::filesystem::path path; ///< The directory, empty until it is created.
+};
+
 TEST_CASE("Agent blueprint tools: capabilities")
 {
 	const Json capabilities = BlueprintToolCapabilities();
@@ -154,6 +216,13 @@ TEST_CASE("Agent blueprint tools: capabilities")
 	for (const char *op : {"plan", "status", "execute_chunk", "stop", "drop"}) {
 		CHECK(Contains(route["implemented"], op));
 	}
+
+	/* The document names the module and the authority of every method, as the other tool modules do. */
+	CHECK(capabilities["module"] == "agent_blueprint_tools");
+	CHECK(blueprint["authority"] == "write");
+	CHECK(route["authority"] == "write");
+	/* `kind` is kept as the same value for readers of the older spelling. */
+	CHECK(blueprint["kind"] == "write");
 
 	/* The query operations are listed apart from the write operations. */
 	REQUIRE(capabilities["query_ops"].is_array());
@@ -234,11 +303,11 @@ TEST_CASE("Agent blueprint tools: dispatch and name validation")
 
 TEST_CASE("Agent blueprint tools: blueprint file round trip")
 {
-	/* Blueprints live in the blueprint directory of the personal directory; use a scratch one for this case. */
-	std::error_code error_code;
-	const std::string scratch = (std::filesystem::temp_directory_path(error_code) / "openttd_agent_blueprint_test").string() + "/";
-	std::filesystem::create_directories(scratch, error_code);
-	const AutoRestoreBackup<std::string> personal_dir(_personal_dir, scratch);
+	/* Blueprints live in the blueprint directory of the personal directory; use a scratch one that
+	 * belongs to this invocation only. The guard comes first, so the personal directory is restored
+	 * before the scratch directory is removed. */
+	const ScratchDirectory scratch;
+	const AutoRestoreBackup<std::string> personal_dir(_personal_dir, scratch.Path());
 
 	/* Save a blueprint with the engine's own writer, then read it back through the module. */
 	const std::string name = "agent_tools_test_blueprint";
@@ -254,6 +323,13 @@ TEST_CASE("Agent blueprint tools: blueprint file round trip")
 	bp.tunnelbridges.push_back({0, 0, 1, 0, 0, true, 0});
 	bp.stations.push_back({2, 0, 0, 0, Axis::X, false, UINT16_MAX});
 	REQUIRE(SaveBlueprint(bp));
+
+	/* The writer really wrote into this invocation's own directory, and the file is readable again. */
+	const std::string file = GetBlueprintFileName(name);
+	CHECK(file.rfind(scratch.Path(), 0) == 0);
+	std::error_code error_code;
+	REQUIRE(std::filesystem::exists(OTTD2FS(file), error_code));
+	REQUIRE(!error_code);
 
 	/* The listing finds it. */
 	const Json list = Dispatch("world.blueprint", Json::object({{"op", "list"}, {"limit", 256}}));
