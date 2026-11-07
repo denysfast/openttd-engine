@@ -10,8 +10,11 @@
 #include "stdafx.h"
 #include "agent_bridge.h"
 
+#include "agent_admin_tools.h"
 #include "agent_capture.h"
 #include "agent_chat_gui.h"
+#include "agent_game_tools.h"
+#include "agent_transport_tools.h"
 #include "command_func.h"
 #include "company_base.h"
 #include "company_cmd.h"
@@ -302,6 +305,29 @@ Json Error(std::string_view code, std::string_view message = {})
 }
 
 /**
+ * Map a tool module result onto the bridge result shape.
+ *
+ * The tool modules report `{ok, ...}` with their own diagnostics: the actual cost, the created
+ * ids, the engine's message id, partial receipts and the gap detail. A success becomes
+ * `{ok: true, value: <module result>}`, which is what the backend unwraps, so nothing is lost. A
+ * failure keeps the module's error code and diagnostics at the top level, which is the bridge's
+ * error shape, so a gap or a rejected command is never reported as a success.
+ * @param result The result of the tool module.
+ * @return The bridge result.
+ */
+Json FromModule(Json result)
+{
+	if (!result.is_object()) return Ok(std::move(result));
+
+	const auto ok = result.find("ok");
+	if (ok != result.end() && ok->is_boolean() && ok->get<bool>()) return Ok(std::move(result));
+
+	if (!result.contains("error") || !result["error"].is_string()) result["error"] = "tool_failed";
+	if (!result.contains("message") || !result["message"].is_string()) result["message"] = "the tool module reported a failure";
+	return result;
+}
+
+/**
  * Check whether the world may be read or changed right now.
  *
  * While a world is generated or a savegame is loaded, the map and the pools are
@@ -432,11 +458,14 @@ void Send(RequestKind kind, const std::string &path, std::string payload, const 
  *
  * A receipt may only be forgotten once the backend acknowledged the delivery of
  * its result; otherwise a replay of that request would execute it a second time.
+ * A capture that waits for the draw tick already holds a receipt slot, so the
+ * pending captures are counted here: an ordinary request must not take the slot
+ * the capture was promised, or the capture result could never be stored.
  * @return True iff there is room for another receipt.
  */
 bool HasReceiptCapacity()
 {
-	if (_state.receipts.size() < MAX_RECEIPTS) return true;
+	if (_state.receipts.size() + _captures.size() < MAX_RECEIPTS) return true;
 	for (const std::string &request_id : _state.receipt_order) {
 		const auto receipt = _state.receipts.find(request_id);
 		if (receipt != _state.receipts.end() && receipt->second.acknowledged) return true;
@@ -444,10 +473,17 @@ bool HasReceiptCapacity()
 	return false;
 }
 
-/** Forget the oldest acknowledged receipt, to make room for a new one. */
+/**
+ * Forget the oldest acknowledged receipt, to make room for a new one.
+ *
+ * Only acknowledged receipts are evicted: an unacknowledged one is the only
+ * answer a replay of its request can get, so dropping it would execute the
+ * request a second time. A pending capture holds a receipt slot as well, so the
+ * room is made for both.
+ */
 void MakeReceiptRoom()
 {
-	while (_state.receipts.size() >= MAX_RECEIPTS) {
+	while (_state.receipts.size() + _captures.size() >= MAX_RECEIPTS) {
 		const auto oldest = std::find_if(_state.receipt_order.begin(), _state.receipt_order.end(), [](const std::string &request_id) {
 			const auto receipt = _state.receipts.find(request_id);
 			return receipt != _state.receipts.end() && receipt->second.acknowledged;
@@ -488,7 +524,13 @@ void AcknowledgeReceipt(const std::string &request_id)
  */
 bool QueueResult(const std::string &request_id, const Json &result)
 {
-	if (_state.results.size() >= MAX_PENDING_RESULTS) {
+	/*
+	 * A capture that waits for the draw tick already holds a result slot. Counting
+	 * the pending captures here keeps that slot free: an ordinary result may not
+	 * consume it, because the capture result is produced later and cannot be
+	 * replayed from the request.
+	 */
+	if (_state.results.size() + _captures.size() >= MAX_PENDING_RESULTS) {
 		Debug(Facility::Net, Severity::Warning, "In-game agent bridge: result queue is full; the backend has to catch up");
 		return false;
 	}
@@ -544,12 +586,24 @@ Json TileRow(TileIndex tile)
 	return row;
 }
 
-/** The methods that change the world, and therefore need the write gate. */
-bool IsMutation(std::string_view method)
+/**
+ * The methods that change the world, and therefore need the write gate.
+ *
+ * The administrative module knows which of its own operations are read-only
+ * (`world.company op=info`, `world.towns op=needs`, `world.project op=power/district`),
+ * so it decides for its families; the rest is fixed by the method name.
+ * @param method The method name.
+ * @param params The method parameters.
+ * @return True when the call is expected to change the world.
+ */
+bool IsMutation(std::string_view method, const Json &params)
 {
-	return method == "world.pause" || method == "world.rename" || method == "world.settings.set" ||
+	if (method == "world.pause" || method == "world.rename" || method == "world.settings.set" ||
 			method == "world.construct" || method == "world.vehicles" || method == "world.orders" ||
-			method == "world.command";
+			method == "world.command") {
+		return true;
+	}
+	return IsAdminMutation(method, params);
 }
 
 /**
@@ -1083,6 +1137,11 @@ Json CaptureFailure(const Json &capture)
  * Stop between scheduling and drawing must not turn into a successful capture
  * of another world. The receipt and the result are stored only here, so a
  * placeholder is never delivered as if the capture had been applied.
+ *
+ * The entry is removed first, which releases the receipt and result slot the
+ * capture reserved. That is safe because this runs under the game state lock,
+ * so no other capacity check can observe the released slot before the answer of
+ * this capture is stored and queued below.
  * @param request_id The request the capture belongs to.
  */
 void FinishDeferredCapture(const std::string &request_id)
@@ -1113,8 +1172,15 @@ void FinishDeferredCapture(const std::string &request_id)
 	}
 
 	StoreReceipt(request_id, result);
+	/*
+	 * The reservation taken by ScheduleCapture guarantees this slot: every other capacity check
+	 * counts the pending captures, and this capture has just released its own. The fallback keeps
+	 * the answer deliverable even if that invariant is ever broken, because a capture result
+	 * cannot be replayed from the request.
+	 */
 	if (!QueueResult(request_id, result)) {
-		Debug(Facility::Net, Severity::Warning, "In-game agent bridge: result queue is full; the capture result stays in its receipt");
+		Debug(Facility::Net, Severity::Warning, "In-game agent bridge: result queue is full; queueing the capture result anyway");
+		_state.results.push_back({{"request_id", request_id}, {"result", result}});
 	}
 }
 
@@ -1183,8 +1249,12 @@ Json ExecuteRequest(const Json &request, bool &deferred)
 	 */
 	if (!IsWorldReady()) return Error("world_not_ready", "the world is being generated or loaded");
 
+	/* The company the call is made for; every tool module scopes its commands to it. */
+	const CompanyID company = RequestCompanyId(request);
+	const bool mutation = IsMutation(method, params);
+
 	/* Mutations are only supported in single player: in multiplayer Post() merely enqueues the command. */
-	if (IsMutation(method) && _networking) return Error("multiplayer_unsupported", "mutations are only supported in single player");
+	if (mutation && _networking) return Error("multiplayer_unsupported", "mutations are only supported in single player");
 
 	/* The barrier is the last request of a task; nothing of that task may mutate the world afterwards. */
 	if (method == "task.barrier") {
@@ -1192,26 +1262,72 @@ Json ExecuteRequest(const Json &request, bool &deferred)
 		return Ok({{"barrier", true}});
 	}
 
-	if (IsMutation(method) && !task_id.empty() && _state.barrier_tasks.find(task_id) != _state.barrier_tasks.end()) {
+	if (mutation && !task_id.empty() && _state.barrier_tasks.find(task_id) != _state.barrier_tasks.end()) {
 		return Error("task_stopped", "the task has been stopped");
 	}
 
 	/* A mutation may only run when the objects it was planned for are still the same objects. */
-	if (IsMutation(method)) {
+	if (mutation) {
 		if (const std::optional<Json> stale = CheckExpectedRefs(params); stale.has_value()) return *stale;
 	}
 
 	if (method == "world.info") return WorldInfo();
-	if (method == "world.query") return WorldQuery(params);
+	if (method == "world.query") {
+		/*
+		 * The game tool module owns the vehicle and engine inventory, which is richer than the
+		 * core rows; the core query keeps the other kinds and stays the fallback when the module
+		 * does not claim the kind, so a kind is never shadowed by a thinner answer.
+		 */
+		const std::string_view kind = CanonicalQueryKind(JsonString(params, "kind"));
+		if (kind == "vehicles" || kind == "engines") {
+			if (std::optional<Json> result = DispatchGameTool(method, params, company); result.has_value()) {
+				Json mapped = FromModule(std::move(*result));
+				/* Every read is bound to the world and epoch it was taken in, whoever produced it. */
+				if (mapped["ok"].is_boolean() && mapped["ok"].get<bool>() && mapped.contains("value") && mapped["value"].is_object()) {
+					mapped["value"].update(WorldBinding());
+				}
+				return mapped;
+			}
+		}
+		return WorldQuery(params);
+	}
 	if (method == "world.objects") return WorldObjects(params);
 	if (method == "world.pause") return WorldPause(params);
-	if (method == "world.rename") return WorldRename(params, RequestCompanyId(request));
+	if (method == "world.rename") return WorldRename(params, company);
 
 	/* Read-only description of the native chat UI, so a GUI test can locate real targets. */
 	if (method == "ui.inspect") return Ok(::DescribeAgentChatUi());
 
 	/* The frame is copied on the draw thread, so the capture answers from the next draw tick. */
 	if (method == "world.capture") return ScheduleCapture(request, JsonString(request, "request_id"), params, deferred);
+
+	/*
+	 * Construction is split between two modules. The transport module owns the rail, water and
+	 * air ops and returns nothing for the road ops it leaves to the game tool module, which is
+	 * therefore asked second; only an op a module explicitly owns is executed by it.
+	 */
+	if (method == "world.construct") {
+		if (std::optional<Json> result = DispatchTransportTool(method, params, company); result.has_value()) {
+			return FromModule(std::move(*result));
+		}
+		if (std::optional<Json> result = DispatchGameTool(method, params, company); result.has_value()) {
+			return FromModule(std::move(*result));
+		}
+		return Error("unsupported_method", method);
+	}
+
+	/* Vehicle and order commands belong to the game tool module. */
+	if (method == "world.vehicles" || method == "world.orders") {
+		if (std::optional<Json> result = DispatchGameTool(method, params, company); result.has_value()) {
+			return FromModule(std::move(*result));
+		}
+		return Error("unsupported_method", method);
+	}
+
+	/* Administrative families: settings, companies, towns and projects. */
+	if (std::optional<Json> result = DispatchAdminTool(method, params, company); result.has_value()) {
+		return FromModule(std::move(*result));
+	}
 
 	return Error("unsupported_method", method);
 }
@@ -1374,18 +1490,53 @@ void ProcessCompletions()
 	}
 }
 
+/**
+ * The methods the engine can actually serve right now.
+ *
+ * Composed from the core methods of this file and from the capability documents of the tool
+ * modules: a method is only advertised when a module really implements at least one of its
+ * operations, so a gap is never advertised as a capability. The per-module documents are sent
+ * along as detail, so the backend and the operator can see what is missing.
+ * @return {methods, modules}: the advertised method names and the module documents.
+ */
+Json Capabilities()
+{
+	std::vector<std::string> methods = {"world.info", "world.query", "world.objects", "world.pause",
+			"world.rename", "world.capture", "task.barrier", "ui.inspect"};
+	Json modules = Json::array();
+
+	for (const Json &module : {GameToolCapabilities(), TransportToolCapabilities(), AdminToolCapabilities()}) {
+		modules.push_back(module);
+		const auto entries = module.find("methods");
+		if (entries == module.end() || !entries->is_array()) continue;
+		for (const Json &entry : *entries) {
+			const auto implemented = entry.find("implemented");
+			if (implemented == entry.end() || !implemented->is_array() || implemented->empty()) continue;
+			const std::string name = JsonString(entry, "method");
+			if (name.empty()) continue;
+			if (std::find(methods.begin(), methods.end(), name) == methods.end()) methods.push_back(name);
+		}
+	}
+
+	Json advertised = Json::array();
+	for (const std::string &method : methods) advertised.push_back(method);
+	return {{"methods", std::move(advertised)}, {"modules", std::move(modules)}};
+}
+
 /** Send a hello for the current world and epoch. */
 void SendHello()
 {
 	ResolveWorldId();
 	_state.hello_in_flight = true;
 
+	const Json capabilities = Capabilities();
 	const Json body = {
 		{"engine_id", _state.engine_id},
 		{"world_id", _state.world_id},
 		{"epoch", _state.epoch},
 		{"build", std::string(_openttd_revision)},
-		{"capabilities", Json::array({"world.info", "world.query", "world.objects", "world.pause", "world.rename", "world.capture", "task.barrier", "ui.inspect"})},
+		{"capabilities", capabilities["methods"]},
+		{"capability_detail", capabilities["modules"]},
 	};
 
 	Send(RequestKind::Hello, "/v1/engine/hello", body.dump(), _state.engine_token, _state.epoch, nullptr);

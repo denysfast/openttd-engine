@@ -1,4 +1,5 @@
 add_test_files(
+    agent_transport_tools.cpp
     alternating_iterator.cpp
     bitmath_func.cpp
     blueprint.cpp
@@ -18,6 +19,9 @@ add_test_files(
     string_consumer.cpp
     string_inplace.cpp
     string_func.cpp
+    test_agent_admin_tools.cpp
+    test_agent_capture.cpp
+    test_agent_game_tools.cpp
     test_main.cpp
     test_network_crypto.cpp
     test_network_http.cpp
