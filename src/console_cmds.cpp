@@ -65,6 +65,7 @@
 #include "town_districts.h"
 #include "town_map.h"
 #include "station_base.h"
+#include "vehicle_base.h"
 #include "station_func.h"
 #include "station_cmd.h"
 #include "core/backup_type.hpp"
@@ -2774,6 +2775,73 @@ static bool ConStationCatchment(std::span<std::string_view> argv)
 }
 
 /** Show the towns a station can belong to, or assign it to one of them. @copydoc IConsoleCmdProc */
+/**
+ * List the vehicles that waited longest for a path or for cargo.
+ * @param argv The arguments.
+ * @return True when the arguments were valid.
+ */
+static bool ConVehicleWaits(std::span<std::string_view> argv)
+{
+	if (argv.empty()) {
+		IConsolePrint(CC_HELP, "List vehicles by the time they waited. Usage: 'vehicle_waits [path|cargo [this|last [<count> [<company>]]]]'.");
+		IConsolePrint(CC_HELP, "Path: standing still outside stations and depots (signals, no path, blocked). Cargo: loading, but nothing to load. Times in days.");
+		return true;
+	}
+	if (argv.size() > 5) return false;
+
+	if (_game_mode == GameMode::Menu) {
+		IConsolePrint(CC_ERROR, "There is no game running.");
+		return true;
+	}
+
+	bool cargo = argv.size() > 1 && argv[1] == "cargo";
+	if (argv.size() > 1 && !cargo && argv[1] != "path") return false;
+	bool last = argv.size() > 2 && argv[2] == "last";
+	if (argv.size() > 2 && !last && argv[2] != "this") return false;
+	uint count = 20;
+	if (argv.size() > 3) {
+		auto n = ParseInteger(argv[3]);
+		if (!n.has_value()) return false;
+		count = *n;
+	}
+	std::optional<CompanyID> company;
+	if (argv.size() > 4) {
+		auto c = ParseInteger(argv[4]);
+		if (!c.has_value() || *c < 1 || !Company::IsValidID(*c - 1)) {
+			IConsolePrint(CC_ERROR, "Company '{}' does not exist.", argv[4]);
+			return true;
+		}
+		company = static_cast<CompanyID>(*c - 1);
+	}
+
+	auto key = [cargo, last](const Vehicle *v) {
+		return cargo ? (last ? v->wait_cargo_last_year : v->wait_cargo_this_year) : (last ? v->wait_path_last_year : v->wait_path_this_year);
+	};
+
+	std::vector<const Vehicle *> list;
+	uint64_t total = 0;
+	for (const Vehicle *v : Vehicle::Iterate()) {
+		if (!v->IsPrimaryVehicle() || (company.has_value() && v->owner != *company)) continue;
+		list.push_back(v);
+		total += key(v);
+	}
+	std::sort(list.begin(), list.end(), [&key](const Vehicle *a, const Vehicle *b) {
+		return key(a) != key(b) ? key(a) > key(b) : a->index < b->index;
+	});
+
+	IConsolePrint(CC_INFO, "{} vehicles, waited for {} {} year: {} days in total.", list.size(), cargo ? "cargo" : "a path", last ? "last" : "this", total / Ticks::DAY_TICKS);
+	IConsolePrint(CC_INFO, "   id company type name                            path (this/last)  cargo (this/last)");
+	static const std::string_view type_names[] = {"train", "road", "ship", "air"};
+	for (uint i = 0; i < count && i < list.size(); i++) {
+		const Vehicle *v = list[i];
+		IConsolePrint(CC_DEFAULT, "{:5} {:7} {:5} {:30} {:7} {:7}    {:7} {:7}", v->index, v->owner.base() + 1,
+				to_underlying(v->type) < 4 ? type_names[to_underlying(v->type)] : "?", GetString(STR_VEHICLE_NAME, v->index),
+				v->wait_path_this_year / Ticks::DAY_TICKS, v->wait_path_last_year / Ticks::DAY_TICKS,
+				v->wait_cargo_this_year / Ticks::DAY_TICKS, v->wait_cargo_last_year / Ticks::DAY_TICKS);
+	}
+	return true;
+}
+
 static bool ConStationTown(std::span<std::string_view> argv)
 {
 	if (argv.empty()) {
@@ -4322,6 +4390,7 @@ void IConsoleStdLibRegister()
 	IConsole::CmdRegister("power_add_fuel",          ConPowerAddFuel,     ConHookServerOrNoNetwork);
 	IConsole::CmdRegister("townsim_log",             ConTownSimLog);
 	IConsole::CmdRegister("station_catchment",       ConStationCatchment, ConHookServerOrNoNetwork);
+	IConsole::CmdRegister("vehicle_waits",           ConVehicleWaits);
 	IConsole::CmdRegister("station_town",            ConStationTown,      ConHookServerOrNoNetwork);
 
 	/* networking functions */

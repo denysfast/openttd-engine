@@ -1437,6 +1437,22 @@ void CheckVehicleBreakdown(Vehicle *v)
 	}
 }
 
+/** Update the time this primary vehicle has spent waiting. */
+void Vehicle::UpdateWaitStatistics()
+{
+	assert(this->IsPrimaryVehicle());
+
+	if (this->current_order.IsType(OT_LOADING)) {
+		if (this->vehicle_flags.Test(VehicleFlag::CargoWait)) this->wait_cargo_this_year++;
+		return;
+	}
+
+	if (this->cur_speed != 0 || this->vehstatus.Any({VehState::Stopped, VehState::Crashed}) ||
+			this->IsChainInDepot() || this->breakdown_ctr == 1) return;
+
+	this->wait_path_this_year++;
+}
+
 /**
  * Handle all of the aspects of a vehicle breakdown
  * This includes adding smoke and sounds, and ending the breakdown when appropriate.
@@ -2484,6 +2500,7 @@ void Vehicle::CancelReservation(StationID next, Station *st)
 void Vehicle::LeaveStation()
 {
 	assert(this->current_order.IsType(OT_LOADING));
+	this->vehicle_flags.Reset(VehicleFlag::CargoWait);
 
 	delete this->cargo_payment;
 	assert(this->cargo_payment == nullptr); // cleared by ~CargoPayment
@@ -3223,6 +3240,10 @@ static const IntervalTimer<TimerGameEconomy> _economy_vehicles_yearly({TimerGame
 
 			v->profit_last_year = v->profit_this_year;
 			v->profit_this_year = 0;
+			v->wait_path_last_year = v->wait_path_this_year;
+			v->wait_path_this_year = 0;
+			v->wait_cargo_last_year = v->wait_cargo_this_year;
+			v->wait_cargo_this_year = 0;
 			SetWindowDirty(WindowClass::VehicleDetails, v->index);
 		}
 	}

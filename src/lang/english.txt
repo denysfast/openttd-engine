@@ -347,6 +347,14 @@ STR_SORT_BY_VALUE                                               :Value
 STR_SORT_BY_LENGTH                                              :Length
 STR_SORT_BY_LIFE_TIME                                           :Remaining lifetime
 STR_SORT_BY_TIMETABLE_DELAY                                     :Timetable delay
+STR_SORT_BY_WAIT_PATH_THIS_YEAR                                 :Waiting for path this year
+STR_SORT_BY_WAIT_PATH_LAST_YEAR                                 :Waiting for path last year
+STR_SORT_BY_WAIT_CARGO_THIS_YEAR                                :Waiting for cargo this year
+STR_SORT_BY_WAIT_CARGO_LAST_YEAR                                :Waiting for cargo last year
+STR_SORT_BY_WAIT_PATH_THIS_PERIOD                               :Waiting for path this period
+STR_SORT_BY_WAIT_PATH_LAST_PERIOD                               :Waiting for path last period
+STR_SORT_BY_WAIT_CARGO_THIS_PERIOD                              :Waiting for cargo this period
+STR_SORT_BY_WAIT_CARGO_LAST_PERIOD                              :Waiting for cargo last period
 STR_SORT_BY_FACILITY                                            :Station type
 STR_SORT_BY_WAITING_TOTAL                                       :Total waiting cargo
 STR_SORT_BY_WAITING_AVAILABLE                                   :Available waiting cargo
@@ -4405,6 +4413,10 @@ STR_VEHICLE_LIST_SEND_FOR_SERVICING                             :Send for servic
 STR_VEHICLE_LIST_CREATE_GROUP                                   :Create group
 STR_VEHICLE_LIST_PROFIT_THIS_YEAR_LAST_YEAR                     :{TINY_FONT}{BLACK}Profit this year: {CURRENCY_LONG} (last year: {CURRENCY_LONG})
 STR_VEHICLE_LIST_PROFIT_THIS_PERIOD_LAST_PERIOD                 :{TINY_FONT}{BLACK}Profit this period: {CURRENCY_LONG} (last period: {CURRENCY_LONG})
+STR_VEHICLE_LIST_WAIT_PATH_THIS_YEAR_LAST_YEAR                  :{TINY_FONT}{BLACK}Waiting for path: {NUM} days (last year: {NUM} days)
+STR_VEHICLE_LIST_WAIT_PATH_THIS_PERIOD_LAST_PERIOD              :{TINY_FONT}{BLACK}Waiting for path: {NUM} days (last period: {NUM} days)
+STR_VEHICLE_LIST_WAIT_CARGO_THIS_YEAR_LAST_YEAR                 :{TINY_FONT}{BLACK}Waiting for cargo: {NUM} days (last year: {NUM} days)
+STR_VEHICLE_LIST_WAIT_CARGO_THIS_PERIOD_LAST_PERIOD             :{TINY_FONT}{BLACK}Waiting for cargo: {NUM} days (last period: {NUM} days)
 STR_VEHICLE_LIST_CARGO                                          :[{CARGO_LIST}]
 STR_VEHICLE_LIST_NAME_AND_CARGO                                 :{STRING1} {STRING1}
 
@@ -4865,6 +4877,8 @@ STR_VEHICLE_INFO_PROFIT_THIS_YEAR_LAST_YEAR                     :{BLACK}Profit t
 STR_VEHICLE_INFO_PROFIT_THIS_YEAR_LAST_YEAR_MIN_PERFORMANCE     :{BLACK}Profit this year: {LTBLUE}{CURRENCY_LONG} (last year: {CURRENCY_LONG}) {BLACK}Min. performance: {LTBLUE}{POWER_TO_WEIGHT}
 STR_VEHICLE_INFO_PROFIT_THIS_PERIOD_LAST_PERIOD                 :{BLACK}Profit this period: {LTBLUE}{CURRENCY_LONG} (last period: {CURRENCY_LONG})
 STR_VEHICLE_INFO_PROFIT_THIS_PERIOD_LAST_PERIOD_MIN_PERFORMANCE :{BLACK}Profit this period: {LTBLUE}{CURRENCY_LONG} (last period: {CURRENCY_LONG}) {BLACK}Min. performance: {LTBLUE}{POWER_TO_WEIGHT}
+STR_VEHICLE_INFO_WAIT_TIMES_THIS_YEAR_LAST_YEAR                 :{BLACK}Waiting for path: {LTBLUE}{NUM} days {BLACK}(last year: {LTBLUE}{NUM} days{BLACK}) · Waiting for cargo: {LTBLUE}{NUM} days {BLACK}(last year: {LTBLUE}{NUM} days{BLACK})
+STR_VEHICLE_INFO_WAIT_TIMES_THIS_PERIOD_LAST_PERIOD             :{BLACK}Waiting for path: {LTBLUE}{NUM} days {BLACK}(last period: {LTBLUE}{NUM} days{BLACK}) · Waiting for cargo: {LTBLUE}{NUM} days {BLACK}(last period: {LTBLUE}{NUM} days{BLACK})
 STR_VEHICLE_INFO_RELIABILITY_BREAKDOWNS                         :{BLACK}Reliability: {LTBLUE}{COMMA}% (max: {COMMA}%)  {BLACK}Breakdowns since last service: {LTBLUE}{COMMA}
 
 STR_VEHICLE_INFO_BUILT_VALUE                                    :{LTBLUE}{ENGINE} {BLACK}Built: {LTBLUE}{NUM}{BLACK} Value: {LTBLUE}{CURRENCY_LONG}

@@ -272,6 +272,34 @@ public:
 	 */
 	static Money GetProfitLastYear(VehicleID vehicle_id);
 
+	/**
+	 * Get the number of ticks this vehicle waited for a path this economy-year.
+	 * @param vehicle_id The vehicle to get the waiting time of.
+	 * @return The waiting time, or -1 if the vehicle is invalid or not primary.
+	 */
+	static int32_t GetPathWaitTicksThisYear(VehicleID vehicle_id);
+
+	/**
+	 * Get the number of ticks this vehicle waited for a path last economy-year.
+	 * @param vehicle_id The vehicle to get the waiting time of.
+	 * @return The waiting time, or -1 if the vehicle is invalid or not primary.
+	 */
+	static int32_t GetPathWaitTicksLastYear(VehicleID vehicle_id);
+
+	/**
+	 * Get the number of ticks this vehicle waited for cargo this economy-year.
+	 * @param vehicle_id The vehicle to get the waiting time of.
+	 * @return The waiting time, or -1 if the vehicle is invalid or not primary.
+	 */
+	static int32_t GetCargoWaitTicksThisYear(VehicleID vehicle_id);
+
+	/**
+	 * Get the number of ticks this vehicle waited for cargo last economy-year.
+	 * @param vehicle_id The vehicle to get the waiting time of.
+	 * @return The waiting time, or -1 if the vehicle is invalid or not primary.
+	 */
+	static int32_t GetCargoWaitTicksLastYear(VehicleID vehicle_id);
+
 
 	/**
 	 * Get the current value of a vehicle.

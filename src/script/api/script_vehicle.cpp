@@ -390,6 +390,34 @@
 	return ::Vehicle::Get(vehicle_id)->GetDisplayProfitLastYear();
 }
 
+/* static */ int32_t ScriptVehicle::GetPathWaitTicksThisYear(VehicleID vehicle_id)
+{
+	if (!IsPrimaryVehicle(vehicle_id)) return -1;
+
+	return ClampTo<int32_t>(::Vehicle::Get(vehicle_id)->wait_path_this_year);
+}
+
+/* static */ int32_t ScriptVehicle::GetPathWaitTicksLastYear(VehicleID vehicle_id)
+{
+	if (!IsPrimaryVehicle(vehicle_id)) return -1;
+
+	return ClampTo<int32_t>(::Vehicle::Get(vehicle_id)->wait_path_last_year);
+}
+
+/* static */ int32_t ScriptVehicle::GetCargoWaitTicksThisYear(VehicleID vehicle_id)
+{
+	if (!IsPrimaryVehicle(vehicle_id)) return -1;
+
+	return ClampTo<int32_t>(::Vehicle::Get(vehicle_id)->wait_cargo_this_year);
+}
+
+/* static */ int32_t ScriptVehicle::GetCargoWaitTicksLastYear(VehicleID vehicle_id)
+{
+	if (!IsPrimaryVehicle(vehicle_id)) return -1;
+
+	return ClampTo<int32_t>(::Vehicle::Get(vehicle_id)->wait_cargo_last_year);
+}
+
 /* static */ Money ScriptVehicle::GetCurrentValue(VehicleID vehicle_id)
 {
 	if (!IsValidVehicle(vehicle_id)) return -1;

@@ -4911,6 +4911,7 @@ bool Train::Tick()
 
 	if (this->IsFrontEngine()) {
 		PerformanceAccumulator framerate(PerformanceElement::GameLoopTrains);
+		this->UpdateWaitStatistics();
 
 		if (!this->vehstatus.Test(VehState::Stopped) || this->cur_speed > 0) this->running_ticks++;
 

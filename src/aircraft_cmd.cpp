@@ -2148,6 +2148,7 @@ bool Aircraft::Tick()
 	PerformanceAccumulator framerate(PerformanceElement::GameLoopAircraft);
 
 	this->tick_counter++;
+	this->UpdateWaitStatistics();
 
 	if (!this->vehstatus.Test(VehState::Stopped)) this->running_ticks++;
 

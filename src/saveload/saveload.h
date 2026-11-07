@@ -430,6 +430,7 @@ enum class SaveLoadVersion : uint16_t {
 	StationCatchmentUpgrade, ///< Fork mapuamap/openttd-engine: bought catchment radius levels of stations.
 	TownInvestment, ///< Fork mapuamap/openttd-engine: investments of companies into towns.
 	IndustryCargoAmounts32, ///< Fork mapuamap/openttd-engine: 32 bit produced cargo waiting and monthly produced/transported/accepted amounts of industries.
+	VehicleWaitStats, ///< Fork mapuamap/openttd-engine: vehicle path and cargo wait statistics.
 
 	MaxVersion, ///< Highest possible saveload version.
 };

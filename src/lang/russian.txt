@@ -473,6 +473,14 @@ STR_SORT_BY_VALUE                                               :Стоимос�
 STR_SORT_BY_LENGTH                                              :Длина
 STR_SORT_BY_LIFE_TIME                                           :Оставшийся срок службы
 STR_SORT_BY_TIMETABLE_DELAY                                     :Отставание от графика
+STR_SORT_BY_WAIT_PATH_THIS_YEAR                                 :Ждёт пути в этом году
+STR_SORT_BY_WAIT_PATH_LAST_YEAR                                 :Ждёт пути в прошлом году
+STR_SORT_BY_WAIT_CARGO_THIS_YEAR                                :Ждёт груза в этом году
+STR_SORT_BY_WAIT_CARGO_LAST_YEAR                                :Ждёт груза в прошлом году
+STR_SORT_BY_WAIT_PATH_THIS_PERIOD                               :Ждёт пути в этом периоде
+STR_SORT_BY_WAIT_PATH_LAST_PERIOD                               :Ждёт пути в прошлом периоде
+STR_SORT_BY_WAIT_CARGO_THIS_PERIOD                              :Ждёт груза в этом периоде
+STR_SORT_BY_WAIT_CARGO_LAST_PERIOD                              :Ждёт груза в прошлом периоде
 STR_SORT_BY_FACILITY                                            :Тип станции
 STR_SORT_BY_WAITING_TOTAL                                       :Общий объём груза
 STR_SORT_BY_WAITING_AVAILABLE                                   :Объём доступного груза
@@ -4580,6 +4588,10 @@ STR_VEHICLE_LIST_SEND_FOR_SERVICING                             :Отправи�
 STR_VEHICLE_LIST_CREATE_GROUP                                   :Создать группу
 STR_VEHICLE_LIST_PROFIT_THIS_YEAR_LAST_YEAR                     :{TINY_FONT}{BLACK}Прибыль в этом году: {CURRENCY_LONG} (в прошлом году: {CURRENCY_LONG})
 STR_VEHICLE_LIST_PROFIT_THIS_PERIOD_LAST_PERIOD                 :{TINY_FONT}{BLACK}Прибыль в текущем цикле: {LTBLUE}{CURRENCY_LONG} (в прошлом: {CURRENCY_LONG})
+STR_VEHICLE_LIST_WAIT_PATH_THIS_YEAR_LAST_YEAR                  :{TINY_FONT}{BLACK}Ждёт пути: {NUM} дн. (в прошлом году: {NUM} дн.)
+STR_VEHICLE_LIST_WAIT_PATH_THIS_PERIOD_LAST_PERIOD              :{TINY_FONT}{BLACK}Ждёт пути: {NUM} дн. (в прошлом периоде: {NUM} дн.)
+STR_VEHICLE_LIST_WAIT_CARGO_THIS_YEAR_LAST_YEAR                 :{TINY_FONT}{BLACK}Ждёт груза: {NUM} дн. (в прошлом году: {NUM} дн.)
+STR_VEHICLE_LIST_WAIT_CARGO_THIS_PERIOD_LAST_PERIOD             :{TINY_FONT}{BLACK}Ждёт груза: {NUM} дн. (в прошлом периоде: {NUM} дн.)
 STR_VEHICLE_LIST_CARGO                                          :[{CARGO_LIST}]
 STR_VEHICLE_LIST_NAME_AND_CARGO                                 :{STRING} {STRING}
 
@@ -5052,6 +5064,8 @@ STR_VEHICLE_INFO_PROFIT_THIS_YEAR_LAST_YEAR                     :{BLACK}Приб
 STR_VEHICLE_INFO_PROFIT_THIS_YEAR_LAST_YEAR_MIN_PERFORMANCE     :{BLACK}Прибыль в текущем году: {LTBLUE}{CURRENCY_LONG} (в прошлом: {CURRENCY_LONG}) {BLACK}Мин. удельная мощн.: {LTBLUE}{POWER_TO_WEIGHT}
 STR_VEHICLE_INFO_PROFIT_THIS_PERIOD_LAST_PERIOD                 :{BLACK}Прибыль в текущем цикле: {LTBLUE}{CURRENCY_LONG} (в прошлом: {CURRENCY_LONG})
 STR_VEHICLE_INFO_PROFIT_THIS_PERIOD_LAST_PERIOD_MIN_PERFORMANCE :{BLACK}Прибыль в текущем цикле: {LTBLUE}{CURRENCY_LONG} (в прошлом: {CURRENCY_LONG}) {BLACK}Мин. удельная мощн.: {LTBLUE}{POWER_TO_WEIGHT}
+STR_VEHICLE_INFO_WAIT_TIMES_THIS_YEAR_LAST_YEAR                 :{BLACK}Ждёт пути: {LTBLUE}{NUM} дн. {BLACK}(в прошлом году: {LTBLUE}{NUM} дн.{BLACK}) · Ждёт груза: {LTBLUE}{NUM} дн. {BLACK}(в прошлом году: {LTBLUE}{NUM} дн.{BLACK})
+STR_VEHICLE_INFO_WAIT_TIMES_THIS_PERIOD_LAST_PERIOD             :{BLACK}Ждёт пути: {LTBLUE}{NUM} дн. {BLACK}(в прошлом периоде: {LTBLUE}{NUM} дн.{BLACK}) · Ждёт груза: {LTBLUE}{NUM} дн. {BLACK}(в прошлом периоде: {LTBLUE}{NUM} дн.{BLACK})
 STR_VEHICLE_INFO_RELIABILITY_BREAKDOWNS                         :{BLACK}Надёжность: {LTBLUE}{COMMA}% (макс. {COMMA}%) {BLACK}Поломок после ТО: {LTBLUE}{COMMA}
 
 STR_VEHICLE_INFO_BUILT_VALUE                                    :{LTBLUE}{ENGINE} {BLACK}Построен в {LTBLUE}{NUM} г.{BLACK} Стоимость: {LTBLUE}{CURRENCY_LONG}

@@ -53,6 +53,34 @@ struct GUIVehicleGroup {
 		});
 	}
 
+	uint64_t GetPathWaitTicksThisYear() const
+	{
+		return std::accumulate(this->vehicles_begin, this->vehicles_end, uint64_t{0}, [](uint64_t acc, const Vehicle *v) {
+			return acc + v->wait_path_this_year;
+		});
+	}
+
+	uint64_t GetPathWaitTicksLastYear() const
+	{
+		return std::accumulate(this->vehicles_begin, this->vehicles_end, uint64_t{0}, [](uint64_t acc, const Vehicle *v) {
+			return acc + v->wait_path_last_year;
+		});
+	}
+
+	uint64_t GetCargoWaitTicksThisYear() const
+	{
+		return std::accumulate(this->vehicles_begin, this->vehicles_end, uint64_t{0}, [](uint64_t acc, const Vehicle *v) {
+			return acc + v->wait_cargo_this_year;
+		});
+	}
+
+	uint64_t GetCargoWaitTicksLastYear() const
+	{
+		return std::accumulate(this->vehicles_begin, this->vehicles_end, uint64_t{0}, [](uint64_t acc, const Vehicle *v) {
+			return acc + v->wait_cargo_last_year;
+		});
+	}
+
 	TimerGameEconomy::Date GetOldestVehicleAge() const
 	{
 		const Vehicle *oldest = *std::max_element(this->vehicles_begin, this->vehicles_end, [](const Vehicle *v_a, const Vehicle *v_b) {
