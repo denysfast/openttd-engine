@@ -6679,5 +6679,26 @@ STR_AGENT_CHAT_KIND_WATER                                       :Вода
 STR_AGENT_CHAT_KIND_BRIDGE                                      :Мост
 STR_AGENT_CHAT_KIND_TUNNEL                                      :Тоннель
 STR_AGENT_CHAT_ATTACHMENT_TILE_WHAT                             :{RAW_STRING} (тайл {NUM}, {NUM})
+STR_AGENT_CHAT_ATTACHMENT_TILE_KIND_SUBTYPE                    :{RAW_STRING} ({RAW_STRING}) (тайл {NUM}, {NUM})
+STR_AGENT_CHAT_SUBTYPE_GRASS                                   :трава
+STR_AGENT_CHAT_SUBTYPE_ROUGH                                   :неровная земля
+STR_AGENT_CHAT_SUBTYPE_ROCKS                                   :камни
+STR_AGENT_CHAT_SUBTYPE_FIELDS                                  :поля
+STR_AGENT_CHAT_SUBTYPE_DESERT                                  :пустыня
+STR_AGENT_CHAT_SUBTYPE_SNOW_OR_DESERT                          :снег или пустыня
+STR_AGENT_CHAT_SUBTYPE_SHORE                                   :берег
+STR_AGENT_CHAT_SUBTYPE_ROUGH_SNOW                              :неровный снег
+STR_AGENT_CHAT_SUBTYPE_COAST                                   :побережье
+STR_AGENT_CHAT_SUBTYPE_CANAL                                   :канал
+STR_AGENT_CHAT_SUBTYPE_RIVER                                   :река
+STR_AGENT_CHAT_SUBTYPE_LOCK                                    :шлюз
+STR_AGENT_CHAT_SUBTYPE_WATER                                   :вода
+STR_AGENT_CHAT_SUBTYPE_CLEAR_ROCKS                             :камни в воде
+STR_AGENT_CHAT_SUBTYPE_COAST_ROCKS                             :прибрежные камни
+STR_AGENT_CHAT_SUBTYPE_DEPOT                                   :депо
+STR_AGENT_CHAT_SUBTYPE_SIGNALS                                 :сигналы
+STR_AGENT_CHAT_SUBTYPE_SEMAPHORE                               :семафор
+STR_AGENT_CHAT_SUBTYPE_ELECTRIC                                :электрический
+STR_AGENT_CHAT_SUBTYPE_AIR                                     :воздушный
 STR_AGENT_CHAT_ADD_COMPANY                                      :Добавить компанию
 STR_AGENT_CHAT_ADD_COMPANY_TOOLTIP                              :Выбрать компанию для вложения

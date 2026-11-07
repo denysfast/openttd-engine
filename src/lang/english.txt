@@ -6418,5 +6418,26 @@ STR_AGENT_CHAT_KIND_WATER                                       :Water
 STR_AGENT_CHAT_KIND_BRIDGE                                      :Bridge
 STR_AGENT_CHAT_KIND_TUNNEL                                      :Tunnel
 STR_AGENT_CHAT_ATTACHMENT_TILE_WHAT                             :{RAW_STRING} tile {NUM}, {NUM}
+STR_AGENT_CHAT_ATTACHMENT_TILE_KIND_SUBTYPE                    :{RAW_STRING} ({RAW_STRING}) tile {NUM}, {NUM}
+STR_AGENT_CHAT_SUBTYPE_GRASS                                   :grass
+STR_AGENT_CHAT_SUBTYPE_ROUGH                                   :rough ground
+STR_AGENT_CHAT_SUBTYPE_ROCKS                                   :rocks
+STR_AGENT_CHAT_SUBTYPE_FIELDS                                  :fields
+STR_AGENT_CHAT_SUBTYPE_DESERT                                  :desert
+STR_AGENT_CHAT_SUBTYPE_SNOW_OR_DESERT                          :snow or desert
+STR_AGENT_CHAT_SUBTYPE_SHORE                                   :shore
+STR_AGENT_CHAT_SUBTYPE_ROUGH_SNOW                              :rough snow
+STR_AGENT_CHAT_SUBTYPE_COAST                                   :coast
+STR_AGENT_CHAT_SUBTYPE_CANAL                                   :canal
+STR_AGENT_CHAT_SUBTYPE_RIVER                                   :river
+STR_AGENT_CHAT_SUBTYPE_LOCK                                    :lock
+STR_AGENT_CHAT_SUBTYPE_WATER                                   :water
+STR_AGENT_CHAT_SUBTYPE_CLEAR_ROCKS                             :rocks in the water
+STR_AGENT_CHAT_SUBTYPE_COAST_ROCKS                             :coastal rocks
+STR_AGENT_CHAT_SUBTYPE_DEPOT                                   :depot
+STR_AGENT_CHAT_SUBTYPE_SIGNALS                                 :signals
+STR_AGENT_CHAT_SUBTYPE_SEMAPHORE                               :semaphore
+STR_AGENT_CHAT_SUBTYPE_ELECTRIC                                :electric
+STR_AGENT_CHAT_SUBTYPE_AIR                                     :air
 STR_AGENT_CHAT_ADD_COMPANY                                      :Add company
 STR_AGENT_CHAT_ADD_COMPANY_TOOLTIP                              :Pick a company to attach to the message

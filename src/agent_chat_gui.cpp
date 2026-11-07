@@ -236,19 +236,19 @@ static int64_t GetPoolGeneration(const T &object)
  */
 static std::string GetAttachmentKindName(const std::string &what)
 {
-	if (what == "clear" || what == "terrain") return GetString(STR_AGENT_CHAT_KIND_TERRAIN);
+	if (what == "clear" || what == "terrain" || what == "landscape") return GetString(STR_AGENT_CHAT_KIND_TERRAIN);
 	if (what == "rail") return GetString(STR_AGENT_CHAT_KIND_RAIL);
 	if (what == "road") return GetString(STR_AGENT_CHAT_KIND_ROAD);
 	if (what == "tram") return GetString(STR_AGENT_CHAT_KIND_TRAM);
 	if (what == "signal") return GetString(STR_AGENT_CHAT_KIND_SIGNAL);
-	if (what == "trees") return GetString(STR_AGENT_CHAT_KIND_TREES);
+	if (what == "tree" || what == "trees") return GetString(STR_AGENT_CHAT_KIND_TREES);
 	if (what == "water") return GetString(STR_AGENT_CHAT_KIND_WATER);
 	if (what == "bridge" || what == "tunnelbridge") return GetString(STR_AGENT_CHAT_KIND_BRIDGE);
 	if (what == "tunnel") return GetString(STR_AGENT_CHAT_KIND_TUNNEL);
 	if (what == "station") return GetString(STR_AGENT_CHAT_TYPE_STATION);
 	if (what == "industry") return GetString(STR_AGENT_CHAT_TYPE_INDUSTRY);
 	if (what == "house") return GetString(STR_AGENT_CHAT_TYPE_HOUSE);
-	if (what == "object" || what == "mapobject") return GetString(STR_AGENT_CHAT_TYPE_OBJECT);
+	if (what == "object" || what == "mapobject" || what == "map_object") return GetString(STR_AGENT_CHAT_TYPE_OBJECT);
 	return {};
 }
 
@@ -283,6 +283,86 @@ static std::string GetAttachmentTypeName(const std::string &type)
 }
 
 /**
+ * Get the readable name of the subtype of a typed tile object.
+ *
+ * The bridge describes the subtype of a typed tile row (ground, water kind, signal variant,
+ * transport type of a bridge or tunnel, ...). Only words a player can read are named: track bits
+ * and raw NewGRF numbers would say nothing, so they leave the label short.
+ * @param type The type of the reference.
+ * @param subtype The protocol subtype.
+ * @return The name, or an empty string when the subtype adds nothing to the label.
+ */
+static std::string GetAttachmentSubtypeName(const std::string &type, const std::string &subtype)
+{
+	if (subtype.empty() || subtype == type) return {};
+	if (subtype.starts_with("house_") || subtype.starts_with("type_")) return {};
+
+	if (subtype == "grass") return GetString(STR_AGENT_CHAT_SUBTYPE_GRASS);
+	if (subtype == "rough") return GetString(STR_AGENT_CHAT_SUBTYPE_ROUGH);
+	if (subtype == "rocks") return GetString(STR_AGENT_CHAT_SUBTYPE_ROCKS);
+	if (subtype == "fields") return GetString(STR_AGENT_CHAT_SUBTYPE_FIELDS);
+	if (subtype == "desert") return GetString(STR_AGENT_CHAT_SUBTYPE_DESERT);
+	if (subtype == "snow_or_desert") return GetString(STR_AGENT_CHAT_SUBTYPE_SNOW_OR_DESERT);
+	if (subtype == "shore") return GetString(STR_AGENT_CHAT_SUBTYPE_SHORE);
+	if (subtype == "rough_snow") return GetString(STR_AGENT_CHAT_SUBTYPE_ROUGH_SNOW);
+	if (subtype == "coast") return GetString(STR_AGENT_CHAT_SUBTYPE_COAST);
+	if (subtype == "canal") return GetString(STR_AGENT_CHAT_SUBTYPE_CANAL);
+	if (subtype == "river") return GetString(STR_AGENT_CHAT_SUBTYPE_RIVER);
+	if (subtype == "lock") return GetString(STR_AGENT_CHAT_SUBTYPE_LOCK);
+	if (subtype == "water") return GetString(STR_AGENT_CHAT_SUBTYPE_WATER);
+	if (subtype == "clear_rocks") return GetString(STR_AGENT_CHAT_SUBTYPE_CLEAR_ROCKS);
+	if (subtype == "coast_rocks") return GetString(STR_AGENT_CHAT_SUBTYPE_COAST_ROCKS);
+	if (subtype == "depot") return GetString(STR_AGENT_CHAT_SUBTYPE_DEPOT);
+	if (subtype == "signals") return GetString(STR_AGENT_CHAT_SUBTYPE_SIGNALS);
+	if (subtype == "semaphore") return GetString(STR_AGENT_CHAT_SUBTYPE_SEMAPHORE);
+	if (subtype == "electric") return GetString(STR_AGENT_CHAT_SUBTYPE_ELECTRIC);
+	if (subtype == "air") return GetString(STR_AGENT_CHAT_SUBTYPE_AIR);
+
+	/* Track bits and protocol markers are words the player does not read as a word. */
+	if (subtype == "x" || subtype == "y" || subtype == "upper" || subtype == "lower" || subtype == "left" ||
+			subtype == "right" || subtype == "cross" || subtype == "horizontal" || subtype == "vertical" ||
+			subtype == "all" || subtype == "mixed" || subtype == "clear" || subtype == "unknown" ||
+			subtype == "invalid") {
+		return {};
+	}
+	/* A word this build does not know is still more useful than hiding it. */
+	return subtype;
+}
+
+/**
+ * Read the subtype of a reference.
+ *
+ * The subtype of a typed tile object is not part of the identity the UI keeps in its own fields, so
+ * it travels in #AgentChatAttachment::extra; reading it there keeps a reference that came back from
+ * the backend labelled the same way as a freshly picked one.
+ * @param attachment The attachment.
+ * @return The subtype, or an empty string.
+ */
+static std::string GetAttachmentSubtype(const AgentChatAttachment &attachment)
+{
+	if (!attachment.extra.is_object()) return {};
+	return JsonString(attachment.extra, "subtype");
+}
+
+/**
+ * Get the label of a reference that is identified by its tile.
+ * @param type The type of the reference.
+ * @param what The classification the reference carries.
+ * @param subtype The subtype of the object, if any.
+ * @param tile The tile.
+ * @return The label.
+ */
+static std::string GetTileAttachmentLabel(const std::string &type, const std::string &what, const std::string &subtype, TileIndex tile)
+{
+	const std::string kind = GetAttachmentKindName(what.empty() ? type : what);
+	if (kind.empty()) return GetString(STR_AGENT_CHAT_ATTACHMENT_TILE, TileX(tile), TileY(tile));
+
+	const std::string sub = GetAttachmentSubtypeName(type, subtype);
+	if (sub.empty()) return GetString(STR_AGENT_CHAT_ATTACHMENT_TILE_WHAT, kind, TileX(tile), TileY(tile));
+	return GetString(STR_AGENT_CHAT_ATTACHMENT_TILE_KIND_SUBTYPE, kind, sub, TileX(tile), TileY(tile));
+}
+
+/**
  * Get the label of an attachment, as shown in the attachment tray.
  * @param attachment The attachment.
  * @return The label.
@@ -290,13 +370,13 @@ static std::string GetAttachmentTypeName(const std::string &type)
 static std::string GetAttachmentLabel(const AgentChatAttachment &attachment)
 {
 	if (!attachment.name.empty()) return SanitiseBackendText(attachment.name);
+	/* A pooled object is named by its id; a typed tile object has no id of its own and is named
+	 * by its category, subtype and location instead. */
+	if (attachment.id >= 0) return GetString(STR_AGENT_CHAT_ATTACHMENT_OBJECT, GetAttachmentTypeName(attachment.type), attachment.id);
 	if (attachment.tile != INVALID_TILE) {
 		if (attachment.type == "point") return GetString(STR_AGENT_CHAT_ATTACHMENT_POINT, TileX(attachment.tile), TileY(attachment.tile));
-		const std::string kind = GetAttachmentKindName(attachment.what);
-		if (!kind.empty()) return GetString(STR_AGENT_CHAT_ATTACHMENT_TILE_WHAT, kind, TileX(attachment.tile), TileY(attachment.tile));
-		return GetString(STR_AGENT_CHAT_ATTACHMENT_TILE, TileX(attachment.tile), TileY(attachment.tile));
+		return GetTileAttachmentLabel(attachment.type, attachment.what, GetAttachmentSubtype(attachment), attachment.tile);
 	}
-	if (attachment.id >= 0) return GetString(STR_AGENT_CHAT_ATTACHMENT_OBJECT, GetAttachmentTypeName(attachment.type), attachment.id);
 	return GetAttachmentTypeName(attachment.type);
 }
 
@@ -1341,7 +1421,11 @@ struct AgentChatWindow : Window {
 		for (size_t i = 0; i < rows.size(); i++) {
 			const Json &candidate = _agent_chat.candidates[i];
 			std::string label = SanitiseBackendText(JsonString(candidate, "name"));
-			if (label.empty()) label = GetString(STR_AGENT_CHAT_ATTACHMENT_OBJECT, GetAttachmentTypeName(JsonString(candidate, "type", "object")), JsonInt(candidate, "id", -1));
+			if (label.empty()) {
+				AgentChatAttachment preview = ParseAttachment(candidate);
+				if (preview.type.empty()) preview.type = "object";
+				label = GetAttachmentLabel(preview);
+			}
 			DrawString(rows[i].left + ScaleGUITrad(4), rows[i].right, rows[i].top, label, TextColour::Cream);
 		}
 	}
@@ -1706,8 +1790,13 @@ struct AgentChatWindow : Window {
 
 		this->SetShaded(this->picking_was_shaded);
 		if (!this->picking_was_shaded) {
-			/* SetShaded() restores the size, but a window moved while it was shaded would keep
-			 * the moved position, so the remembered one is restored. */
+			/* SetShaded() restores the size, but a window that was moved while it was shaded can
+			 * come back moved and clamped at the screen edge, so the remembered rectangle wins. */
+			const int restore_width = this->picking_restore_rect.right - this->picking_restore_rect.left + 1;
+			const int restore_height = this->picking_restore_rect.bottom - this->picking_restore_rect.top + 1;
+			if (this->width != restore_width || this->height != restore_height) {
+				ResizeWindow(this, restore_width - this->width, restore_height - this->height, false, false);
+			}
 			this->left = this->picking_restore_rect.left;
 			this->top = this->picking_restore_rect.top;
 		}
@@ -1843,7 +1932,8 @@ struct AgentChatWindow : Window {
 	{
 		AgentChatAttachment attachment = ParseAttachment(candidate);
 		if (attachment.type.empty()) attachment.type = "object";
-		if (attachment.name.empty()) attachment.name = GetString(STR_AGENT_CHAT_ATTACHMENT_OBJECT, GetAttachmentTypeName(attachment.type), attachment.id);
+		/* A typed tile row has no pool id: label it by category, subtype and tile, never by -1. */
+		if (attachment.name.empty()) attachment.name = GetAttachmentLabel(attachment);
 		/* The candidate may already name its world and epoch; only fill in what is missing. */
 		if (attachment.world_id.empty()) attachment.world_id = _agent_chat.world_id;
 		if (attachment.epoch.empty()) attachment.epoch = _agent_chat.epoch;
@@ -2415,6 +2505,12 @@ nlohmann::json DescribeAgentChatUi()
 		entry["id"] = JsonInt(candidate, "id", -1);
 		entry["generation"] = JsonInt(candidate, "generation", -1);
 		entry["name"] = JsonString(candidate, "name");
+		{
+			/* The readable label, so a test never has to guess it from a pool id the row lacks. */
+			AgentChatAttachment preview = ParseAttachment(candidate);
+			if (preview.type.empty()) preview.type = "object";
+			entry["label"] = GetAttachmentLabel(preview);
+		}
 		entry["world_id"] = JsonString(candidate, "world_id");
 		entry["epoch"] = JsonString(candidate, "epoch");
 		candidates.push_back(std::move(entry));
