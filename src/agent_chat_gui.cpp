@@ -472,6 +472,28 @@ static Json AttachmentToJson(const AgentChatAttachment &attachment)
 }
 
 /**
+ * Describe one reference the way `ui.inspect` reports it.
+ *
+ * The canonical reference fields come from #AttachmentToJson, so a fingerprint, a `what`, a town
+ * generation or an object generation the backend reported is reported here as well instead of
+ * being dropped. A reference that has no id or no generation (a point, a typed tile object) simply
+ * has no such member; it is never given a made up -1. The readable labels and the two flags the
+ * tray shows are added on top of the canonical fields.
+ * @param attachment The attachment.
+ * @return The reference description.
+ */
+static Json ReferenceToUiJson(const AgentChatAttachment &attachment)
+{
+	Json entry = AttachmentToJson(attachment);
+	/* The plain label, and the label the tray shows, which marks stale and unverified references. */
+	entry["label"] = GetAttachmentLabel(attachment);
+	entry["name"] = GetAttachmentDisplayLabel(attachment);
+	entry["stale"] = IsAttachmentStale(attachment);
+	entry["generation_known"] = !IsAttachmentGenerationUnknown(attachment);
+	return entry;
+}
+
+/**
  * Read the tile of a reference.
  *
  * The canonical shape names the tile as an object `{"x": x, "y": y}`; the legacy shape is the
@@ -2484,36 +2506,18 @@ nlohmann::json DescribeAgentChatUi()
 
 	Json tray = Json::array();
 	for (const AgentChatAttachment &attachment : _agent_chat.tray) {
-		Json entry = Json::object();
-		entry["type"] = attachment.type;
-		entry["id"] = attachment.id;
-		entry["generation"] = attachment.generation;
-		entry["name"] = GetAttachmentDisplayLabel(attachment);
-		entry["tile"] = attachment.tile == INVALID_TILE ? Json() : Json::array({TileX(attachment.tile), TileY(attachment.tile)});
-		entry["world_id"] = attachment.world_id;
-		entry["epoch"] = attachment.epoch;
-		entry["stale"] = IsAttachmentStale(attachment);
-		entry["generation_known"] = !IsAttachmentGenerationUnknown(attachment);
-		tray.push_back(std::move(entry));
+		tray.push_back(ReferenceToUiJson(attachment));
 	}
 	out["tray"] = std::move(tray);
 
 	Json candidates = Json::array();
 	for (const Json &candidate : _agent_chat.candidates) {
-		Json entry = Json::object();
-		entry["type"] = JsonString(candidate, "type");
-		entry["id"] = JsonInt(candidate, "id", -1);
-		entry["generation"] = JsonInt(candidate, "generation", -1);
-		entry["name"] = JsonString(candidate, "name");
-		{
-			/* The readable label, so a test never has to guess it from a pool id the row lacks. */
-			AgentChatAttachment preview = ParseAttachment(candidate);
-			if (preview.type.empty()) preview.type = "object";
-			entry["label"] = GetAttachmentLabel(preview);
-		}
-		entry["world_id"] = JsonString(candidate, "world_id");
-		entry["epoch"] = JsonString(candidate, "epoch");
-		candidates.push_back(std::move(entry));
+		/* A candidate already is a canonical reference: the round trip through the attachment keeps
+		 * the fields this UI does not model (a fingerprint, a `what`, a lifetime) and drops nothing. */
+		AgentChatAttachment preview = ParseAttachment(candidate);
+		/* The readable label needs a kind; a candidate without one is still an object reference. */
+		if (preview.type.empty()) preview.type = "object";
+		candidates.push_back(ReferenceToUiJson(preview));
 	}
 	out["candidates"] = std::move(candidates);
 
@@ -2527,17 +2531,7 @@ nlohmann::json DescribeAgentChatUi()
 			entry["status"] = message.status;
 			Json attachments = Json::array();
 			for (const AgentChatAttachment &attachment : message.attachments) {
-				Json item = Json::object();
-				item["type"] = attachment.type;
-				item["id"] = attachment.id;
-				item["generation"] = attachment.generation;
-				item["name"] = GetAttachmentDisplayLabel(attachment);
-				item["tile"] = attachment.tile == INVALID_TILE ? Json() : Json::array({TileX(attachment.tile), TileY(attachment.tile)});
-				item["world_id"] = attachment.world_id;
-				item["epoch"] = attachment.epoch;
-				item["stale"] = IsAttachmentStale(attachment);
-				item["generation_known"] = !IsAttachmentGenerationUnknown(attachment);
-				attachments.push_back(std::move(item));
+				attachments.push_back(ReferenceToUiJson(attachment));
 			}
 			entry["attachments"] = std::move(attachments);
 			messages.push_back(std::move(entry));
@@ -2630,8 +2624,16 @@ nlohmann::json DescribeAgentChatUi()
 		const std::vector<Rect> chips = LayoutTrayChips(tray_area);
 		for (size_t i = 0; i < chips.size(); i++) {
 			const int remove_width = GetCharacterHeight(FontSize::Normal);
+			const AgentChatAttachment &attachment = _agent_chat.tray[i];
 			Json entry = Json::object();
-			entry["name"] = GetAttachmentDisplayLabel(_agent_chat.tray[i]);
+			entry["name"] = GetAttachmentDisplayLabel(attachment);
+			/* The chip is a rectangle; the identity of the reference it shows is added, so a test can
+			 * match a chip to the tray entry without guessing which chip belongs to which object. */
+			entry["type"] = attachment.type;
+			if (attachment.id >= 0) entry["id"] = attachment.id;
+			if (attachment.generation >= 0) entry["generation"] = attachment.generation;
+			if (attachment.tile != INVALID_TILE) entry["tile"] = Json{{"x", TileX(attachment.tile)}, {"y", TileY(attachment.tile)}};
+			entry["stale"] = IsAttachmentStale(attachment);
 			entry["rect"] = RectToJson(ToScreenRect(*w, chips[i]));
 			entry["remove_rect"] = RectToJson(ToScreenRect(*w, Rect{chips[i].right - remove_width, chips[i].top, chips[i].right, chips[i].bottom}));
 			tray_rows.push_back(std::move(entry));
