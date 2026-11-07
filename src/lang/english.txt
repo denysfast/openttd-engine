@@ -6369,12 +6369,12 @@ STR_AGENT_CHAT_ROLE_USER                                        :You
 STR_AGENT_CHAT_ROLE_ASSISTANT                                   :Agent
 STR_AGENT_CHAT_ROLE_SYSTEM                                      :System
 STR_AGENT_CHAT_ROLE_TOOL                                        :Tool
-STR_AGENT_CHAT_MESSAGE_STATUS                                   : ({STRING})
+STR_AGENT_CHAT_MESSAGE_STATUS                                   : ({RAW_STRING})
 STR_AGENT_CHAT_ATTACHMENT_POINT                                 :Point {NUM}, {NUM}
 STR_AGENT_CHAT_ATTACHMENT_TILE                                  :Tile {NUM}, {NUM}
-STR_AGENT_CHAT_ATTACHMENT_OBJECT                                :{STRING} {NUM}
-STR_AGENT_CHAT_ATTACHMENT_STALE                                 :{STRING} (stale)
-STR_AGENT_CHAT_ATTACHMENT_UNVERIFIED                            :{STRING} (unverified)
+STR_AGENT_CHAT_ATTACHMENT_OBJECT                                :{RAW_STRING} {NUM}
+STR_AGENT_CHAT_ATTACHMENT_STALE                                 :{RAW_STRING} (stale)
+STR_AGENT_CHAT_ATTACHMENT_UNVERIFIED                            :{RAW_STRING} (unverified)
 STR_AGENT_CHAT_TYPE_POINT                                       :Point
 STR_AGENT_CHAT_TYPE_TILE                                        :Tile
 STR_AGENT_CHAT_TYPE_TOWN                                        :Town
@@ -6386,12 +6386,14 @@ STR_AGENT_CHAT_TYPE_COMPANY                                     :Company
 STR_AGENT_CHAT_TYPE_UNKNOWN                                     :Object
 STR_AGENT_CHAT_STATUS_IDLE                                      :{GRAY}Agent: idle
 STR_AGENT_CHAT_STATUS_THINKING                                  :{GRAY}Agent: thinking...
-STR_AGENT_CHAT_STATUS_TOOL                                      :{GRAY}Agent: {STRING}
+STR_AGENT_CHAT_STATUS_TOOL                                      :{GRAY}Agent: {RAW_STRING}
 STR_AGENT_CHAT_STATUS_DONE                                      :{GRAY}Agent: done
 STR_AGENT_CHAT_STATUS_FAILED                                    :{RED}Agent: failed
 STR_AGENT_CHAT_STATUS_STOPPED                                   :{GRAY}Agent: stopped
+STR_AGENT_CHAT_STATUS_SETTLING                                  :{GRAY}Agent: finishing...
+STR_AGENT_CHAT_STATUS_STOPPING                                  :{GRAY}Agent: stopping...
 STR_AGENT_CHAT_STATUS_UNAVAILABLE                               :{RED}Agent: unavailable
-STR_AGENT_CHAT_STATUS_WINDOW                                    :{STRING} - {STRING}
+STR_AGENT_CHAT_STATUS_WINDOW                                    :{RAW_STRING} - {RAW_STRING}
 STR_AGENT_CHAT_STATUS_TOOLTIP                                   :Open the agent chat window
-STR_AGENT_CHAT_ERROR                                            :{RED}Error: {STRING}
+STR_AGENT_CHAT_ERROR                                            :{RED}Error: {RAW_STRING}
 STR_AGENT_CHAT_ERROR_UNKNOWN                                    :request failed

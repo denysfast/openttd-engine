@@ -6630,12 +6630,12 @@ STR_AGENT_CHAT_ROLE_USER                                        :Вы
 STR_AGENT_CHAT_ROLE_ASSISTANT                                   :Агент
 STR_AGENT_CHAT_ROLE_SYSTEM                                      :Система
 STR_AGENT_CHAT_ROLE_TOOL                                        :Инструмент
-STR_AGENT_CHAT_MESSAGE_STATUS                                   : ({STRING})
+STR_AGENT_CHAT_MESSAGE_STATUS                                   : ({RAW_STRING})
 STR_AGENT_CHAT_ATTACHMENT_POINT                                 :Точка {NUM}, {NUM}
 STR_AGENT_CHAT_ATTACHMENT_TILE                                  :Тайл {NUM}, {NUM}
-STR_AGENT_CHAT_ATTACHMENT_OBJECT                                :{STRING} {NUM}
-STR_AGENT_CHAT_ATTACHMENT_STALE                                 :{STRING} (устарело)
-STR_AGENT_CHAT_ATTACHMENT_UNVERIFIED                            :{STRING} (не проверено)
+STR_AGENT_CHAT_ATTACHMENT_OBJECT                                :{RAW_STRING} {NUM}
+STR_AGENT_CHAT_ATTACHMENT_STALE                                 :{RAW_STRING} (устарело)
+STR_AGENT_CHAT_ATTACHMENT_UNVERIFIED                            :{RAW_STRING} (не проверено)
 STR_AGENT_CHAT_TYPE_POINT                                       :Точка
 STR_AGENT_CHAT_TYPE_TILE                                        :Тайл
 STR_AGENT_CHAT_TYPE_TOWN                                        :Город
@@ -6647,12 +6647,14 @@ STR_AGENT_CHAT_TYPE_COMPANY                                     :Компани�
 STR_AGENT_CHAT_TYPE_UNKNOWN                                     :Объект
 STR_AGENT_CHAT_STATUS_IDLE                                      :{GRAY}Агент: свободен
 STR_AGENT_CHAT_STATUS_THINKING                                  :{GRAY}Агент: думает...
-STR_AGENT_CHAT_STATUS_TOOL                                      :{GRAY}Агент: {STRING}
+STR_AGENT_CHAT_STATUS_TOOL                                      :{GRAY}Агент: {RAW_STRING}
 STR_AGENT_CHAT_STATUS_DONE                                      :{GRAY}Агент: готово
 STR_AGENT_CHAT_STATUS_FAILED                                    :{RED}Агент: ошибка
 STR_AGENT_CHAT_STATUS_STOPPED                                   :{GRAY}Агент: остановлен
+STR_AGENT_CHAT_STATUS_SETTLING                                  :{GRAY}Агент: завершает...
+STR_AGENT_CHAT_STATUS_STOPPING                                  :{GRAY}Агент: останавливается...
 STR_AGENT_CHAT_STATUS_UNAVAILABLE                               :{RED}Агент: недоступен
-STR_AGENT_CHAT_STATUS_WINDOW                                    :{STRING} - {STRING}
+STR_AGENT_CHAT_STATUS_WINDOW                                    :{RAW_STRING} - {RAW_STRING}
 STR_AGENT_CHAT_STATUS_TOOLTIP                                   :Открыть окно чата с агентом
-STR_AGENT_CHAT_ERROR                                            :{RED}Ошибка: {STRING}
+STR_AGENT_CHAT_ERROR                                            :{RED}Ошибка: {RAW_STRING}
 STR_AGENT_CHAT_ERROR_UNKNOWN                                    :запрос не выполнен
