@@ -21,6 +21,7 @@
 #include <optional>
 #include <string_view>
 
+class Engine;
 struct Order;
 struct Vehicle;
 
@@ -151,6 +152,30 @@ void AgentCloneVehicleCallback(Commands cmd, const CommandCost &result, VehicleI
  * @return The three fields.
  */
 Json VehicleRoadTypeFieldsForTest(const Vehicle *v);
+
+/**
+ * The name the game itself shows for an engine.
+ *
+ * The engine's own custom name only replaces the display name while the engine is enabled, so the
+ * purchase list, the vehicle details and the autoreplace window all resolve the name through
+ * `STR_ENGINE_NAME`. A tool that reported `Engine::name` reported an empty name for every engine
+ * nobody renamed.
+ *
+ * @param e The engine.
+ * @return The display name.
+ */
+std::string EngineDisplayName(const Engine *e);
+
+/**
+ * The engine name fields of a vehicle row, for the tests.
+ *
+ * The fields are exactly the ones VehicleRow adds: `engine_name` (the engine's display name) and
+ * `engine_custom_name` (the player's override, null when there is none).
+ *
+ * @param v The vehicle.
+ * @return The two fields.
+ */
+Json VehicleEngineNameFieldsForTest(const Vehicle *v);
 
 /**
  * Build one order from the tool's order object, for the tests.

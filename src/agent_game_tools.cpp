@@ -1002,6 +1002,23 @@ void AddRoadTypeFields(Json &row, const Vehicle *v)
 }
 
 /**
+ * Add the engine name fields of a vehicle row.
+ *
+ * `engine_name` is the name the game shows for the engine, so a vehicle of an engine nobody renamed
+ * reports its real name instead of an empty string; `engine_custom_name` is the player's override
+ * on its own, null when there is none.
+ *
+ * @param row The vehicle row being built.
+ * @param v The vehicle.
+ */
+void AddVehicleEngineNameFields(Json &row, const Vehicle *v)
+{
+	const Engine *engine = Engine::GetIfValid(v->engine_type);
+	row["engine_name"] = engine != nullptr ? Json(EngineDisplayName(engine)) : Json(nullptr);
+	row["engine_custom_name"] = engine != nullptr && !engine->name.empty() ? Json(engine->name) : Json(nullptr);
+}
+
+/**
  * Serialise one vehicle.
  * @param v The vehicle.
  * @return JSON row with the current state of the vehicle.
@@ -1019,7 +1036,7 @@ Json VehicleRow(const Vehicle *v)
 	row["engine_id"] = v->engine_type.base();
 	const Engine *engine = Engine::GetIfValid(v->engine_type);
 	if (engine != nullptr) row["engine_ref"] = PoolRef("engine", engine);
-	row["engine_name"] = engine != nullptr ? Json(engine->name) : Json(nullptr);
+	AddVehicleEngineNameFields(row, v);
 	row["tile"] = TileJson(v->tile);
 	row["status"] = std::string(VehicleStatusName(v));
 	row["stopped"] = v->vehstatus.Test(VehState::Stopped);
@@ -1075,7 +1092,8 @@ Json EngineRow(const Engine *e, CompanyID company)
 	row["ref"] = PoolRef("engine", e);
 	row["id"] = e->index.base();
 	row["type"] = std::string(VehicleTypeName(e->type));
-	row["name"] = e->name;
+	row["name"] = EngineDisplayName(e);
+	row["custom_name"] = e->name.empty() ? Json(nullptr) : Json(e->name);
 	row["cost"] = static_cast<int64_t>(e->GetCost());
 	row["running_cost"] = static_cast<int64_t>(e->GetRunningCost());
 	row["max_speed"] = e->GetDisplayMaxSpeed();
@@ -1420,7 +1438,7 @@ Json QueryEngines(const Json &params, CompanyID company)
 		if (filters.vehicle_type.has_value() && e->type != *filters.vehicle_type) continue;
 		if (filters.engine_id != EngineID::Invalid() && e->index != filters.engine_id) continue;
 		if (IsValidCargoType(filters.cargo) && e->GetDefaultCargoType() != filters.cargo && !e->info.refit_mask.Test(filters.cargo)) continue;
-		if (!filters.name_contains.empty() && e->name.find(filters.name_contains) == std::string::npos) continue;
+		if (!filters.name_contains.empty() && EngineDisplayName(e).find(filters.name_contains) == std::string::npos) continue;
 		if (filters.refittable.has_value() && e->info.refit_mask.Any() != *filters.refittable) continue;
 		if (total++ < offset) continue;
 		if (static_cast<int64_t>(rows.size()) >= limit) continue;
@@ -2989,10 +3007,34 @@ Json Capability(std::string_view method, std::string_view authority, std::initia
 
 } // namespace
 
+/**
+ * The name the game itself shows for an engine.
+ *
+ * `Engine::name` only holds the player's custom name, so it is empty for every engine nobody
+ * renamed. The engine resolves its display name through `STR_ENGINE_NAME`: the custom name while the
+ * engine is enabled, otherwise the NewGRF or default name. The build vehicle window, the vehicle
+ * details and the autoreplace window all show that name, so the tool reports it too instead of the
+ * raw field.
+ *
+ * @param e The engine.
+ * @return The display name.
+ */
+std::string EngineDisplayName(const Engine *e)
+{
+	return GetString(STR_ENGINE_NAME, PackEngineNameDParam(e->index, EngineNameContext::PurchaseList));
+}
+
 Json VehicleRoadTypeFieldsForTest(const Vehicle *v)
 {
 	Json row = Json::object();
 	AddRoadTypeFields(row, v);
+	return row;
+}
+
+Json VehicleEngineNameFieldsForTest(const Vehicle *v)
+{
+	Json row = Json::object();
+	AddVehicleEngineNameFields(row, v);
 	return row;
 }
 

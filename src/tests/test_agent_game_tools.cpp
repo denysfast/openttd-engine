@@ -22,7 +22,10 @@
 #include "../aircraft.h"
 #include "../cargotype.h"
 #include "../company_base.h"
+#include "../engine_base.h"
 #include "../order_base.h"
+#include "../settings_type.h"
+#include "../table/strings.h"
 #include "../road.h"
 #include "../roadveh.h"
 #include "../train.h"
@@ -897,6 +900,29 @@ public:
 	RoadVehicle *road = nullptr; ///< The road vehicle the fixture created.
 };
 
+/**
+ * One real engine in the engine's own pool, removed again when the fixture goes out of scope.
+ *
+ * The engine is created through the pool's own `CreateAtIndex`, the path the engine itself uses when
+ * it sets up the default engines, so its id and lifetime generation are the engine's own. Removal
+ * uses the pool's `CleanPool`, which needs no running game. Every check that can fail runs before
+ * the allocation, so a failed `REQUIRE` never leaves an engine behind.
+ */
+class TestEngines {
+public:
+	TestEngines()
+	{
+		REQUIRE(Engine::GetNumItems() == 0);
+		REQUIRE(Engine::CanAllocateItem());
+		this->engine = Engine::CreateAtIndex(EngineID(0), VehicleType::Road, 0);
+		REQUIRE(this->engine != nullptr);
+	}
+
+	~TestEngines() { _engine_pool.CleanPool(); }
+
+	Engine *engine = nullptr; ///< The engine the fixture created.
+};
+
 } // namespace
 
 TEST_CASE("agent_game_tools: a vehicle row reports the engine's own raw wait counters")
@@ -1035,4 +1061,90 @@ TEST_CASE("agent_game_tools: a station order with unusable parameters is still r
 	CHECK(ReadOrderForTest(Json{{"type", "station"}, {"id", 0}, {"unload", "bogus"}}, order).has_value());
 	CHECK(ReadOrderForTest(Json{{"type", "station"}, {"id", 0}, {"refit_cargo_id", static_cast<int64_t>(NUM_CARGO)}}, order).has_value());
 	CHECK(ReadOrderForTest(Json{{"type", "platform"}, {"id", 0}}, order).has_value());
+}
+
+TEST_CASE("agent_game_tools: an engine row reports the name the game shows")
+{
+	TestEngines engines;
+	Engine *e = engines.engine;
+	e->info.string_id = STR_SV_EMPTY;
+	/* The engine's own rule: the custom name is shown only while the engine is enabled. */
+	e->info.climates.Set(_settings_game.game_creation.landscape);
+	e->name = "Renamed Bus";
+	REQUIRE(e->IsEnabled());
+
+	/* A renamed engine: the row reports the name the game shows, and the override on its own. */
+	const std::optional<Json> renamed = DispatchGameTool("world.query", {{"kind", "engines"}}, CompanyID::Invalid());
+	REQUIRE(renamed.has_value());
+	REQUIRE((*renamed)["ok"] == true);
+	REQUIRE((*renamed)["total"] == 1);
+	const Json &row = (*renamed)["rows"].front();
+	CHECK(row["name"] == "Renamed Bus");
+	CHECK(row["custom_name"] == "Renamed Bus");
+	CHECK(row["name"] == EngineDisplayName(e));
+
+	/* The other fields of the row are untouched. */
+	CHECK(row["id"] == 0);
+	CHECK(row["type"] == "road");
+	CHECK(row["cost"] == 0);
+	CHECK(row["refittable"] == false);
+	CHECK(row["enabled"] == true);
+	CHECK_FALSE(row.contains("available"));
+
+	/* The text filter reads the same name the row reports. */
+	const std::optional<Json> filtered = DispatchGameTool("world.query", {{"kind", "engines"}, {"filters", {{"name_contains", "Renamed"}}}}, CompanyID::Invalid());
+	REQUIRE(filtered.has_value());
+	CHECK((*filtered)["total"] == 1);
+	const std::optional<Json> missing = DispatchGameTool("world.query", {{"kind", "engines"}, {"filters", {{"name_contains", "No Such Engine"}}}}, CompanyID::Invalid());
+	REQUIRE(missing.has_value());
+	CHECK((*missing)["total"] == 0);
+
+	/* Without an override the row still reports the display name the engine resolves to. The default
+	 * name comes from the language pack, which only a running game loads, so it is compared with the
+	 * engine's own resolution instead of an invented label. */
+	e->name.clear();
+	const std::optional<Json> plain = DispatchGameTool("world.query", {{"kind", "engines"}}, CompanyID::Invalid());
+	REQUIRE(plain.has_value());
+	REQUIRE((*plain)["total"] == 1);
+	CHECK((*plain)["rows"].front()["custom_name"].is_null());
+	CHECK((*plain)["rows"].front()["name"] == EngineDisplayName(e));
+
+	/* A disabled engine does not show its override: the row follows the engine's resolution instead of
+	 * reporting the raw field, which is what the tool used to do. */
+	e->name = "Renamed Bus";
+	e->info.climates = LandscapeTypes{};
+	REQUIRE_FALSE(e->IsEnabled());
+	const std::optional<Json> disabled = DispatchGameTool("world.query", {{"kind", "engines"}}, CompanyID::Invalid());
+	REQUIRE(disabled.has_value());
+	REQUIRE((*disabled)["total"] == 1);
+	const Json &disabled_row = (*disabled)["rows"].front();
+	CHECK(disabled_row["custom_name"] == "Renamed Bus");
+	CHECK(disabled_row["name"] == EngineDisplayName(e));
+	CHECK(disabled_row["name"] != "Renamed Bus");
+}
+
+TEST_CASE("agent_game_tools: a vehicle row reports the engine's display name")
+{
+	TestEngines engines;
+	Engine *e = engines.engine;
+	e->info.string_id = STR_SV_EMPTY;
+	e->info.climates.Set(_settings_game.game_creation.landscape);
+	e->name = "Renamed Bus";
+	REQUIRE(e->IsEnabled());
+
+	/* The company is declared first, so the vehicles are removed before it. */
+	TestCompanyGuard company;
+	TestVehicles vehicles;
+	vehicles.road->owner = company.Id();
+	vehicles.road->engine_type = e->index;
+
+	const Json named = VehicleEngineNameFieldsForTest(vehicles.road);
+	CHECK(named["engine_name"] == "Renamed Bus");
+	CHECK(named["engine_custom_name"] == "Renamed Bus");
+
+	/* Without an override the field still carries the engine's display name, not an empty string. */
+	e->name.clear();
+	const Json plain = VehicleEngineNameFieldsForTest(vehicles.road);
+	CHECK(plain["engine_name"] == EngineDisplayName(e));
+	CHECK(plain["engine_custom_name"].is_null());
 }
