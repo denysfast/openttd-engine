@@ -14,6 +14,7 @@
 
 #include "company_base.h"
 #include "company_func.h"
+#include "console_func.h"
 #include "core/backup_type.hpp"
 #include "core/enum_type.hpp"
 #include "core/geometry_func.hpp"
@@ -1971,6 +1972,11 @@ struct AgentChatWindow : Window {
 		const bool focused = _focused_window == this;
 		const uint16_t base = keycode & ~WKC_SPECIAL_KEYS;
 
+		/* The console key is a global hotkey, offered only after every window had its turn; taking it
+		 * here would type it into the message and the console would never open. It keeps the same
+		 * priority as Escape, so it is never eaten as text even while this window is not focused. */
+		if (base == WKC_BACKQUOTE) return EventState::NotHandled;
+
 		if (base == WKC_ESC) {
 			if (_agent_chat.candidates_open) {
 				_agent_chat.candidates_open = false;
@@ -2055,6 +2061,11 @@ struct AgentChatWindow : Window {
 	 * Everything the keyboard layout produces arrives here: plain characters, characters that need
 	 * a composition step (Cyrillic with a dead key, accented input) and the preedit of an IME. The
 	 * message box is its own multiline buffer rather than a Textbuf, so the insertion happens here.
+	 *
+	 * The console key is passed on to the key handler instead of being inserted: a backend that
+	 * delivers text input (SDL, Cocoa) does not send a key press for it while an edit box has the
+	 * text focus, so the global console hotkey would never see it. The key handler offers it to
+	 * every window, this one included, which answers NotHandled for it.
 	 * @param wid The widget the text is for.
 	 * @param str The text to insert, UTF-8 encoded.
 	 * @param marked Whether the text is IME text that is still being composed.
@@ -2063,6 +2074,13 @@ struct AgentChatWindow : Window {
 	{
 		if (wid != WID_AC_INPUT) {
 			Window::InsertTextString(wid, str, marked, caret, insert_location, replacement_end);
+			return;
+		}
+
+		/* The console key belongs to the global hotkey, not to the message. A composition is left
+		 * alone, so an IME preedit is never dropped by it. */
+		if (!marked && str == "`") {
+			HandleKeypress(WKC_BACKQUOTE, U'`');
 			return;
 		}
 
@@ -2486,6 +2504,8 @@ nlohmann::json DescribeAgentChatUi()
 	out["input"] = _agent_chat.input;
 	out["error"] = _agent_chat.error;
 	out["candidates_open"] = _agent_chat.candidates_open;
+	/* The real console mode, so a read-only check can see whether the console key worked. */
+	out["console_open"] = _iconsole_mode != IConsoleMode::Closed;
 	out["picking_point"] = _agent_chat.picking_point;
 	out["picking_object"] = _agent_chat.picking_object;
 
