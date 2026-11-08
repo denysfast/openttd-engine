@@ -1172,14 +1172,18 @@ static void AgentChatLoadMessages(const std::string &chat_id)
 		 * clamped by the scrollbar, so the window has to re-run its layout for it to take effect. */
 		if (merged.changed) {
 			_agent_chat.scroll = INT32_MAX;
-			if (merged.inserted_before) {
-				/* A message that went in before cached ones moves their transcript indices, so
-				 * the selection would point at other text and is dropped. */
-				_agent_chat.selection.Clear();
-			} else {
-				/* An ordinary answer only appends, so the selection stays on its own text; a
-				 * reloaded message may be shorter than the one it was made in. */
-				_agent_chat.selection.Clamp(TranscriptTexts(chat));
+			/* The selection belongs to the transcript that is shown, so an answer for another chat
+			 * must not touch it, however that transcript changed. */
+			if (_agent_chat.selection.ChatId() == chat_id) {
+				if (merged.inserted_before) {
+					/* A message that went in before cached ones moves their transcript indices, so
+					 * the selection would point at other text and is dropped. */
+					_agent_chat.selection.Clear();
+				} else {
+					/* An ordinary answer only appends, so the selection stays on its own text; a
+					 * reloaded message may be shorter than the one it was made in. */
+					_agent_chat.selection.Clamp(TranscriptTexts(chat));
+				}
 			}
 			InvalidateWindowClassesData(WindowClass::AgentChat);
 		}

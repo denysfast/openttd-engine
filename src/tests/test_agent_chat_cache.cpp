@@ -24,6 +24,8 @@
 
 #include "../agent_chat_cache.h"
 
+#include "../3rdparty/fmt/format.h"
+
 #include <algorithm>
 #include <cstdint>
 #include <string>
@@ -53,7 +55,7 @@ struct TestChat {
 /** A message of the given sequence number, with a text that names it. */
 TestMessage Msg(int64_t seq)
 {
-	return TestMessage{seq, "m" + std::to_string(seq)};
+	return TestMessage{seq, fmt::format("m{}", seq)};
 }
 
 /** A batch of messages with the given sequence numbers, in that order. */
@@ -92,7 +94,7 @@ std::string Seqs(const TestChat &chat)
 	std::string seqs;
 	for (const TestMessage &message : chat.messages) {
 		if (!seqs.empty()) seqs.push_back(' ');
-		seqs += std::to_string(message.seq);
+		seqs += fmt::format("{}", message.seq);
 	}
 	return seqs;
 }
