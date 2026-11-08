@@ -944,7 +944,13 @@ static Json OccludingWindowJson(int x, int y)
 
 	/* Name the window when its class is one a caller can recognise, so it does not have to know
 	 * the numeric value of a window class. */
-	if (w->window_class == WindowClass::Finances) occluding["kind"] = "finances";
+	switch (w->window_class) {
+		case WindowClass::Finances: occluding["kind"] = "finances"; break;
+		case WindowClass::News: occluding["kind"] = "news"; break;
+		case WindowClass::AgentChat: occluding["kind"] = "agent_chat"; break;
+		case WindowClass::AgentChatSettings: occluding["kind"] = "agent_chat_settings"; break;
+		default: break;
+	}
 
 	/* The close box of the window that is actually on screen, in the same screen coordinates as
 	 * the rest of the projection. It is read from the widget tree; no offset is guessed. */
@@ -962,6 +968,11 @@ static Json OccludingWindowJson(int x, int y)
 	}
 
 	return occluding;
+}
+
+Json DescribeWindowAtPoint(int x, int y)
+{
+	return OccludingWindowJson(x, y);
 }
 
 /**

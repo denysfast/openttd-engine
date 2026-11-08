@@ -11,6 +11,7 @@
 
 #include "agent_chat_gui.h"
 #include "agent_bridge.h"
+#include "agent_capture.h"
 #include "agent_chat_cache.h"
 #include "agent_chat_image.h"
 #include "agent_chat_selection.h"
@@ -4225,6 +4226,22 @@ nlohmann::json DescribeAgentChatUi()
 		const NWidgetBase *closebox = w->nested_root->GetWidgetOfType(WWT_CLOSEBOX);
 		if (closebox != nullptr) widgets["closebox"] = RectToJson(ToScreenRect(*w, closebox->GetCurrentRect()));
 		out["widgets"] = std::move(widgets);
+
+		/* Where a click on the message input really lands: the centre of the same input rectangle
+		 * this object exports, in screen pixels, and what covers that pixel right now. The covering
+		 * window is the shared read-only description of the capture, so a caller can recognise a
+		 * window that hides the input - and the close box it really has - without a second read.
+		 * The input is a valid target only when this very window is on top at that pixel. */
+		const Rect input = ToScreenRect(*w, w->GetWidget<NWidgetBase>(WID_AC_INPUT)->GetCurrentRect());
+		const int input_x = (input.left + input.right) / 2;
+		const int input_y = (input.top + input.bottom) / 2;
+		const bool input_visible = FindWindowFromPt(input_x, input_y) == w;
+		out["input_target"] = Json{
+			{"coordinate_space", "screen_pixels"},
+			{"point", {{"x", input_x}, {"y", input_y}}},
+			{"visible", input_visible},
+			{"occluding_window", input_visible ? Json(nullptr) : InGameAgent::DescribeWindowAtPoint(input_x, input_y)},
+		};
 
 		/* The actual enabled state of the action widgets: a read-only check can see whether a
 		 * click would be accepted instead of guessing it from the connection flag. */
