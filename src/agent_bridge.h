@@ -132,11 +132,13 @@ Json PickObjects(TileIndex tile);
  * `object_generation` (the pooled object behind the tile). Only the requested tile is read, so a
  * call is bounded and never scans the map.
  *
- * The fingerprint is FNV-1a over the values the engine stores for the object (tile type and
- * height, the recorded owner, both halves of every 64 bit pool lifetime, plus the subtype specific
- * fields listed at the implementation), not over the bytes of the map array and not over an
- * address, so it is stable across runs for the same state. Signal states change with passing
- * traffic, so a signal reference can go stale without anyone building anything.
+ * The fingerprint is FNV-1a over the values the engine stores for the object (tile type, the height
+ * of the north corner and the slope of the tile, the recorded owner, both halves of every 64 bit
+ * pool lifetime, plus the subtype specific fields listed at the implementation), not over the bytes
+ * of the map array and not over an address, so it is stable across runs for the same state. Signal
+ * states change with passing traffic, so a signal reference can go stale without anyone building
+ * anything. A road and a tram on one tile are one cell, so both rows carry the fingerprint of the
+ * whole cell and either of them goes stale when either family changes.
  * @param tile The tile to describe.
  * @return Array of typed tile object rows.
  */

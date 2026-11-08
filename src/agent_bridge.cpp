@@ -976,24 +976,86 @@ Owner TileObjectOwner(TileIndex tile, TileObjectKind kind)
 }
 
 /**
+ * Mix the state of the road tile a road object or a tram object stands on.
+ *
+ * A road and a tram on one tile share one cell: the road bits, the tram bits, the road type, the
+ * tram type, the owner of each family and the one-way state of the road are stored in the same map
+ * array, and a whole-cell write — a demolition, a rebuild — replaces all of them at once. A guard
+ * that mixed only its own family would stay current while the other family was added, changed or
+ * removed on that tile, so both families are mixed here, present or absent, and the road and the
+ * tram row of one tile carry the same fingerprint.
+ *
+ * The geometry is read through the subtype-safe `GetAnyRoadBits()`: `GetRoadBits()` asserts a normal
+ * road, and a depot stores the direction of its exit where a normal road stores its pieces. The
+ * one-way state exists on a normal road only, so it is read behind `IsNormalRoad()`; a depot and a
+ * level crossing store other values in those bits. A level crossing carries rail in the same cell,
+ * so its rail type and track are mixed in as well. A road depot is a pooled object, so its pool
+ * lifetime is mixed in too.
+ * @param hash The fingerprint so far.
+ * @param tile The road tile.
+ * @pre IsTileType(tile, TileType::Road).
+ */
+void MixRoadTileFingerprint(uint32_t &hash, TileIndex tile)
+{
+	/* The subtype says how the geometry is stored, and the same bits mean something else on a normal
+	 * road, a level crossing and a depot. */
+	MixFingerprint(hash, to_underlying(GetRoadTileType(tile)));
+	MixFingerprint(hash, to_underlying(GetRoadType(tile, RoadTramType::Road)));
+	MixFingerprint(hash, to_underlying(GetRoadType(tile, RoadTramType::Tram)));
+	MixFingerprint(hash, GetRoadOwner(tile, RoadTramType::Road).base());
+	MixFingerprint(hash, GetRoadOwner(tile, RoadTramType::Tram).base());
+	MixFingerprint(hash, GetAnyRoadBits(tile, RoadTramType::Road).base());
+	MixFingerprint(hash, GetAnyRoadBits(tile, RoadTramType::Tram).base());
+
+	/* A one-way road is a normal road: on a depot or a level crossing these bits are no direction. */
+	if (IsNormalRoad(tile)) MixFingerprint(hash, GetDisallowedRoadDirections(tile).base());
+
+	/* A level crossing carries rail in the same cell: its rail type is stored on the tile, and the
+	 * track it carries follows the road axis, so both are part of the state a demolition removes. */
+	if (IsLevelCrossing(tile)) {
+		MixFingerprint(hash, to_underlying(GetRailType(tile)));
+		MixFingerprint(hash, to_underlying(GetCrossingRailTrack(tile)));
+	}
+
+	/* A road depot is a pooled object as well: a rebuilt depot is not the one the caller saw. */
+	if (IsRoadDepotTile(tile)) {
+		const Depot *depot = Depot::GetByTile(tile);
+		MixFingerprint64(hash, depot == nullptr ? 0 : depot->generation);
+	}
+}
+
+/**
  * Compute the state fingerprint of a typed tile object.
  *
  * Only the native values that identify the object and its state are mixed in, per category:
- * - every category: the tile type and the tile height;
+ * - every category: the tile type, the height of the north corner and the slope of the tile. The
+ *   height is the north corner only, and the other three corners are the north corners of the
+ *   neighbouring tiles, so the height alone misses an object drawn on a different slope: both are
+ *   mixed for every category, and the engine's own `GetTileSlope()` clamps at the map edge;
  * - every category the engine records an owner for: that owner (road and tram use the owner of
  *   their own transport type, water and map objects the tile owner), because an ownership change
  *   is part of the precondition a caller observed;
- * - terrain: clear ground, clear density and slope;
+ * - terrain: clear ground and clear density;
  * - water: water tile type and water class (the coast, canal and river flags are part of it);
- * - tree: ground, density and tree type;
+ * - tree: ground, density, tree type and the tree count. The density is not a count: planting
+ *   another tree of the same type on the tile only moves `GetTreeCount()`, so the count is part of
+ *   the state. The growth stage is left out, because it advances with the growth counter on its own
+ *   and would make a reference stale while nobody touched the tile;
  * - rail: rail tile type, rail type and, for plain rail, the track bits;
  * - signal: the signal variant of every track, the present signals and the signal states (traffic
  *   can change these, so a signal reference may go stale without anyone building anything);
- * - road and tram: the road type, the subtype of the road tile and the road bits of that tram
- *   type. The bits are read through the subtype-safe `GetAnyRoadBits()`, because a road depot
- *   and a level crossing store their geometry where a normal road does not: on a depot the bits
- *   are the direction of its exit. A depot is a pooled object as well, so its pool lifetime is
- *   mixed in, and a rebuilt depot on the same tile is not the depot the caller looked at;
+ * - road and tram: the whole cell the two families share — the subtype of the road tile, the road
+ *   type, the tram type, the owner of each family, the road bits and the tram bits, each present or
+ *   absent, plus the one-way state of a normal road. A road and a tram on one tile are one cell, and
+ *   a whole-cell write (a demolition, a rebuild) replaces both families at once, so both guards mix
+ *   the state of both families and the two rows of one tile carry the same fingerprint; they differ
+ *   in `type` and `owner`. The geometry is read through the subtype-safe `GetAnyRoadBits()`, because
+ *   `GetRoadBits()` asserts a normal road and a road depot and a level crossing store their geometry
+ *   where a normal road does not: on a depot the bits are the direction of its exit. The one-way
+ *   state exists on a normal road only, so it is read behind `IsNormalRoad()`. A level crossing
+ *   carries rail in the same cell, so its rail type and track are mixed in as well. A depot is a
+ *   pooled object, so its pool lifetime is mixed in, and a rebuilt depot on the same tile is not the
+ *   depot the caller looked at;
  * - bridge and tunnel: transport type and direction, plus the bridge type for a bridge;
  * - mapobject: the object type, the pooled object id and the full 64 bit generation of that
  *   object, so replacing an object with one of the same type is a different identity;
@@ -1010,6 +1072,10 @@ uint32_t TileObjectFingerprint(TileObjectKind kind, TileIndex tile)
 	uint32_t hash = FINGERPRINT_SEED;
 	MixFingerprint(hash, to_underlying(GetTileType(tile)));
 	MixFingerprint(hash, TileHeight(tile));
+	/* TileHeight() is the north corner only: the other three corners are the north corners of the
+	 * neighbouring tiles, so a slope change elsewhere on the tile leaves the height alone while the
+	 * object is drawn on another slope. GetTileSlope() clamps at the map edge, so it is safe here. */
+	MixFingerprint(hash, to_underlying(GetTileSlope(tile)));
 
 	/* Ownership is part of the observed precondition, not only the type, height and bits. */
 	switch (kind) {
@@ -1023,14 +1089,10 @@ uint32_t TileObjectFingerprint(TileObjectKind kind, TileIndex tile)
 			break;
 
 		case TileObjectKind::Road:
-			/* The road and the tram on one tile can belong to different companies. */
-			MixFingerprint(hash, GetTileOwner(tile).base());
-			MixFingerprint(hash, GetRoadOwner(tile, RoadTramType::Road).base());
-			break;
-
 		case TileObjectKind::Tram:
+			/* The road and the tram on one tile can belong to different companies: the owner of each
+			 * family is mixed with the rest of the shared cell in the road case below. */
 			MixFingerprint(hash, GetTileOwner(tile).base());
-			MixFingerprint(hash, GetRoadOwner(tile, RoadTramType::Tram).base());
 			break;
 
 		default:
@@ -1042,7 +1104,6 @@ uint32_t TileObjectFingerprint(TileObjectKind kind, TileIndex tile)
 		case TileObjectKind::Terrain:
 			MixFingerprint(hash, to_underlying(GetClearGround(tile)));
 			MixFingerprint(hash, GetClearDensity(tile));
-			MixFingerprint(hash, to_underlying(GetTileSlope(tile)));
 			break;
 
 		case TileObjectKind::Water:
@@ -1054,6 +1115,9 @@ uint32_t TileObjectFingerprint(TileObjectKind kind, TileIndex tile)
 			MixFingerprint(hash, to_underlying(GetTreeGround(tile)));
 			MixFingerprint(hash, GetTreeDensity(tile));
 			MixFingerprint(hash, to_underlying(GetTreeType(tile)));
+			/* The density is not a count: another tree of the same type only moves GetTreeCount().
+			 * The growth stage stays out: it advances with the growth counter on its own. */
+			MixFingerprint(hash, GetTreeCount(tile));
 			break;
 
 		case TileObjectKind::Rail: {
@@ -1073,21 +1137,10 @@ uint32_t TileObjectFingerprint(TileObjectKind kind, TileIndex tile)
 			break;
 
 		case TileObjectKind::Road:
-		case TileObjectKind::Tram: {
-			const RoadTramType tram_type = kind == TileObjectKind::Tram ? RoadTramType::Tram : RoadTramType::Road;
-			MixFingerprint(hash, to_underlying(GetRoadType(tile, tram_type)));
-			/* The subtype says how the geometry is stored, and the same bits mean something else on a
-			 * normal road, a level crossing and a depot. GetRoadBits() asserts a normal road, so the
-			 * bits come from the subtype-safe GetAnyRoadBits(): on a depot they are its exit direction. */
-			if (IsTileType(tile, TileType::Road)) MixFingerprint(hash, to_underlying(GetRoadTileType(tile)));
-			MixFingerprint(hash, GetAnyRoadBits(tile, tram_type).base());
-			/* A road depot is a pooled object as well: a rebuilt depot is not the one the caller saw. */
-			if (IsRoadDepotTile(tile)) {
-				const Depot *depot = Depot::GetByTile(tile);
-				MixFingerprint64(hash, depot == nullptr ? 0 : depot->generation);
-			}
+		case TileObjectKind::Tram:
+			/* A road and a tram on one tile are one cell: both guards mix both families. */
+			MixRoadTileFingerprint(hash, tile);
 			break;
-		}
 
 		case TileObjectKind::Bridge:
 		case TileObjectKind::Tunnel:

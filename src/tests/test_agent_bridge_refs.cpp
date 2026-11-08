@@ -46,7 +46,9 @@
 #include "../company_base.h"
 #include "../settings_internal.h"
 #include "../settings_type.h"
+#include "../signal_func.h"
 #include "../road_map.h"
+#include "../roadveh.h"
 #include "../station_base.h"
 #include "../station_map.h"
 #include "../station_type.h"
@@ -55,6 +57,8 @@
 #include "../town.h"
 #include "../town_map.h"
 #include "../tree_map.h"
+#include "../tunnel_map.h"
+#include "../vehicle_base.h"
 #include "../water_map.h"
 
 #include "../safeguards.h"
@@ -791,6 +795,234 @@ TEST_CASE("Agent bridge refs: the other road subtypes are read by subtype")
 	const TileIndex stop = TileXY(55, 55);
 	MakeDriveThroughRoadStop(stop, Owner{0}, Owner{0}, OWNER_NONE, StationID{0}, StationType::Bus, ROADTYPE_ROAD, INVALID_ROADTYPE, Axis::X);
 	CHECK(DescribeTileObjects(stop).empty());
+}
+
+TEST_CASE("Agent bridge refs: the slope of the tile is part of every tile object")
+{
+	MapFixture map;
+	/* Which road type is a tram type is decided by the masks the engine fills in at game start. */
+	ResetRoadTypes();
+
+	/*
+	 * `TileHeight()` is the north corner of the tile only; the other three corners are the north
+	 * corners of the neighbouring tiles. A landscape change there leaves the height of the tile
+	 * alone and moves the slope the object is drawn on, so every category has to mix the slope as
+	 * well. The fixtures are two tiles apart, so the corner changed for one of them is never a
+	 * corner of another one, and the corner is put back after every check.
+	 */
+	const TileIndex terrain = TileXY(10, 10);
+	const TileIndex water = TileXY(10, 12);
+	const TileIndex tree = TileXY(10, 14);
+	const TileIndex rail = TileXY(10, 16);
+	const TileIndex signal = TileXY(10, 18);
+	const TileIndex road = TileXY(10, 20);
+	const TileIndex bridge = TileXY(10, 22);
+	const TileIndex tunnel = TileXY(10, 24);
+	const TileIndex house = TileXY(10, 26);
+	const TileIndex mapobject = TileXY(10, 28);
+
+	MakeWater(water, OWNER_WATER, WaterClass::Sea, 0);
+	MakeTree(tree, TreeType{0}, 0, TreeGrowthStage::Grown, TreeGround::Grass, 3);
+	MakeRailNormal(rail, Owner{0}, TrackBits{Track::X}, RAILTYPE_RAIL);
+	/* A signal is a rail tile that carries signals; it is the more specific row of that tile. */
+	MakeRailNormal(signal, Owner{0}, TrackBits{Track::X}, RAILTYPE_RAIL);
+	SetHasSignals(signal, true);
+	SetPresentSignals(signal, SignalOnTrack(Track::X));
+	/* A road tile that carries both families: two rows, both of the same shared cell. */
+	MakeRoadNormal(road, ROAD_X, ROADTYPE_ROAD, ROADTYPE_TRAM, TownID::Invalid(), Owner{0}, Owner{1});
+	MakeRailBridgeRamp(bridge, Owner{0}, BridgeType{0}, DiagDirection::NE, RAILTYPE_RAIL);
+	MakeRailTunnel(tunnel, Owner{0}, DiagDirection::NE, RAILTYPE_RAIL);
+	SetTileType(house, TileType::House);
+	SetHouseType(house, 0);
+	REQUIRE(Object::CanAllocateItem());
+	Object *object = Object::Create(ObjectType{0}, nullptr, TileArea(mapobject, 1, 1), TimerGameCalendar::Date{0}, 0);
+	REQUIRE(object != nullptr);
+	MakeObject(mapobject, Owner{0}, object->index, WaterClass::Invalid, 0);
+
+	/* One check per category: the north corner height stays, the slope and the fingerprint move. */
+	const auto slope_is_mixed = [](TileIndex tile, std::string_view type) {
+		const Json before = FindTileObject(tile, type);
+		REQUIRE(!before.empty());
+		const uint height = TileHeight(tile);
+		const auto slope = GetTileSlope(tile);
+		const TileIndex corner = TileXY(TileX(tile) + 1, TileY(tile) + 1);
+		REQUIRE(TileHeight(corner) < MAX_TILE_HEIGHT);
+		SetTileHeight(corner, TileHeight(corner) + 1);
+		CHECK(TileHeight(tile) == height);
+		CHECK(GetTileSlope(tile) != slope);
+		CHECK(FindTileObject(tile, type)["fingerprint"] != before["fingerprint"]);
+		SetTileHeight(corner, TileHeight(corner) - 1);
+	};
+
+	slope_is_mixed(terrain, "terrain");
+	slope_is_mixed(water, "water");
+	slope_is_mixed(tree, "tree");
+	slope_is_mixed(rail, "rail");
+	slope_is_mixed(signal, "signal");
+	slope_is_mixed(road, "road");
+	slope_is_mixed(road, "tram");
+	slope_is_mixed(bridge, "bridge");
+	slope_is_mixed(tunnel, "tunnel");
+	slope_is_mixed(house, "house");
+	slope_is_mixed(mapobject, "mapobject");
+
+	delete object;
+
+	/* The slope is read through the engine's own accessor, which clamps at the map edge: a tile on
+	 * the last row and the corner tile of the map are fingerprinted without reading outside it. */
+	const TileIndex edge = TileXY(63, 30);
+	MakeRoadNormal(edge, ROAD_X, ROADTYPE_ROAD, INVALID_ROADTYPE, TownID::Invalid(), Owner{0}, OWNER_NONE);
+	CHECK(FindTileObject(edge, "road")["fingerprint"].is_number_unsigned());
+	CHECK(FindTileObject(TileXY(63, 63), "terrain")["fingerprint"].is_number_unsigned());
+}
+
+TEST_CASE("Agent bridge refs: a road and a tram on one tile guard the whole cell")
+{
+	MapFixture map;
+	/* Which road type is a tram type is decided by the masks the engine fills in at game start. */
+	ResetRoadTypes();
+	REQUIRE(GetRoadTramType(ROADTYPE_TRAM) == RoadTramType::Tram);
+
+	const TileIndex tile = TileXY(20, 20);
+	MakeRoadNormal(tile, ROAD_X, ROADTYPE_ROAD, INVALID_ROADTYPE, TownID::Invalid(), Owner{0}, OWNER_NONE);
+	const Json road_row = FindTileObject(tile, "road");
+	REQUIRE(!road_row.empty());
+	const Json road_ref = TileRef(road_row);
+	CHECK(ResolveObjectRef(road_ref, true)["found"] == true);
+
+	/*
+	 * A tram is built on the same tile. The road itself is untouched: the same subtype, the same
+	 * road type, the same pieces, the same owner and the same one-way state. Only the cell the two
+	 * families share changed, so only the fingerprint can say that the tile is not the one the
+	 * caller read, and a whole-cell write (a demolition, a rebuild) would take the new tram with it.
+	 */
+	MakeRoadNormal(tile, ROAD_X, ROADTYPE_ROAD, ROADTYPE_TRAM, TownID::Invalid(), Owner{0}, Owner{1});
+	const Json with_tram = FindTileObject(tile, "road");
+	REQUIRE(!with_tram.empty());
+	CHECK(with_tram["subtype"] == road_row["subtype"]);
+	CHECK(with_tram["owner"] == road_row["owner"]);
+	CHECK(with_tram["road_bits"] == road_row["road_bits"]);
+	CHECK(with_tram["road_type_id"] == road_row["road_type_id"]);
+	CHECK(with_tram["one_way"] == road_row["one_way"]);
+	CHECK(with_tram["fingerprint"] != road_row["fingerprint"]);
+
+	/* So the guard the caller kept for the road is stale before the demolition can run. */
+	const Json stale = ResolveObjectRef(road_ref, true);
+	CHECK(stale["found"] == false);
+	CHECK(stale["error"] == "stale_ref");
+	CHECK(stale["reason"] == "tile_state_changed");
+
+	/* The tram row reports the owner of its own family, and its guard covers the road family too. */
+	const Json tram_row = FindTileObject(tile, "tram");
+	REQUIRE(!tram_row.empty());
+	CHECK(tram_row["owner"] == 1);
+	const Json tram_ref = TileRef(tram_row);
+	CHECK(ResolveObjectRef(tram_ref, true)["found"] == true);
+	SetRoadOwner(tile, RoadTramType::Road, Owner{2});
+	const Json opposite_owner = ResolveObjectRef(tram_ref, true);
+	CHECK(opposite_owner["found"] == false);
+	CHECK(opposite_owner["reason"] == "tile_state_changed");
+
+	/* The other direction as well: the tram owner is part of the road guard's cell. */
+	const Json road_after = TileRef(FindTileObject(tile, "road"));
+	CHECK(ResolveObjectRef(road_after, true)["found"] == true);
+	SetRoadOwner(tile, RoadTramType::Tram, Owner{3});
+	CHECK(ResolveObjectRef(road_after, true)["found"] == false);
+
+	/* A one-way state is stored in the bits of a normal road, so it is part of the cell: changing it
+	 * leaves the road type, the pieces and the owners alone. Both guards have to see it. */
+	const Json one_way_ref = TileRef(FindTileObject(tile, "road"));
+	CHECK(ResolveObjectRef(one_way_ref, true)["found"] == true);
+	SetDisallowedRoadDirections(tile, DisallowedRoadDirections{DisallowedRoadDirection::Northbound});
+	REQUIRE(IsOneWayRoadTile(tile));
+	const Json one_way = ResolveObjectRef(one_way_ref, true);
+	CHECK(one_way["found"] == false);
+	CHECK(one_way["reason"] == "tile_state_changed");
+	SetDisallowedRoadDirections(tile, DisallowedRoadDirections{});
+	const Json tram_before = TileRef(FindTileObject(tile, "tram"));
+	SetDisallowedRoadDirections(tile, DisallowedRoadDirections{DisallowedRoadDirection::Southbound});
+	CHECK(ResolveObjectRef(tram_before, true)["found"] == false);
+
+	/*
+	 * A level crossing carries rail in the same cell, so another rail type is another cell: a
+	 * demolition of the crossing removes the rail as well. The one-way accessor is only read on a
+	 * normal road; a crossing and a depot store other values in those bits, which the depot case
+	 * above covers.
+	 */
+	const TileIndex crossing = TileXY(21, 21);
+	MakeRoadCrossing(crossing, Owner{0}, OWNER_NONE, Owner{0}, Axis::X, RAILTYPE_RAIL, ROADTYPE_ROAD, INVALID_ROADTYPE, TownID::Invalid());
+	const Json crossing_row = FindTileObject(crossing, "road");
+	REQUIRE(!crossing_row.empty());
+	const Json crossing_ref = TileRef(crossing_row);
+	CHECK(ResolveObjectRef(crossing_ref, true)["found"] == true);
+	SetRailType(crossing, RAILTYPE_ELECTRIC);
+	const Json rail_type_changed = ResolveObjectRef(crossing_ref, true);
+	CHECK(rail_type_changed["found"] == false);
+	CHECK(rail_type_changed["reason"] == "tile_state_changed");
+}
+
+TEST_CASE("Agent bridge refs: another tree on the tile is a new state")
+{
+	MapFixture map;
+
+	const TileIndex tile = TileXY(30, 30);
+	MakeTree(tile, TreeType{0}, 0, TreeGrowthStage::Grown, TreeGround::Grass, 3);
+	REQUIRE(GetTreeCount(tile) == 1);
+	const Json row = FindTileObject(tile, "tree");
+	REQUIRE(!row.empty());
+	const Json ref = TileRef(row);
+	CHECK(ResolveObjectRef(ref, true)["found"] == true);
+
+	/*
+	 * The engine's own planting path for a tile that already carries trees: the type, the ground and
+	 * the density stay and only the count moves (tree_cmd.cpp: PlaceTreeGroupAroundTile). The
+	 * density is not a count, so the row alone cannot tell the two states apart.
+	 */
+	AddTreeCount(tile, 1);
+	REQUIRE(GetTreeCount(tile) == 2);
+	CHECK(FindTileObject(tile, "tree")["subtype"] == row["subtype"]);
+	const Json changed = ResolveObjectRef(ref, true);
+	CHECK(changed["found"] == false);
+	CHECK(changed["error"] == "stale_ref");
+	CHECK(changed["reason"] == "tile_state_changed");
+
+	/* The growth stage belongs to the growth counter and advances without anyone touching the tile,
+	 * so it is not part of the observed state: a tree that only grew keeps the reference current. */
+	const Json grown_ref = TileRef(FindTileObject(tile, "tree"));
+	SetTreeGrowth(tile, TreeGrowthStage::Growing1);
+	REQUIRE(GetTreeGrowth(tile) != TreeGrowthStage::Grown);
+	CHECK(ResolveObjectRef(grown_ref, true)["found"] == true);
+}
+
+TEST_CASE("Agent bridge refs: an unchanged tile keeps its fingerprint")
+{
+	MapFixture map;
+
+	/* The fingerprint is the state of the tile and not the place of it, so two tiles in the same
+	 * state carry the same value and reading one of them twice reports it unchanged. */
+	MakeRoadNormal(TileXY(40, 40), ROAD_X, ROADTYPE_ROAD, INVALID_ROADTYPE, TownID::Invalid(), Owner{0}, OWNER_NONE);
+	MakeRoadNormal(TileXY(40, 41), ROAD_X, ROADTYPE_ROAD, INVALID_ROADTYPE, TownID::Invalid(), Owner{0}, OWNER_NONE);
+	const Json first = FindTileObject(TileXY(40, 40), "road");
+	const Json second = FindTileObject(TileXY(40, 41), "road");
+	REQUIRE(!first.empty());
+	REQUIRE(!second.empty());
+	CHECK(first["fingerprint"] == second["fingerprint"]);
+	CHECK(FindTileObject(TileXY(40, 40), "road")["fingerprint"] == first["fingerprint"]);
+
+	/* A vehicle standing on the tile is a pooled object of its own and not part of the tile state, so
+	 * it does not move the fingerprint: the vehicle's own reference carries its lifetime instead. */
+	REQUIRE(Vehicle::GetNumItems() == 0);
+	REQUIRE(Vehicle::CanAllocateItem());
+	RoadVehicle *vehicle = RoadVehicle::Create();
+	REQUIRE(vehicle != nullptr);
+	vehicle->tile = TileXY(40, 40);
+	CHECK(FindTileObject(TileXY(40, 40), "road")["fingerprint"] == first["fingerprint"]);
+	bool listed = false;
+	for (const Json &candidate : PickObjects(TileXY(40, 40))) {
+		if (candidate["type"] == "vehicle") listed = true;
+	}
+	CHECK(listed);
+	_vehicle_pool.CleanPool();
 }
 
 TEST_CASE("Agent bridge refs: a map object carries the lifetime of the pooled object")
