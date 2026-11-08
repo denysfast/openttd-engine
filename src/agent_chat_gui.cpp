@@ -11,6 +11,7 @@
 
 #include "agent_chat_gui.h"
 #include "agent_bridge.h"
+#include "agent_chat_cache.h"
 #include "agent_chat_image.h"
 #include "agent_chat_selection.h"
 
@@ -998,21 +999,27 @@ static void AgentChatLoadChats()
 
 	AgentChatRequest("GET", path, Json(), [world_id, epoch](const Json &response) {
 		/* Ignore the answer when the world changed while the request was in flight. */
-		if (world_id != _agent_chat.world_id || epoch != _agent_chat.epoch) return;
+		if (!AgentChatAnswerIsCurrent(world_id, epoch, _agent_chat.world_id, _agent_chat.epoch)) return;
 
-		const std::string previous = GetActiveChat() != nullptr ? GetActiveChat()->id : std::string();
-		_agent_chat.chats.clear();
-		_agent_chat.active = -1;
+		const AgentChatEntry *previous_chat = GetActiveChat();
+		const std::string previous = previous_chat != nullptr ? previous_chat->id : std::string();
 
+		std::vector<AgentChatEntry> refreshed;
 		for (const Json &entry : JsonArray(response, "chats")) {
 			AgentChatEntry chat;
 			chat.id = JsonString(entry, "chat_id", JsonString(entry, "id"));
 			if (chat.id.empty()) continue;
 			chat.title = SanitiseBackendText(JsonString(entry, "title"));
 			ApplyChatTaskState(chat, entry);
-			_agent_chat.chats.push_back(std::move(chat));
+			refreshed.push_back(std::move(chat));
 		}
 
+		/* The list describes the chats of this world and epoch, so the same chat id is the same
+		 * conversation: its cached transcript and its cursors survive the refresh, and a read that
+		 * is still in flight can only add to it instead of landing on a rebuilt cache and hiding
+		 * the messages that came before the ones it brings. */
+		AgentChatMergeChatList(_agent_chat.chats, std::move(refreshed));
+		_agent_chat.active = -1;
 		_agent_chat.chats_loaded = true;
 
 		for (size_t i = 0; i < _agent_chat.chats.size(); i++) {
@@ -1121,13 +1128,20 @@ static void AgentChatLoadMessages(const std::string &chat_id)
 	const AgentChatEntry *chat = FindChatById(chat_id);
 	if (chat == nullptr) return;
 
+	const std::string world_id = _agent_chat.world_id;
+	const std::string epoch = _agent_chat.epoch;
 	const std::string path = "/v1/chats/" + chat_id + "/messages?after=" + fmt::format("{}", chat->message_seq);
 
-	AgentChatRequest("GET", path, Json(), [chat_id](const Json &response) {
+	AgentChatRequest("GET", path, Json(), [chat_id, world_id, epoch](const Json &response) {
+		/* An answer of the world or epoch that was left must not touch the transcript of a chat that
+		 * carries the same id in this one. */
+		if (!AgentChatAnswerIsCurrent(world_id, epoch, _agent_chat.world_id, _agent_chat.epoch)) return;
+
 		AgentChatEntry *chat = FindChatById(chat_id);
 		if (chat == nullptr) return;
 
-		bool any = false;
+		std::vector<AgentChatMessage> messages;
+		int64_t highest = chat->message_seq;
 		for (const Json &entry : JsonArray(response, "messages")) {
 			AgentChatMessage message;
 			message.seq = JsonInt(entry, "seq", 0);
@@ -1138,25 +1152,35 @@ static void AgentChatLoadMessages(const std::string &chat_id)
 				message.attachments.push_back(ParseAttachment(attachment));
 			}
 
-			/* Skip messages that were already received. */
-			if (message.seq != 0 && message.seq <= chat->message_seq) continue;
-
-			if (message.seq > chat->message_seq) chat->message_seq = message.seq;
-			chat->messages.push_back(std::move(message));
-			any = true;
+			highest = std::max(highest, message.seq);
+			messages.push_back(std::move(message));
 		}
 
-		/* Fall back to the cursor of the backend when the messages carry no sequence number. */
-		if (!any && response.is_object() && response.contains("next_seq")) {
+		/* The answer is merged at the sequence positions of its messages instead of being appended
+		 * behind the cursor: an answer that overtook another one still fills the transcript, and a
+		 * message that was already received is not shown twice. The cursor only moves forward. */
+		const AgentChatMergeResult merged = AgentChatMergeMessages(chat->messages, std::move(messages));
+		chat->message_seq = highest;
+
+		/* Fall back to the cursor of the backend when the answer carried no message that could be
+		 * placed. */
+		if (!merged.changed && response.is_object() && response.contains("next_seq")) {
 			chat->message_seq = std::max(chat->message_seq, JsonInt(response, "next_seq", chat->message_seq));
 		}
 
 		/* Keep the transcript pinned to the bottom while new messages arrive. The offset is
 		 * clamped by the scrollbar, so the window has to re-run its layout for it to take effect. */
-		if (any) {
+		if (merged.changed) {
 			_agent_chat.scroll = INT32_MAX;
-			/* A reloaded message may be shorter than the one the selection was made in. */
-			_agent_chat.selection.Clamp(TranscriptTexts(chat));
+			if (merged.inserted_before) {
+				/* A message that went in before cached ones moves their transcript indices, so
+				 * the selection would point at other text and is dropped. */
+				_agent_chat.selection.Clear();
+			} else {
+				/* An ordinary answer only appends, so the selection stays on its own text; a
+				 * reloaded message may be shorter than the one it was made in. */
+				_agent_chat.selection.Clamp(TranscriptTexts(chat));
+			}
 			InvalidateWindowClassesData(WindowClass::AgentChat);
 		}
 	});

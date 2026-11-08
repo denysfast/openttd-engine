@@ -28,6 +28,7 @@ add_test_files(
     test_agent_bridge_refs.cpp
     test_agent_bridge_transport.cpp
     test_agent_capture.cpp
+    test_agent_chat_cache.cpp
     test_agent_chat_image.cpp
     test_agent_chat_selection.cpp
     test_agent_chat_send_ack.cpp

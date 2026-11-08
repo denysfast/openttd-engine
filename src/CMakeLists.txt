@@ -64,6 +64,7 @@ add_files(
     agent_bridge.h
     agent_capture.cpp
     agent_capture.h
+    agent_chat_cache.h
     agent_chat_gui.cpp
     agent_chat_gui.h
     agent_chat_image.cpp
