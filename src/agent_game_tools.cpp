@@ -15,6 +15,7 @@
 #include "cargotype.h"
 #include "command_func.h"
 #include "company_base.h"
+#include "core/backup_type.hpp"
 #include "depot_base.h"
 #include "depot_map.h"
 #include "direction_func.h"
@@ -287,7 +288,9 @@ public:
 	explicit CompanyContext(CompanyID company) : backup(_current_company, company) {}
 
 private:
-	Backup<CompanyID> backup; ///< Restores the previous company on destruction.
+	/* The company is restored on every return path of the command, so the automatic backup is the
+	 * right one: the manual `Backup` would report a value it was expected to restore by hand. */
+	AutoRestoreBackup<CompanyID> backup; ///< Restores the previous company on destruction.
 };
 
 /**

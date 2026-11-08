@@ -149,9 +149,13 @@ TEST_CASE("Agent bridge guard: a demolition reports the state it left, which is 
 
 	/* The real command path of the module, exactly as `world.construct op=demolish` posts it. */
 	const Json params = DemolishParams(10, 10, guard);
+	/* The module switches the company that pays for the command and restores the company it found
+	 * (`agent_game_tools.cpp: CompanyContext`), so the process keeps the company it had before. */
+	const CompanyID previous_company = _current_company;
 	const std::optional<Json> module_result = DispatchGameTool("world.construct", params, company.Id());
 	REQUIRE(module_result.has_value());
 	REQUIRE((*module_result)["ok"].get<bool>());
+	CHECK(_current_company == previous_company);
 	CHECK_FALSE(IsTileType(tile, TileType::Road));
 
 	const Json postcondition = GuardPostcondition(ConstructRequest("request-1", params), BridgeResult(*module_result));
@@ -184,8 +188,13 @@ TEST_CASE("Agent bridge guard: a demolition reports the state it left, which is 
 	 * request - the after state is the engine's own read of the tile after the command.
 	 */
 	Json after = effect["after"];
-	after["world_id"] = "test-world";
-	after["epoch"] = "test-epoch";
+	/* A reference is bound to the world and epoch it was read in, and the read happens in the world
+	 * the bridge is bound to now - not in the world a request names. `Context()` is that binding. */
+	const Json context = Context();
+	REQUIRE(context["world_id"].is_string());
+	REQUIRE_FALSE(context["world_id"].get<std::string>().empty());
+	after["world_id"] = context["world_id"];
+	after["epoch"] = context["epoch"];
 	CHECK(ResolveObjectRef(after, true)["found"] == true);
 	const Json stale = ResolveObjectRef(guard, true);
 	CHECK(stale["found"] == false);
