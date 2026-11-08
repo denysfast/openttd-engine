@@ -847,6 +847,11 @@ Json RoadNeighbourJson(TileIndex tile, DiagDirection dir, RoadTramType rtt)
  * depot direction, and it is the stored direction that is rejected. The track status of the entered
  * tile already has its one-way restriction applied (`GetTileTrackStatus_Road` scales the trackdirs
  * by the disallowed directions), so a one-way tile only lets a vehicle in along its arrow.
+ * A vehicle that drives in from a neighbour stands on that neighbour first, and the neighbour is what
+ * decides which way it may leave: a one-way arrow there that points away from the reported tile takes
+ * the trackdir which exits towards it out of the neighbour's track status, so a stop entry whose
+ * neighbour points the other way is as much a trap as a one-way tile driven into. A depot tile
+ * carries the exit direction it stores and is never one-way, so only the entering case needs that.
  * The raw piece test alone is not enough: a one-piece stub carries the piece but has no drivable
  * track at all, so \c connected is the pair and a stub never reads as a usable connection.
  * @param tile The reported tile.
@@ -870,8 +875,23 @@ Json RoadLinkJson(TileIndex tile, DiagDirection dir, RoadTramType rtt, bool leav
 	const bool has_required_bit = present.Any(required);
 	/* The tile the vehicle comes from must carry the piece towards the other one. */
 	const bool from_ok = leaving ? own.Any(DiagDirToRoadBits(dir)) : has_required_bit;
+	/* The tile the vehicle comes from must also offer a trackdir that leaves towards the other one.
+	 * A one-way arrow on that tile points away exactly when the trackdir which exits towards the other
+	 * tile is gone from its track status (`GetTileTrackStatus_Road` scales the trackdirs by the
+	 * disallowed directions), and a vehicle standing there then drives off the other way. A depot tile
+	 * carries the exit direction it stores and is never one-way, so only the entering case needs it. */
+	bool from_leaves = true;
+	if (!leaving && valid) {
+		from_leaves = false;
+		for (const Trackdir trackdir : GetTileTrackStatus(neighbour, TransportType::Road, rtt).trackdirs) {
+			if (TrackdirToExitdir(trackdir) == motion) {
+				from_leaves = true;
+				break;
+			}
+		}
+	}
 	/* The engine's own reachability test on the tile the vehicle drives into. */
-	const bool drivable = valid && from_ok &&
+	const bool drivable = valid && from_ok && from_leaves &&
 			(GetTileTrackStatus(entered, TransportType::Road, rtt).trackdirs & DiagdirReachesTrackdirs(motion)).Any();
 
 	Json result = RoadNeighbourJson(tile, dir, rtt);

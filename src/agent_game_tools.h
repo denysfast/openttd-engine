@@ -175,7 +175,9 @@ void AgentCloneVehicleCallback(Commands cmd, const CommandCost &result, VehicleI
  *                        tile with the direction of motion). For a depot exit the vehicle drives out
  *                        of the depot tile, for a stop entry it drives from the neighbour into the
  *                        stop tile. The entered tile's own one-way state is part of its track status,
- *                        so a one-way tile only lets a vehicle in along its arrow.
+ *                        so a one-way tile only lets a vehicle in along its arrow, and for a stop
+ *                        entry the neighbour's own one-way state counts as well: an arrow that points
+ *                        away from the stop leaves no trackdir of that neighbour exiting towards it.
  *   `connected`          `has_required_bit && drivable`. This is the field to check: a vehicle can
  *                        only get through when it is true. The other fields say why it is not.
  */

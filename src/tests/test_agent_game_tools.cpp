@@ -1532,7 +1532,9 @@ TEST_CASE("agent_game_tools: a mixed road and tram stop reads each family on its
 	CHECK(entry(both["tram"]["entries"], "se", "tram")["connected"] == true);
 
 	/* A one-way restriction belongs to the road family only: the engine leaves the tram trackdirs
-	 * unscaled, so the tram entry stays usable while the road entry is blocked. */
+	 * unscaled, so the tram entry stays usable while the road entry is blocked. `Northbound` on a
+	 * ROAD_Y tile leaves only the southbound trackdir, which exits that neighbour towards (30, 12) and
+	 * not towards the stop, so a bus standing there drives away from the stop instead of into it. */
 	SetDisallowedRoadDirections(TileXY(30, 11), DisallowedRoadDirections{DisallowedRoadDirection::Northbound});
 	const Json one_way = RoadStopAccessJson(TileXY(30, 10));
 	const Json one_way_road = entry(one_way["road"]["entries"], "se", "road");
