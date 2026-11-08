@@ -29,6 +29,7 @@
 #include "../engine_base.h"
 #include "../language.h"
 #include "../map_func.h"
+#include "../newgrf_airport.h"
 #include "../order_base.h"
 #include "../road.h"
 #include "../road_map.h"
@@ -2195,6 +2196,10 @@ class TestConsistHangar {
 public:
 	TestConsistHangar(CompanyID owner, TileIndex tile)
 	{
+		/* Without a game the airport specs are empty, so the small airport would carry no depots and
+		 * `GetHangarTile(0)` would find no hangar. `AirportSpec::ResetAirports()` installs the engine's own
+		 * airport specs, which is the state a running game has. */
+		AirportSpec::ResetAirports();
 		REQUIRE(Station::GetNumItems() == 0);
 		REQUIRE(Station::CanAllocateItem());
 		this->station = Station::Create(tile);

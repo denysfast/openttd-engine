@@ -49,6 +49,10 @@ struct MapFixture {
 	{
 		Map::Allocate(64, 64);
 		_game_mode = GameMode::Normal;
+		/* Without a game the road type masks are empty, so `RoadTypeIsRoad()` answers for nothing and
+		 * `MakeRoadNormal()` asserts on the road type it is given. `ResetRoadTypes()` installs the
+		 * engine's own road and tram defaults, which is the state a running game has. */
+		ResetRoadTypes();
 	}
 
 	~MapFixture() { _game_mode = previous_mode; }
