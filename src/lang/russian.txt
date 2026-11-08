@@ -548,6 +548,7 @@ STR_TOOLBAR_TOOLTIP_SHOW_SOUND_MUSIC_WINDOW                     :{BLACK}Наст
 STR_TOOLBAR_TOOLTIP_SHOW_LAST_MESSAGE_NEWS                      :{BLACK}Показать последнее сообщение, историю сообщений и их удаление
 STR_TOOLBAR_TOOLTIP_LAND_BLOCK_INFORMATION                      :{BLACK}Показать информацию о территории, о разработчиках игры; инструменты разработчика, снимки экрана
 STR_TOOLBAR_TOOLTIP_SWITCH_TOOLBAR                              :{BLACK}Переключить панели инструментов
+STR_TOOLBAR_TOOLTIP_AGENT_CHAT                                  :{BLACK}Открыть чат с агентом (Ctrl+Shift+A)
 
 # Extra tooltips for the scenario editor toolbar
 STR_SCENEDIT_TOOLBAR_SAVE_SCENARIO_LOAD_SCENARIO_TOOLTIP        :{BLACK}Сохранение/загрузка сценария, выход из редактора, выход
@@ -6608,6 +6609,7 @@ STR_BADGE_FILTER_ANY_LABEL                                      :Любой {STR
 
 STR_AGENT_CHAT_CAPTION                                          :{WHITE}Чат с агентом
 STR_AGENT_CHAT_MENU_ENTRY                                       :Чат с агентом
+STR_AGENT_CHAT_TOOLBAR_BUTTON                                   :Чат агента
 STR_AGENT_CHAT_NEW_CHAT                                         :Новый чат
 STR_AGENT_CHAT_NEW_CHAT_TOOLTIP                                 :Начать новый чат с игровым агентом
 STR_AGENT_CHAT_SEND                                             :Отправить

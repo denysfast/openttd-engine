@@ -422,6 +422,7 @@ STR_TOOLBAR_TOOLTIP_SHOW_SOUND_MUSIC_WINDOW                     :{BLACK}Open sou
 STR_TOOLBAR_TOOLTIP_SHOW_LAST_MESSAGE_NEWS                      :{BLACK}Open last message/news report, messages history or delete all messages
 STR_TOOLBAR_TOOLTIP_LAND_BLOCK_INFORMATION                      :{BLACK}Open land information, screenshot menu, OpenTTD credits, or developer tools
 STR_TOOLBAR_TOOLTIP_SWITCH_TOOLBAR                              :{BLACK}Switch toolbars
+STR_TOOLBAR_TOOLTIP_AGENT_CHAT                                  :{BLACK}Open the agent chat (Ctrl+Shift+A)
 
 # Extra tooltips for the scenario editor toolbar
 STR_SCENEDIT_TOOLBAR_SAVE_SCENARIO_LOAD_SCENARIO_TOOLTIP        :{BLACK}Save scenario, load scenario, abandon scenario editor, exit
@@ -6347,6 +6348,7 @@ STR_BADGE_FILTER_ANY_LABEL                                      :Any {STRING}
 
 STR_AGENT_CHAT_CAPTION                                          :{WHITE}Agent chat
 STR_AGENT_CHAT_MENU_ENTRY                                       :Agent chat
+STR_AGENT_CHAT_TOOLBAR_BUTTON                                   :Agent chat
 STR_AGENT_CHAT_NEW_CHAT                                         :New chat
 STR_AGENT_CHAT_NEW_CHAT_TOOLTIP                                 :Start a new chat with the in-game agent
 STR_AGENT_CHAT_SEND                                             :Send

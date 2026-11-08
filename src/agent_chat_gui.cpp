@@ -43,6 +43,7 @@
 #include "zoom_func.h"
 
 #include "widgets/agent_chat_widget.h"
+#include "widgets/toolbar_widget.h"
 
 #include "3rdparty/fmt/format.h"
 
@@ -4179,6 +4180,26 @@ nlohmann::json DescribeAgentChatUi()
 	out["coordinate_space"] = "screen";
 	AgentChatWindow *w = dynamic_cast<AgentChatWindow *>(FindWindowById(WindowClass::AgentChat, 0));
 	out["window_open"] = w != nullptr;
+
+	/* The real geometry of the labelled agent chat button of the main toolbar, so a read-only check
+	 * can click the button itself instead of guessing a pixel. It is reported whether or not the chat
+	 * window is open, because the button is what opens it; the enabled state is the window's own, and
+	 * a button the layout hid has no rectangle on screen. */
+	Window *toolbar = FindWindowById(WindowClass::MainToolbar, 0);
+	const NWidgetBase *toolbar_chat = toolbar != nullptr ? toolbar->GetWidget<NWidgetBase>(WID_TN_AGENT_CHAT) : nullptr;
+	Json toolbar_button = Json{
+		{"coordinate_space", "screen_pixels"},
+		{"caption", GetString(STR_AGENT_CHAT_TOOLBAR_BUTTON)},
+		{"rect", Json()},
+		{"visible", false},
+		{"enabled", false},
+	};
+	if (toolbar_chat != nullptr) {
+		toolbar_button["rect"] = RectToJson(ToScreenRect(*toolbar, toolbar_chat->GetCurrentRect()));
+		toolbar_button["visible"] = toolbar_chat->current_x > 0 && toolbar_chat->current_y > 0;
+		toolbar_button["enabled"] = !toolbar->IsWidgetDisabled(WID_TN_AGENT_CHAT);
+	}
+	out["toolbar_agent_chat"] = std::move(toolbar_button);
 
 	/* The viewport is where a map click lands; a test picks a point inside it and outside the
 	 * (shaded) chat window instead of guessing coordinates. */
