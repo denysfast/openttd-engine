@@ -172,6 +172,28 @@ Json DescribeTileObjects(TileIndex tile);
 Json ResolveObjectRef(const Json &ref, bool require_identity);
 
 /**
+ * The postcondition receipt of a guarded mutation, as the bridge adds it to the answer.
+ *
+ * A write is admitted with `expected_refs`, so the state of every guarded tile is the precondition
+ * the command ran against. The receipt reports, for each guarded tile the command actually left in
+ * another state, the state the guard was checked against (`before`) next to the state the engine
+ * reads on that tile immediately after the command (`after`), bound to the request, the task, the
+ * world and the epoch. A caller may advance the guard of its own successful write to `after`, and
+ * must not do it for anything else: a dry run, an estimate, a refused or never dispatched command
+ * answers no receipt, and a tile the command did not change is not reported as an effect. Only the
+ * module's own mode flags can state that the command really ran: a receipt without a boolean
+ * `dry_run`, or with an `estimated` or `executed` flag that disagrees, reports nothing.
+ *
+ * The block is `{request_id, task_id, world_id, epoch, guarded, tiles, complete, truncated}`;
+ * `complete` is false when a guarded tile could not be examined, and `truncated` when the bound of
+ * one request's references cut the report short. An answer with nothing to report carries no block.
+ * @param request The request, for its id, task, world, epoch, method and parameters.
+ * @param result The result of the request.
+ * @return The postcondition block, or an empty object when there is nothing to report.
+ */
+Json GuardPostcondition(const Json &request, const Json &result);
+
+/**
  * Send a request to the backend on behalf of the native UI. The UI token is
  * used for authentication, and the callback is always invoked on the main
  * thread.
