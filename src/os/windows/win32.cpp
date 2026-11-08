@@ -415,7 +415,9 @@ bool SetClipboardContents(const std::string &text)
 		if (cbuf != nullptr) {
 			void *dst = GlobalLock(cbuf);
 			if (dst != nullptr) {
-				memcpy(dst, wide.c_str(), size);
+				/* A typed copy of the UTF-16 text including its terminating null, through the
+				 * pointer GlobalLock() returned for the block. */
+				std::copy_n(wide.c_str(), wide.size() + 1, static_cast<wchar_t *>(dst));
 				GlobalUnlock(cbuf);
 				/* The clipboard owns the block once it took it; until then this side frees it. */
 				if (SetClipboardData(CF_UNICODETEXT, cbuf) != nullptr) {
