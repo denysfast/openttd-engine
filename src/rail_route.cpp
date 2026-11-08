@@ -441,6 +441,7 @@ public:
 	{
 		int64_t best = INT64_MAX;
 		uint tried = 0, bounds = 0, obstacles_rejected = 0, terrain_rejected = 0;
+		TileIndex first_obstacle = INVALID_TILE;
 		std::set<std::vector<bool>> shapes;
 		const bool straight_start = this->options.start == RailRouteStart::X || this->options.start == RailRouteStart::Y;
 		const bool diagonal_start = this->options.start == RailRouteStart::NS || this->options.start == RailRouteStart::EW;
@@ -474,10 +475,18 @@ public:
 				bool blocked = false;
 				for (const auto &[tile, bits] : tiles) {
 					int64_t cost = this->ObstacleCost(tile);
-					if (cost >= ROUTE_BLOCKED_COST) { blocked = true; break; }
+					if (cost >= ROUTE_BLOCKED_COST) {
+						if (first_obstacle == INVALID_TILE) first_obstacle = tile;
+						blocked = true;
+						break;
+					}
 					TrackBits existing = ExistingRouteTracks(tile, this->options.railtype);
 					if (existing.Any() && bits != (bits & existing)) {
-						if (IsRailStationTile(tile) || (HasSignals(tile) && TracksOverlap(bits | existing))) { blocked = true; break; }
+						if (IsRailStationTile(tile) || (HasSignals(tile) && TracksOverlap(bits | existing))) {
+							if (first_obstacle == INVALID_TILE) first_obstacle = tile;
+							blocked = true;
+							break;
+						}
 					}
 					obstacles += cost;
 				}
@@ -522,6 +531,10 @@ public:
 			}
 		}
 		if (best == INT64_MAX) this->failure_detail = fmt::format("candidates={} bounds={} protected={} terrain={}", tried, bounds, obstacles_rejected, terrain_rejected);
+		if (best == INT64_MAX && first_obstacle != INVALID_TILE && first_obstacle < Map::Size()) {
+			format_append(this->failure_detail, " first_protected={},{} tiletype={} owner={}", TileX(first_obstacle), TileY(first_obstacle),
+					to_underlying(GetTileType(first_obstacle)), GetTileOwner(first_obstacle).base());
+		}
 		return best != INT64_MAX;
 	}
 
@@ -864,7 +877,10 @@ RailRoutePlan PlanRailRoute(TileIndex from, TileIndex to, const RailRouteOptions
 		int mnr = minor + back;
 		/* Only pieces of the first run (diagonal for a diagonal start, straight for a straight one) can be start pieces. */
 		int first_run = diagonal ? mnr : len - mnr;
-		int max_index = std::min(diagonal ? 2 * first_run : first_run, 2 * static_cast<int>(options.tracks) + 2 * back + 6);
+		int search_limit = 2 * static_cast<int>(options.tracks) + 2 * back + 6;
+		/* First identify the fixed starts on an unbounded diagonal run. A short requested
+		 * end may otherwise hide outer start pieces before reach can be adjusted. */
+		int max_index = diagonal ? search_limit : std::min(first_run, search_limit);
 		std::vector<std::pair<int, int>> tracks;
 		for (auto [tile, track] : templ) {
 			bool found = false;
@@ -879,6 +895,21 @@ RailRoutePlan PlanRailRoute(TileIndex from, TileIndex to, const RailRouteOptions
 			if (!found) break;
 		}
 		if (tracks.size() != templ.size()) continue;
+
+		if (diagonal) {
+			int required = 1;
+			for (auto [offset, skip] : tracks) required = std::max(required, skip / 2 + 1);
+			/* All staggered outer starts must fit before the first bend. Project an end
+			 * that is too close to the start fan into reach, as for a straight start. */
+			mnr = std::max(mnr, required);
+			len = std::max(len, mnr);
+			auto [end_x, end_y] = f.Tile(len, mnr);
+			if (end_x < 1 || end_y < 1 || end_x + 1 >= static_cast<int>(Map::MaxX()) || end_y + 1 >= static_cast<int>(Map::MaxY())) {
+				plan.error = "the corridor does not fit on the map";
+				return plan;
+			}
+			plan.end = TileXY(end_x, end_y);
+		}
 
 		RoutePlanner planner(options, f, len, mnr);
 		planner.SetTracks(std::move(tracks));
