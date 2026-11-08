@@ -14,13 +14,16 @@
  * stands on (read, guarded removal through the real command path, rebuilt lifetime), the error
  * cases and the calendar conversion `world.info` reports.
  *
- * The bridge reads only the requested tile, so a small allocated map is enough: no game loop, no
- * video driver and no command is needed.
+ * The bridge reads only the requested tile, so a small allocated map is enough: no game loop and no
+ * video driver. The guarded removal case posts the engine's own demolition command, which updates the
+ * station sign, so that case loads the language pack the build generated.
  */
 
 #include "../stdafx.h"
 
 #include "../3rdparty/catch2/catch.hpp"
+
+#include <filesystem>
 
 #include "../agent_bridge.h"
 #include "../agent_command_catalog.h"
@@ -30,6 +33,7 @@
 #include "../depot_base.h"
 #include "../industry.h"
 #include "../industry_map.h"
+#include "../language.h"
 #include "../map_func.h"
 #include "../object_base.h"
 #include "../object_map.h"
@@ -72,6 +76,39 @@ struct MapFixture {
 		_game_mode = previous_mode;
 	}
 };
+
+/**
+ * Load the language pack the build generated, so this binary formats real strings.
+ *
+ * The test binary has no language pack of its own: `GetString()` aborts on the first string that is
+ * not in the loaded table ("String 0x8826 is invalid"), and a real station removal updates the
+ * station sign, which formats `STR_VIEWPORT_STATION` and `STR_STATION_NAME`. The pack is the real
+ * `english.lng` the build writes to `${CMAKE_BINARY_DIR}/lang`; CTest passes its path in
+ * `OTTD_TEST_LANGUAGE_FILE`, and the relative path is the fallback for a manual run from the build
+ * directory.
+ *
+ * The metadata is static because `ReadLanguagePack()` keeps the pointer it is given as the current
+ * language, so a stack object would dangle after this function returns.
+ */
+void LoadTestLanguagePack()
+{
+	static LanguageMetadata english;
+	if (_current_language == &english) return;
+
+	std::vector<std::filesystem::path> candidates;
+	if (const char *from_ctest = getenv("OTTD_TEST_LANGUAGE_FILE"); from_ctest != nullptr && *from_ctest != '\0') {
+		candidates.emplace_back(from_ctest);
+	}
+	candidates.emplace_back(std::filesystem::path("lang") / "english.lng");
+
+	for (const std::filesystem::path &candidate : candidates) {
+		if (!std::filesystem::exists(candidate)) continue;
+		english.file = candidate;
+		REQUIRE(ReadLanguagePack(&english));
+		return;
+	}
+	FAIL("no english.lng found: CTest passes OTTD_TEST_LANGUAGE_FILE, a manual run needs the build directory as its working directory");
+}
 
 /** A tile location in the canonical shape. */
 Json TilePoint(int x, int y)
@@ -1240,18 +1277,25 @@ TEST_CASE("Agent bridge refs: a station structure tile is a generic tile object"
 	/* The typed rows are unchanged: a station tile carries no typed landscape object. */
 	CHECK(DescribeTileObjects(tile).empty());
 
-	/* The void at the map edge and a tile off the map stay honest. */
+	/*
+	 * The void at the map edge and a tile off the map stay honest. The engine's own `IsValidTile`
+	 * excludes `TileType::Void` (tile_map.h), so the border void is no tile at all: it is an invalid
+	 * argument, not a structure that does not match.
+	 */
 	const TileIndex void_tile = TileXY(63, 63);
 	SetTileType(void_tile, TileType::Void);
 	const Json void_row = ResolveObjectRef(Json{{"type", "tile"}, {"tile", TilePoint(63, 63)}}, false);
 	CHECK(void_row["found"] == false);
-	CHECK(void_row["reason"] == "tile_type_mismatch");
+	CHECK(void_row["error"] == "invalid_params");
+	CHECK(void_row["reason"] == "invalid_tile");
 	CHECK(ResolveObjectRef(Json{{"type", "tile"}, {"tile", TilePoint(1000, 1000)}}, false)["reason"] == "invalid_tile");
 }
 
 TEST_CASE("Agent bridge refs: the read guard of a bus stop is current when the demolition runs")
 {
 	MapFixture map;
+	/* The removal updates the station sign, which formats the engine's own station strings. */
+	LoadTestLanguagePack();
 	StructureTestCompany company;
 
 	const TileIndex tile = TileXY(61, 61);
