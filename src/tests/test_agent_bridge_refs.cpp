@@ -16,7 +16,8 @@
  *
  * The bridge reads only the requested tile, so a small allocated map is enough: no game loop and no
  * video driver. The guarded removal case posts the engine's own demolition command, which updates the
- * station sign, so that case loads the language pack the build generated.
+ * station sign, so that case loads the language pack the build generated and bootstraps the engine's
+ * own font caches for the sign measurement.
  */
 
 #include "../stdafx.h"
@@ -31,6 +32,7 @@
 #include "../company_func.h"
 #include "../core/backup_type.hpp"
 #include "../depot_base.h"
+#include "../fontcache.h"
 #include "../industry.h"
 #include "../industry_map.h"
 #include "../language.h"
@@ -109,6 +111,35 @@ void LoadTestLanguagePack()
 	}
 	FAIL("no english.lng found: CTest passes OTTD_TEST_LANGUAGE_FILE, a manual run needs the build directory as its working directory");
 }
+
+/**
+ * Give the engine the font caches its own string layout asks for, and take them away again.
+ *
+ * The test binary never loads a base set, so no font cache exists, and the string layout a real
+ * removal runs asks `FontCache::Get()` for the font of the line and dereferences the answer: the
+ * sign measurement of the station name segfaults on the null cache
+ * (`ICUParagraphLayoutFactory::GetParagraphLayout`). `FontCache::InitializeFontCaches()` is the
+ * engine's own bootstrap: it registers the built-in sprite font cache for every size, which needs
+ * no base set, no font file and no renderer. Its glyph width is zero while the glyph is not loaded
+ * (`SpriteFontCache::GetGlyphWidth`), and a zero width is all a read-only sign measurement needs.
+ *
+ * Only a binary without caches is bootstrapped and only that bootstrap is undone, so a cache a
+ * later case set up (the mock environment of the widget tests) is left alone.
+ */
+struct TestFontCaches {
+	bool initialized = false; ///< Whether this fixture registered the caches.
+
+	TestFontCaches()
+	{
+		this->initialized = FontCache::Get(FontSize::Normal) == nullptr;
+		if (this->initialized) FontCache::InitializeFontCaches();
+	}
+
+	~TestFontCaches()
+	{
+		if (this->initialized) FontCache::UninitializeFontCaches();
+	}
+};
 
 /** A tile location in the canonical shape. */
 Json TilePoint(int x, int y)
@@ -1294,8 +1325,11 @@ TEST_CASE("Agent bridge refs: a station structure tile is a generic tile object"
 TEST_CASE("Agent bridge refs: the read guard of a bus stop is current when the demolition runs")
 {
 	MapFixture map;
-	/* The removal updates the station sign, which formats the engine's own station strings. */
+	/* The removal updates the station sign, which formats the engine's own station strings, and the
+	 * sign measurement lays them out with the engine's own font caches. */
 	LoadTestLanguagePack();
+	TestFontCaches font_caches;
+	REQUIRE(FontCache::Get(FontSize::Normal) != nullptr);
 	StructureTestCompany company;
 
 	const TileIndex tile = TileXY(61, 61);
