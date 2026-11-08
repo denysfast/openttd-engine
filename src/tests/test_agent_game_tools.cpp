@@ -2201,8 +2201,8 @@ public:
 		this->station->airport.type = AT_SMALL;
 		this->station->airport.rotation = Direction::N;
 		this->station->airport.tile = tile;
-		this->hangar = this->station->GetHangarTile(0);
-		MakeAirport(this->hangar, owner, this->station->index, 0, WaterClass::None);
+		this->hangar = this->station->airport.GetHangarTile(0);
+		MakeAirport(this->hangar, owner, this->station->index, 0, WaterClass::Invalid);
 	}
 
 	~TestConsistHangar() { _station_pool.CleanPool(); }
