@@ -939,6 +939,8 @@ constexpr int64_t MAX_QUERY_LIMIT = 500;
 constexpr size_t MAX_NAME_FILTER = 64;
 /** Largest number of order summaries one vehicle row carries. */
 constexpr size_t MAX_ROW_ORDERS = 64;
+/** Largest number of consist parts one vehicle row carries. */
+constexpr size_t MAX_CONSIST_PARTS = 128;
 
 /**
  * Readable name of a cargo type.
@@ -963,6 +965,37 @@ std::string CargoLabelText(CargoType cargo)
 }
 
 /**
+ * Read the engine's own stopped-in-depot state of the chain a vehicle belongs to.
+ *
+ * `Vehicle::IsStoppedInDepot()` asserts that it is asked for the head of a chain, and what it answers
+ * is a property of the whole chain: it is true only when every part is in the depot
+ * (`GroundVehicle::IsChainInDepot()`). A part of a chain is therefore read through the head, and a
+ * vehicle that stands alone is its own head, so every row reports the state of the chain it is in.
+ * @param v The vehicle.
+ * @return True if and only if the chain of the vehicle is in a depot and stopped there.
+ */
+bool ChainIsStoppedInDepot(const Vehicle *v)
+{
+	return v->First()->IsStoppedInDepot();
+}
+
+/**
+ * Read the engine's own depot state (`IsInDepot()`) of one vehicle.
+ *
+ * Every vehicle type answers this for every part of a chain, except the aircraft: `Aircraft::IsInDepot()`
+ * asserts that it is asked for a primary vehicle, and the shadow of an aircraft is a part that stands in
+ * the hangar of the aircraft it belongs to. The shadow is read through its aircraft and every other part
+ * is read directly, so the field stays the state of that part and not the state of its chain.
+ * @param v The vehicle.
+ * @return True if and only if the vehicle is in the depot.
+ */
+bool VehicleIsInDepot(const Vehicle *v)
+{
+	if (v->type == VehicleType::Aircraft && !v->IsPrimaryVehicle()) return v->First()->IsInDepot();
+	return v->IsInDepot();
+}
+
+/**
  * Map the state of a vehicle onto the protocol name.
  * @param v The vehicle.
  * @return Protocol name of the state the vehicle is in.
@@ -971,7 +1004,7 @@ std::string_view VehicleStatusName(const Vehicle *v)
 {
 	if (v->vehstatus.Test(VehState::Crashed)) return "crashed";
 	if (v->breakdown_ctr == 1) return "broken_down";
-	if (v->vehstatus.Test(VehState::Stopped)) return v->IsStoppedInDepot() ? "in_depot" : "stopped";
+	if (v->vehstatus.Test(VehState::Stopped)) return ChainIsStoppedInDepot(v) ? "in_depot" : "stopped";
 	if (v->current_order.IsType(OT_LOADING)) return "loading";
 	return "travelling";
 }
@@ -1079,6 +1112,70 @@ Json VehicleCargoJson(const Vehicle *v)
 	cargo["load"] = v->cargo.TotalCount();
 	cargo["capacity"] = v->cargo_cap;
 	return cargo;
+}
+
+/**
+ * Serialise the consist a primary vehicle actually hauls.
+ *
+ * A vehicle row is one vehicle, so the row of a locomotive says nothing about the wagons behind it:
+ * a wagon row carries its own cargo but not the head it is coupled to, and a wagon that stands alone
+ * in a depot is a row of the same shape as a wagon of a train. The consist is the engine's own chain,
+ * walked from the primary vehicle with `Next()`, so the order of the parts and every part's own cargo
+ * are the engine's values and not a reconstruction from the pool.
+ *
+ * Only the primary row of a chain carries this field: a chain is walked once, from its head, so a
+ * query that returns every vehicle does not walk the same chain once per part.
+ *
+ * @param v The primary vehicle the chain starts at.
+ * @return `{total_parts, truncated, parts, cargo}`: the number of parts in the chain, whether the
+ *         parts list was cut at #MAX_CONSIST_PARTS, the parts in chain order with their own cargo,
+ *         and the exact per-cargo load and capacity totals over the whole chain.
+ */
+Json VehicleConsistJson(const Vehicle *v)
+{
+	/** Cargo of a whole chain, per cargo type. */
+	struct ConsistCargo {
+		uint64_t load = 0;     ///< Cargo on board over the whole chain.
+		uint64_t capacity = 0; ///< Capacity over the whole chain.
+	};
+
+	/* The totals are summed over every part even when the parts list below is truncated, and the
+	 * counters are wide: the parts are bounded but the cargo of a chain is not, so a total must never
+	 * wrap. The map orders the answer by cargo type, so the same chain always reads the same way. */
+	std::map<CargoType, ConsistCargo> cargo_totals;
+
+	Json parts = Json::array();
+	int64_t total_parts = 0;
+	for (const Vehicle *part = v; part != nullptr; part = part->Next()) {
+		total_parts++;
+		if (parts.size() < MAX_CONSIST_PARTS) {
+			Json entry = Json::object();
+			entry["ref"] = PoolRef("vehicle", part);
+			entry["cargo"] = VehicleCargoJson(part);
+			parts.push_back(std::move(entry));
+		}
+
+		ConsistCargo &total = cargo_totals[part->cargo_type];
+		total.load += part->cargo.TotalCount();
+		total.capacity += part->cargo_cap;
+	}
+
+	Json cargo = Json::array();
+	for (const auto &[type, total] : cargo_totals) {
+		Json entry = Json::object();
+		entry["type"] = static_cast<uint8_t>(type);
+		entry["label"] = IsValidCargoType(type) ? Json(CargoLabelText(type)) : Json(nullptr);
+		entry["load"] = total.load;
+		entry["capacity"] = total.capacity;
+		cargo.push_back(std::move(entry));
+	}
+
+	Json consist = Json::object();
+	consist["total_parts"] = total_parts;
+	consist["truncated"] = total_parts > static_cast<int64_t>(MAX_CONSIST_PARTS);
+	consist["parts"] = std::move(parts);
+	consist["cargo"] = std::move(cargo);
+	return consist;
 }
 
 /**
@@ -1242,6 +1339,17 @@ Json VehicleRow(const Vehicle *v)
 	row["ref"] = PoolRef("vehicle", v);
 	row["id"] = v->index.base();
 	row["type"] = std::string(VehicleTypeName(v->type));
+	/* The chain the vehicle belongs to, as the engine has it now. `is_primary` is the engine's own
+	 * test for the vehicle that carries the orders and the income of a consist; `primary_ref` names
+	 * the head of the chain only when that head really is a primary vehicle. A wagon that stands
+	 * alone is its own head and is no primary vehicle, so its head is null instead of the wagon
+	 * itself or a guessed front engine, and a stale head can never be reported as a live one. */
+	row["is_primary"] = v->IsPrimaryVehicle();
+	const Vehicle *head = v->First();
+	row["primary_ref"] = head->IsPrimaryVehicle() ? PoolRef("vehicle", head) : Json(nullptr);
+	/* Only the head of a chain carries the consist: the other parts of the same chain are already in
+	 * that answer, so a query that returns every vehicle walks each chain once. */
+	if (v->IsPrimaryVehicle()) row["consist"] = VehicleConsistJson(v);
 	AddRoadTypeFields(row, v);
 	row["owner"] = v->owner.base();
 	row["name"] = v->name;
@@ -1253,13 +1361,15 @@ Json VehicleRow(const Vehicle *v)
 	row["tile"] = TileJson(v->tile);
 	row["status"] = std::string(VehicleStatusName(v));
 	row["stopped"] = v->vehstatus.Test(VehState::Stopped);
-	row["in_depot"] = v->IsStoppedInDepot();
-	/* Exactly the engine's own depot state (`IsInDepot()`, i.e. `RVSB_IN_DEPOT`). It stays true for
-	 * a vehicle that was started but has not left the depot yet, where `in_depot` above
-	 * (`IsStoppedInDepot()`) is already false. It is a state flag, not proof of movement: a vehicle
-	 * turning around on its depot tile is out of this state and still on the tile, which is what
-	 * `on_depot_tile` below reports. */
-	row["in_depot_state"] = v->IsInDepot();
+	/* The engine's own stopped-in-depot state of the chain this vehicle belongs to: a part of a chain
+	 * is in the depot exactly when its chain is, and the engine asks the head of the chain for it. */
+	row["in_depot"] = ChainIsStoppedInDepot(v);
+	/* Exactly the engine's own depot state of this vehicle (`IsInDepot()`, i.e. `RVSB_IN_DEPOT`). It
+	 * stays true for a vehicle that was started but has not left the depot yet, where `in_depot` above
+	 * is already false. It is a state flag, not proof of movement: a vehicle turning around on its
+	 * depot tile is out of this state and still on the tile, which is what `on_depot_tile` below
+	 * reports. */
+	row["in_depot_state"] = VehicleIsInDepot(v);
 	/* Exactly `IsDepotTile(v->tile)`: the tile the vehicle is on now is a depot tile. This is a map
 	 * read of the current tile and does not depend on any vehicle state. */
 	row["on_depot_tile"] = IsDepotTile(v->tile);
@@ -1276,7 +1386,7 @@ Json VehicleRow(const Vehicle *v)
 	row["profit_last_year"] = static_cast<int64_t>(v->GetDisplayProfitLastYear());
 	row["value"] = static_cast<int64_t>(v->value);
 	row["running_cost"] = static_cast<int64_t>(v->GetRunningCost());
-	row["halted_in_depot"] = v->vehstatus.Test(VehState::Stopped) && v->IsStoppedInDepot();
+	row["halted_in_depot"] = v->vehstatus.Test(VehState::Stopped) && ChainIsStoppedInDepot(v);
 	/* The wait state: the engine's own tick counters, the type specific ones null elsewhere. */
 	row.update(VehicleWaitJson(v));
 
@@ -1285,7 +1395,11 @@ Json VehicleRow(const Vehicle *v)
 	row["group_ref"] = group != nullptr ? PoolRef("group", group) : Json(nullptr);
 	row["group_name"] = group != nullptr ? Json(group->name) : Json(nullptr);
 
-	const Depot *depot = v->IsStoppedInDepot() ? Depot::GetByTile(v->tile) : nullptr;
+	/* `Depot::GetByTile()` needs a rail, road or ship depot tile: a hangar stores no depot, so an
+	 * aircraft that is stopped in its hangar has no depot reference. The head of the chain stands on
+	 * the tile the whole chain stands on. */
+	const bool depot_tile = IsRailDepotTile(head->tile) || IsRoadDepotTile(head->tile) || IsShipDepotTile(head->tile);
+	const Depot *depot = depot_tile && ChainIsStoppedInDepot(v) ? Depot::GetByTile(head->tile) : nullptr;
 	row["depot_ref"] = depot != nullptr ? PoolRef("depot", depot) : Json(nullptr);
 
 	row["orders"] = v->GetNumOrders();
@@ -1621,7 +1735,7 @@ Json QueryVehicles(const Json &params, CompanyID company)
 		if (filters.group_id != GroupID::Invalid() && v->group_id != filters.group_id) continue;
 		if (IsValidCargoType(filters.cargo) && v->cargo_type != filters.cargo) continue;
 		if (!filters.name_contains.empty() && v->name.find(filters.name_contains) == std::string::npos) continue;
-		if (filters.in_depot.has_value() && v->IsStoppedInDepot() != *filters.in_depot) continue;
+		if (filters.in_depot.has_value() && ChainIsStoppedInDepot(v) != *filters.in_depot) continue;
 		if (filters.stopped.has_value() && v->vehstatus.Test(VehState::Stopped) != *filters.stopped) continue;
 		if (total++ < offset) continue;
 		if (static_cast<int64_t>(rows.size()) >= limit) continue;
@@ -3580,6 +3694,7 @@ Json GameToolCapabilities()
 		"world.query ownership is explicit: `company_id` filters a company scoped kind, `company_id: null` asks for every owner, and the scope that was applied is reported in `scope.company_id`.",
 		"A vehicle row carries its order list compactly (`current_orders`, at most 64 entries, with `current_orders_truncated`), its group and depot references and the running cost, so the fleet can be audited without a second query.",
 		"A vehicle row carries the engine's own wait counters as raw ticks: `current_order_time` (ticks since the current order started), `load_unload_ticks` (ticks left before the next loading step), `wait_counter` for a train and `turn_counter` for an aircraft. `wait_counter` is one engine field for waiting in front of a signal, being stuck or the forced-proceeding counter, so it is the raw value and not a duration; a counter of another vehicle type is null.",
+		"A vehicle row names its place in a consist: `is_primary` is the engine's own test for the vehicle that carries the orders and the income, and `primary_ref` is the full generation reference of the head of the chain, null when that head is not a primary vehicle (a free wagon is its own head). The primary row adds `consist` with the number of parts in the chain (`total_parts`), whether the parts list was cut at 128 entries (`truncated`), the parts in chain order with their own ref and their own cargo, and the exact per-cargo `load`/`capacity` totals over the whole chain. The row's own `cargo` stays the cargo of that one vehicle.",
 	});
 	return result;
 }

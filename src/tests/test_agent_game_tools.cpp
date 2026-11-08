@@ -22,6 +22,7 @@
 
 #include "../agent_game_tools.h"
 #include "../aircraft.h"
+#include "../airport.h"
 #include "../cargotype.h"
 #include "../clear_map.h"
 #include "../company_base.h"
@@ -34,6 +35,8 @@
 #include "../road_type.h"
 #include "../roadveh.h"
 #include "../settings_type.h"
+#include "../ship.h"
+#include "../station_base.h"
 #include "../station_map.h"
 #include "../station_type.h"
 #include "../table/strings.h"
@@ -1654,4 +1657,692 @@ TEST_CASE("agent_game_tools: a road tile read reports its pieces and one-way sta
 	CHECK(clear_tile["road_type_id"].is_null());
 	CHECK(clear_tile["road_type"].is_null());
 	CHECK(clear_tile["drivable_exits"].empty());
+}
+
+namespace {
+
+/**
+ * Real vehicles in the engine's own vehicle pool, removed again when the fixture goes out of scope.
+ *
+ * The vehicles are genuine pool items, so their index and their lifetime generation are the engine's
+ * own. `Create` reserves the allocation with the pool's own `CanAllocateItem` first, because `GetNew`
+ * asserts that the allocation was checked and decrements that reservation once per allocation.
+ * Removal uses the pool's own `CleanPool`, the path the other cases of this file use: it resets the
+ * pool completely, so a case that runs afterwards still sees an empty pool.
+ */
+class TestConsistVehicles {
+public:
+	TestConsistVehicles() { REQUIRE(Vehicle::GetNumItems() == 0); }
+
+	~TestConsistVehicles()
+	{
+		_vehicle_pool.CleanPool();
+		/* A vehicle only drops its packet list when the pool is cleaned, so the packets of these
+		 * cases are returned to their own pool as well. */
+		_cargopacket_pool.CleanPool();
+	}
+
+	/**
+	 * Create one vehicle in the engine's own pool.
+	 * @tparam Tvehicle The vehicle type to create.
+	 * @return The created vehicle.
+	 */
+	template <typename Tvehicle>
+	Tvehicle *Create()
+	{
+		REQUIRE(Vehicle::CanAllocateItem());
+		Tvehicle *v = Tvehicle::Create();
+		REQUIRE(v != nullptr);
+		return v;
+	}
+};
+
+/**
+ * The real engines the consist cases put on their vehicles, removed again when the fixture goes out
+ * of scope.
+ *
+ * A vehicle row asks the engine of the vehicle for its name and its running cost, so a vehicle
+ * without a real engine could not be read at all. The engines are the engine pool's own default
+ * entries, created through the pool's `CreateAtIndex`, so their names, capacities and running costs
+ * are the engine's data and not a stub of the test.
+ */
+class TestConsistEngines {
+public:
+	TestConsistEngines()
+	{
+		REQUIRE(Engine::GetNumItems() == 0);
+		REQUIRE(Engine::CanAllocateItem(5));
+		this->loco = Engine::CreateAtIndex(EngineID(0), VehicleType::Train, 0);
+		this->wagon = Engine::CreateAtIndex(EngineID(1), VehicleType::Train, 29);
+		this->aircraft = Engine::CreateAtIndex(EngineID(2), VehicleType::Aircraft, 0);
+		this->ship = Engine::CreateAtIndex(EngineID(3), VehicleType::Ship, 0);
+		this->road = Engine::CreateAtIndex(EngineID(4), VehicleType::Road, 0);
+	}
+
+	~TestConsistEngines() { _engine_pool.CleanPool(); }
+
+	Engine *loco = nullptr;     ///< The engine of a locomotive.
+	Engine *wagon = nullptr;    ///< The engine of a coal wagon.
+	Engine *aircraft = nullptr; ///< The engine of an aircraft.
+	Engine *ship = nullptr;     ///< The engine of a ship.
+	Engine *road = nullptr;     ///< The engine of a road vehicle.
+};
+
+/** Cargo type of the default passengers, as the engine's own cargo table numbers it. */
+const CargoType TEST_CARGO_PASSENGERS{0};
+/** Cargo type of the default coal. */
+const CargoType TEST_CARGO_COAL{1};
+/** Cargo type of the default mail. */
+const CargoType TEST_CARGO_MAIL{2};
+/** Cargo type of the default wood. */
+const CargoType TEST_CARGO_WOOD{7};
+
+/**
+ * Set the labels of the cargo types these cases read.
+ *
+ * A running game fills the cargo table; this binary has none, so the cases set the labels of the four
+ * entries they use to the real labels of the default cargoes. Only the label is set, and only the
+ * rows read it through `CargoSpec`, so the rest of an entry stays as it is.
+ */
+void InitTestCargoLabels()
+{
+	CargoSpec::Get(TEST_CARGO_PASSENGERS)->label = CT_PASSENGERS;
+	CargoSpec::Get(TEST_CARGO_COAL)->label = CT_COAL;
+	CargoSpec::Get(TEST_CARGO_MAIL)->label = CT_MAIL;
+	CargoSpec::Get(TEST_CARGO_WOOD)->label = CT_WOOD;
+}
+
+/**
+ * Give a train part the owner, the engine and the tile its row reads, and the front-engine bit the
+ * engine's own `IsPrimaryVehicle()` reads for a train.
+ * @param v The train.
+ * @param owner Owner of the vehicle.
+ * @param engine Engine of the vehicle.
+ * @param tile Tile the vehicle stands on.
+ * @param front Whether the part is the front engine of its chain.
+ */
+void SetupTrainPart(Train *v, CompanyID owner, EngineID engine, TileIndex tile, bool front)
+{
+	v->owner = owner;
+	v->engine_type = engine;
+	v->tile = tile;
+	if (front) {
+		v->SetFrontEngine();
+	} else {
+		v->ClearFrontEngine();
+	}
+}
+
+/**
+ * Put cargo on a vehicle through the engine's own cargo list, with the capacity it has for it.
+ * @param v The vehicle.
+ * @param cargo Cargo type the vehicle carries.
+ * @param capacity Capacity of the vehicle for that cargo.
+ * @param count Units of cargo on board.
+ */
+void LoadCargo(Vehicle *v, CargoType cargo, uint16_t capacity, uint16_t count)
+{
+	v->cargo_type = cargo;
+	v->cargo_cap = capacity;
+	if (count == 0) return;
+	REQUIRE(CargoPacket::CanAllocateItem());
+	v->cargo.Append(CargoPacket::Create(StationID::Invalid(), count, Source{Source::Invalid, SourceType::Industry}));
+}
+
+/**
+ * Read the row of one vehicle out of the vehicle inventory.
+ *
+ * The query is filtered by id, so the row is built for that vehicle only. That is what these cases
+ * need: `VehicleRow` reads the vehicle through the engine's own `IsStoppedInDepot()`, which asserts
+ * that it is asked for the head of a chain, so a case reads the rows of heads and of vehicles that
+ * stand alone, and reads the parts of a chain through the consist of their head.
+ * @param v The vehicle.
+ * @return The vehicle row the inventory reported.
+ */
+Json VehicleRowOf(const Vehicle *v)
+{
+	const Json params = {{"kind", "vehicles"}, {"filters", {{"vehicle_id", static_cast<int64_t>(v->index.base())}}}};
+	const std::optional<Json> result = DispatchGameTool("world.query", params, CompanyID::Invalid());
+	REQUIRE(result.has_value());
+	REQUIRE((*result)["ok"] == true);
+	REQUIRE((*result)["total"] == 1);
+	return (*result)["rows"].front();
+}
+
+} // namespace
+
+TEST_CASE("agent_game_tools: a locomotive row carries the consist it hauls")
+{
+	LoadTestLanguagePack();
+	InitTestCargoLabels();
+
+	/* The company is declared first, so the vehicles are removed before it. */
+	TestCompanyGuard company;
+	TestRoadMap map;
+	TestConsistEngines engines;
+	TestConsistVehicles vehicles;
+
+	const TileIndex tile = TileXY(10, 10);
+	Train *loco = vehicles.Create<Train>();
+	Train *first_wagon = vehicles.Create<Train>();
+	Train *second_wagon = vehicles.Create<Train>();
+	SetupTrainPart(loco, company.Id(), engines.loco->index, tile, true);
+	SetupTrainPart(first_wagon, company.Id(), engines.wagon->index, tile, false);
+	SetupTrainPart(second_wagon, company.Id(), engines.wagon->index, tile, false);
+	/* A refitted train carries the same cargo in every part; the locomotive has no capacity for it. */
+	LoadCargo(loco, TEST_CARGO_COAL, 0, 0);
+	LoadCargo(first_wagon, TEST_CARGO_COAL, 50, 30);
+	LoadCargo(second_wagon, TEST_CARGO_COAL, 50, 40);
+	loco->SetNext(first_wagon);
+	first_wagon->SetNext(second_wagon);
+
+	/* The chain the engine built, before anything is read: head, order and last part. */
+	REQUIRE(loco->First() == loco);
+	REQUIRE(loco->Next() == first_wagon);
+	REQUIRE(first_wagon->Next() == second_wagon);
+	REQUIRE(second_wagon->Previous() == first_wagon);
+	REQUIRE(loco->Last() == second_wagon);
+
+	const Json row = VehicleRowOf(loco);
+	CHECK(row["id"] == static_cast<int64_t>(loco->index.base()));
+	CHECK(row["is_primary"] == true);
+	/* A primary vehicle is its own head, and the reference is a full generation reference. */
+	CHECK(row["primary_ref"] == row["ref"]);
+	CHECK(row["primary_ref"]["type"] == "vehicle");
+	CHECK(row["primary_ref"]["generation"] == loco->generation);
+
+	REQUIRE(row.contains("consist"));
+	const Json &consist = row["consist"];
+	CHECK(consist["total_parts"] == 3);
+	CHECK(consist["truncated"] == false);
+	REQUIRE(consist["parts"].size() == 3);
+	/* The parts are the engine's own chain, in chain order, each with its own lifetime. */
+	CHECK(consist["parts"][0]["ref"] == row["ref"]);
+	CHECK(consist["parts"][1]["ref"]["id"] == static_cast<int64_t>(first_wagon->index.base()));
+	CHECK(consist["parts"][1]["ref"]["generation"] == first_wagon->generation);
+	CHECK(consist["parts"][2]["ref"]["id"] == static_cast<int64_t>(second_wagon->index.base()));
+	CHECK(consist["parts"][2]["ref"]["generation"] == second_wagon->generation);
+	/* Every part carries its own cargo: the locomotive none, the wagons what was loaded on them. */
+	CHECK(consist["parts"][0]["cargo"]["load"] == 0);
+	CHECK(consist["parts"][0]["cargo"]["capacity"] == 0);
+	CHECK(consist["parts"][1]["cargo"]["type"] == static_cast<int>(TEST_CARGO_COAL));
+	CHECK(consist["parts"][1]["cargo"]["label"] == "COAL");
+	CHECK(consist["parts"][1]["cargo"]["load"] == 30);
+	CHECK(consist["parts"][1]["cargo"]["capacity"] == 50);
+	CHECK(consist["parts"][2]["cargo"]["load"] == 40);
+	CHECK(consist["parts"][2]["cargo"]["capacity"] == 50);
+
+	/* The chain total is the engine's own sum over every part, with the label of the cargo. */
+	REQUIRE(consist["cargo"].size() == 1);
+	CHECK(consist["cargo"][0]["type"] == static_cast<int>(TEST_CARGO_COAL));
+	CHECK(consist["cargo"][0]["label"] == "COAL");
+	CHECK(consist["cargo"][0]["load"] == 70);
+	CHECK(consist["cargo"][0]["capacity"] == 100);
+
+	/* The row's own cargo field still describes the one vehicle, not the chain. */
+	CHECK(row["cargo"]["load"] == 0);
+	CHECK(row["cargo"]["capacity"] == 0);
+}
+
+TEST_CASE("agent_game_tools: a consist totals each cargo over the whole chain")
+{
+	LoadTestLanguagePack();
+	InitTestCargoLabels();
+
+	/* The company is declared first, so the vehicles are removed before it. */
+	TestCompanyGuard company;
+	TestRoadMap map;
+	TestConsistEngines engines;
+	TestConsistVehicles vehicles;
+
+	const TileIndex tile = TileXY(12, 12);
+	Train *loco = vehicles.Create<Train>();
+	Train *coal_wagon = vehicles.Create<Train>();
+	Train *wood_wagon = vehicles.Create<Train>();
+	Train *second_coal_wagon = vehicles.Create<Train>();
+	SetupTrainPart(loco, company.Id(), engines.loco->index, tile, true);
+	SetupTrainPart(coal_wagon, company.Id(), engines.wagon->index, tile, false);
+	SetupTrainPart(wood_wagon, company.Id(), engines.wagon->index, tile, false);
+	SetupTrainPart(second_coal_wagon, company.Id(), engines.wagon->index, tile, false);
+	LoadCargo(loco, TEST_CARGO_COAL, 0, 0);
+	LoadCargo(coal_wagon, TEST_CARGO_COAL, 50, 30);
+	LoadCargo(wood_wagon, TEST_CARGO_WOOD, 40, 20);
+	LoadCargo(second_coal_wagon, TEST_CARGO_COAL, 50, 10);
+	loco->SetNext(coal_wagon);
+	coal_wagon->SetNext(wood_wagon);
+	wood_wagon->SetNext(second_coal_wagon);
+	REQUIRE(loco->Last() == second_coal_wagon);
+
+	const Json row = VehicleRowOf(loco);
+	const Json &consist = row["consist"];
+	CHECK(consist["total_parts"] == 4);
+	CHECK(consist["truncated"] == false);
+	REQUIRE(consist["parts"].size() == 4);
+
+	/* One entry per cargo type, in the order of the engine's cargo type ids, summed over the whole
+	 * chain: the coal of the first and the last wagon is one total, the wood of the middle one its
+	 * own. */
+	REQUIRE(consist["cargo"].size() == 2);
+	CHECK(consist["cargo"][0]["type"] == static_cast<int>(TEST_CARGO_COAL));
+	CHECK(consist["cargo"][0]["label"] == "COAL");
+	CHECK(consist["cargo"][0]["load"] == 40);
+	CHECK(consist["cargo"][0]["capacity"] == 100);
+	CHECK(consist["cargo"][1]["type"] == static_cast<int>(TEST_CARGO_WOOD));
+	CHECK(consist["cargo"][1]["label"] == "WOOD");
+	CHECK(consist["cargo"][1]["load"] == 20);
+	CHECK(consist["cargo"][1]["capacity"] == 40);
+
+	/* The parts say where the totals come from: the mixed wagon is listed with its own cargo. */
+	CHECK(consist["parts"][2]["ref"]["id"] == static_cast<int64_t>(wood_wagon->index.base()));
+	CHECK(consist["parts"][2]["cargo"]["type"] == static_cast<int>(TEST_CARGO_WOOD));
+	CHECK(consist["parts"][2]["cargo"]["load"] == 20);
+	CHECK(consist["parts"][2]["cargo"]["capacity"] == 40);
+}
+
+TEST_CASE("agent_game_tools: a free wagon has no head and no consist")
+{
+	LoadTestLanguagePack();
+	InitTestCargoLabels();
+
+	/* The company is declared first, so the vehicles are removed before it. */
+	TestCompanyGuard company;
+	TestRoadMap map;
+	TestConsistEngines engines;
+	TestConsistVehicles vehicles;
+
+	const TileIndex tile = TileXY(14, 14);
+	Train *loco = vehicles.Create<Train>();
+	Train *coupled_wagon = vehicles.Create<Train>();
+	Train *free_wagon = vehicles.Create<Train>();
+	SetupTrainPart(loco, company.Id(), engines.loco->index, tile, true);
+	SetupTrainPart(coupled_wagon, company.Id(), engines.wagon->index, tile, false);
+	SetupTrainPart(free_wagon, company.Id(), engines.wagon->index, tile, false);
+	LoadCargo(loco, TEST_CARGO_COAL, 0, 0);
+	LoadCargo(coupled_wagon, TEST_CARGO_COAL, 50, 20);
+	LoadCargo(free_wagon, TEST_CARGO_COAL, 50, 5);
+	loco->SetNext(coupled_wagon);
+
+	/* A wagon that stands alone in the pool is its own head, and that head is no primary vehicle. */
+	REQUIRE(free_wagon->First() == free_wagon);
+	REQUIRE_FALSE(free_wagon->IsPrimaryVehicle());
+
+	const Json free_row = VehicleRowOf(free_wagon);
+	CHECK(free_row["is_primary"] == false);
+	/* No fabricated head: the wagon itself is not a primary vehicle, so the field is null. */
+	CHECK(free_row["primary_ref"].is_null());
+	/* Only a primary row carries a consist, and a wagon's own cargo is still its own cargo. */
+	CHECK_FALSE(free_row.contains("consist"));
+	CHECK(free_row["cargo"]["load"] == 5);
+	CHECK(free_row["cargo"]["capacity"] == 50);
+
+	/* The coupled wagon is in the chain of the locomotive and in no other chain. */
+	const Json loco_row = VehicleRowOf(loco);
+	CHECK(loco_row["is_primary"] == true);
+	CHECK(loco_row["consist"]["total_parts"] == 2);
+	REQUIRE(loco_row["consist"]["parts"].size() == 2);
+	CHECK(loco_row["consist"]["parts"][1]["ref"]["id"] == static_cast<int64_t>(coupled_wagon->index.base()));
+	CHECK(loco_row["consist"]["cargo"][0]["load"] == 20);
+}
+
+TEST_CASE("agent_game_tools: a consist reference names a lifetime, not a pool id")
+{
+	LoadTestLanguagePack();
+	InitTestCargoLabels();
+
+	/* The company is declared first, so the vehicles are removed before it. */
+	TestCompanyGuard company;
+	TestRoadMap map;
+	TestConsistEngines engines;
+	TestConsistVehicles vehicles;
+
+	const TileIndex tile = TileXY(16, 16);
+	Train *loco = vehicles.Create<Train>();
+	Train *wagon = vehicles.Create<Train>();
+	SetupTrainPart(loco, company.Id(), engines.loco->index, tile, true);
+	SetupTrainPart(wagon, company.Id(), engines.wagon->index, tile, false);
+	LoadCargo(loco, TEST_CARGO_COAL, 0, 0);
+	LoadCargo(wagon, TEST_CARGO_COAL, 50, 10);
+	loco->SetNext(wagon);
+
+	const Json before = VehicleRowOf(loco);
+	REQUIRE(before["consist"]["parts"].size() == 2);
+	const int64_t wagon_id = before["consist"]["parts"][1]["ref"]["id"].get<int64_t>();
+	const uint64_t wagon_generation = before["consist"]["parts"][1]["ref"]["generation"].get<uint64_t>();
+	CHECK(wagon_id == static_cast<int64_t>(wagon->index.base()));
+	CHECK(wagon_generation == wagon->generation);
+	CHECK(before["consist"]["cargo"][0]["load"] == 10);
+
+	/* The pool is reset the way the fixtures do it and a new consist is built in it: the engine keeps
+	 * the lifetime counter, so the rebuilt wagon gets the id back but not the lifetime. */
+	_vehicle_pool.CleanPool();
+	REQUIRE(Vehicle::CanAllocateItem(2));
+	Train *new_loco = Train::Create();
+	Train *new_wagon = Train::Create();
+	REQUIRE(new_loco != nullptr);
+	REQUIRE(new_wagon != nullptr);
+	REQUIRE(new_wagon->index.base() == static_cast<uint32_t>(wagon_id));
+	SetupTrainPart(new_loco, company.Id(), engines.loco->index, tile, true);
+	SetupTrainPart(new_wagon, company.Id(), engines.wagon->index, tile, false);
+	LoadCargo(new_loco, TEST_CARGO_COAL, 0, 0);
+	LoadCargo(new_wagon, TEST_CARGO_COAL, 50, 15);
+	new_loco->SetNext(new_wagon);
+
+	const Json after = VehicleRowOf(new_loco);
+	REQUIRE(after["consist"]["parts"].size() == 2);
+	/* Same id, different lifetime: a reference to the old wagon can never be read as the new one. */
+	CHECK(after["consist"]["parts"][1]["ref"]["id"] == wagon_id);
+	CHECK(after["consist"]["parts"][1]["ref"]["generation"] != wagon_generation);
+	CHECK(after["consist"]["parts"][1]["ref"]["generation"] == new_wagon->generation);
+	/* And the new consist carries the new cargo, so the row is not a remembered answer. */
+	CHECK(after["consist"]["cargo"][0]["load"] == 15);
+}
+
+TEST_CASE("agent_game_tools: an aircraft, a ship and a road vehicle read the same consist fields")
+{
+	LoadTestLanguagePack();
+	InitTestCargoLabels();
+
+	/* The company is declared first, so the vehicles are removed before it. */
+	TestCompanyGuard company;
+	TestRoadMap map;
+	TestConsistEngines engines;
+	TestConsistVehicles vehicles;
+
+	const TileIndex tile = TileXY(18, 18);
+
+	/* An aircraft is a chain too: the front aircraft carries the passengers and the shadow behind it
+	 * carries the mail, so the chain total is what the aircraft really hauls. */
+	Aircraft *plane = vehicles.Create<Aircraft>();
+	Aircraft *shadow = vehicles.Create<Aircraft>();
+	plane->owner = company.Id();
+	plane->engine_type = engines.aircraft->index;
+	plane->tile = tile;
+	plane->subtype = AIR_AIRCRAFT;
+	shadow->owner = company.Id();
+	shadow->engine_type = engines.aircraft->index;
+	shadow->tile = tile;
+	shadow->subtype = AIR_SHADOW;
+	LoadCargo(plane, TEST_CARGO_PASSENGERS, 100, 40);
+	LoadCargo(shadow, TEST_CARGO_MAIL, 20, 5);
+	plane->SetNext(shadow);
+	REQUIRE(plane->First() == plane);
+	REQUIRE(plane->Next() == shadow);
+
+	const Json plane_row = VehicleRowOf(plane);
+	CHECK(plane_row["is_primary"] == true);
+	CHECK(plane_row["primary_ref"] == plane_row["ref"]);
+	const Json &plane_consist = plane_row["consist"];
+	CHECK(plane_consist["total_parts"] == 2);
+	REQUIRE(plane_consist["parts"].size() == 2);
+	CHECK(plane_consist["parts"][1]["ref"]["id"] == static_cast<int64_t>(shadow->index.base()));
+	CHECK(plane_consist["parts"][1]["ref"]["generation"] == shadow->generation);
+	REQUIRE(plane_consist["cargo"].size() == 2);
+	CHECK(plane_consist["cargo"][0]["type"] == static_cast<int>(TEST_CARGO_PASSENGERS));
+	CHECK(plane_consist["cargo"][0]["load"] == 40);
+	CHECK(plane_consist["cargo"][0]["capacity"] == 100);
+	CHECK(plane_consist["cargo"][1]["type"] == static_cast<int>(TEST_CARGO_MAIL));
+	CHECK(plane_consist["cargo"][1]["label"] == "MAIL");
+	CHECK(plane_consist["cargo"][1]["load"] == 5);
+	CHECK(plane_consist["cargo"][1]["capacity"] == 20);
+
+	/* A ship is one vehicle: it is its own head and its own consist. */
+	Ship *ship = vehicles.Create<Ship>();
+	ship->owner = company.Id();
+	ship->engine_type = engines.ship->index;
+	ship->tile = tile;
+	LoadCargo(ship, TEST_CARGO_COAL, 200, 90);
+
+	const Json ship_row = VehicleRowOf(ship);
+	CHECK(ship_row["is_primary"] == true);
+	CHECK(ship_row["primary_ref"] == ship_row["ref"]);
+	const Json &ship_consist = ship_row["consist"];
+	CHECK(ship_consist["total_parts"] == 1);
+	CHECK(ship_consist["truncated"] == false);
+	REQUIRE(ship_consist["parts"].size() == 1);
+	CHECK(ship_consist["parts"][0]["ref"] == ship_row["ref"]);
+	REQUIRE(ship_consist["cargo"].size() == 1);
+	CHECK(ship_consist["cargo"][0]["type"] == static_cast<int>(TEST_CARGO_COAL));
+	CHECK(ship_consist["cargo"][0]["load"] == 90);
+	CHECK(ship_consist["cargo"][0]["capacity"] == 200);
+
+	/* A road vehicle can be articulated as well; the rear part carries its own cargo and is part of
+	 * the same chain, so the two parts add up to what the bus carries. */
+	RoadVehicle *bus = vehicles.Create<RoadVehicle>();
+	RoadVehicle *bus_rear = vehicles.Create<RoadVehicle>();
+	bus->owner = company.Id();
+	bus->engine_type = engines.road->index;
+	bus->tile = tile;
+	bus->roadtype = ROADTYPE_ROAD;
+	bus->SetFrontEngine();
+	bus_rear->owner = company.Id();
+	bus_rear->engine_type = engines.road->index;
+	bus_rear->tile = tile;
+	bus_rear->roadtype = ROADTYPE_ROAD;
+	bus_rear->SetArticulatedPart();
+	LoadCargo(bus, TEST_CARGO_PASSENGERS, 40, 20);
+	LoadCargo(bus_rear, TEST_CARGO_PASSENGERS, 40, 15);
+	bus->SetNext(bus_rear);
+	REQUIRE(bus->Next() == bus_rear);
+	REQUIRE(bus_rear->IsArticulatedPart());
+
+	const Json bus_row = VehicleRowOf(bus);
+	CHECK(bus_row["is_primary"] == true);
+	CHECK(bus_row["primary_ref"] == bus_row["ref"]);
+	CHECK(bus_row["road_type"] == "road");
+	const Json &bus_consist = bus_row["consist"];
+	CHECK(bus_consist["total_parts"] == 2);
+	REQUIRE(bus_consist["parts"].size() == 2);
+	CHECK(bus_consist["parts"][1]["ref"]["id"] == static_cast<int64_t>(bus_rear->index.base()));
+	REQUIRE(bus_consist["cargo"].size() == 1);
+	CHECK(bus_consist["cargo"][0]["type"] == static_cast<int>(TEST_CARGO_PASSENGERS));
+	CHECK(bus_consist["cargo"][0]["load"] == 35);
+	CHECK(bus_consist["cargo"][0]["capacity"] == 80);
+}
+
+TEST_CASE("agent_game_tools: a consist list is bounded and says it was truncated")
+{
+	LoadTestLanguagePack();
+	InitTestCargoLabels();
+
+	/* The company is declared first, so the vehicles are removed before it. */
+	TestCompanyGuard company;
+	TestRoadMap map;
+	TestConsistEngines engines;
+	TestConsistVehicles vehicles;
+
+	/* One locomotive and 129 wagons: two more parts than a row may list. */
+	const TileIndex tile = TileXY(20, 20);
+	Train *loco = vehicles.Create<Train>();
+	SetupTrainPart(loco, company.Id(), engines.loco->index, tile, true);
+	LoadCargo(loco, TEST_CARGO_COAL, 0, 0);
+
+	Train *last = loco;
+	for (int i = 0; i < 129; i++) {
+		Train *wagon = vehicles.Create<Train>();
+		SetupTrainPart(wagon, company.Id(), engines.wagon->index, tile, false);
+		LoadCargo(wagon, TEST_CARGO_COAL, 2, 1);
+		last->SetNext(wagon);
+		last = wagon;
+	}
+	REQUIRE(loco->Last() == last);
+
+	const Json row = VehicleRowOf(loco);
+	const Json &consist = row["consist"];
+	CHECK(consist["total_parts"] == 130);
+	CHECK(consist["truncated"] == true);
+	REQUIRE(consist["parts"].size() == 128);
+	/* The list stops at the 128th part, while the totals are still over the whole chain. */
+	CHECK(consist["parts"][127]["ref"]["id"] == static_cast<int64_t>(loco->Move(127)->index.base()));
+	CHECK(consist["parts"][127]["ref"]["generation"] == loco->Move(127)->generation);
+	REQUIRE(consist["cargo"].size() == 1);
+	CHECK(consist["cargo"][0]["type"] == static_cast<int>(TEST_CARGO_COAL));
+	CHECK(consist["cargo"][0]["load"] == 129);
+	CHECK(consist["cargo"][0]["capacity"] == 258);
+}
+
+namespace {
+
+/**
+ * One real airport station with the hangar tile of its small airport, removed again when the fixture
+ * goes out of scope.
+ *
+ * A running game builds the airport through the build command; these cases only need the airport data
+ * the engine reads to recognise a hangar, so the small airport is placed on the station directly.
+ */
+class TestConsistHangar {
+public:
+	TestConsistHangar(CompanyID owner, TileIndex tile)
+	{
+		REQUIRE(Station::GetNumItems() == 0);
+		REQUIRE(Station::CanAllocateItem());
+		this->station = Station::Create(tile);
+		REQUIRE(this->station != nullptr);
+		this->station->owner = owner;
+		this->station->airport.type = AT_SMALL;
+		this->station->airport.rotation = Direction::N;
+		this->station->airport.tile = tile;
+		this->hangar = this->station->GetHangarTile(0);
+		MakeAirport(this->hangar, owner, this->station->index, 0, WaterClass::None);
+	}
+
+	~TestConsistHangar() { _station_pool.CleanPool(); }
+
+	/** @return The hangar tile of the airport. */
+	TileIndex Hangar() const { return this->hangar; }
+
+private:
+	Station *station = nullptr;      ///< The airport station.
+	TileIndex hangar = INVALID_TILE; ///< The hangar tile of the airport.
+};
+
+} // namespace
+
+TEST_CASE("agent_game_tools: a part of a chain is a row of its own")
+{
+	LoadTestLanguagePack();
+	InitTestCargoLabels();
+
+	/* The company is declared first, so the vehicles and the station are removed before it. */
+	TestCompanyGuard company;
+	TestRoadMap map;
+	TestConsistEngines engines;
+	TestConsistVehicles vehicles;
+	TestConsistHangar hangar(company.Id(), TileXY(30, 30));
+
+	/* A wagon behind the locomotive: its row is the row of that wagon, and the depot fields of the
+	 * engine answer for the part and for the chain it is in. */
+	const TileIndex tile = TileXY(10, 10);
+	Train *loco = vehicles.Create<Train>();
+	Train *wagon = vehicles.Create<Train>();
+	SetupTrainPart(loco, company.Id(), engines.loco->index, tile, true);
+	SetupTrainPart(wagon, company.Id(), engines.wagon->index, tile, false);
+	LoadCargo(loco, TEST_CARGO_COAL, 0, 0);
+	LoadCargo(wagon, TEST_CARGO_COAL, 50, 12);
+	loco->SetNext(wagon);
+	REQUIRE(wagon->First() == loco);
+	REQUIRE(wagon->Previous() == loco);
+	/* The part is on a depot track bit of its own while the chain is not stopped in a depot, so the
+	 * per-part state below has to be the state of the part and not the state of the chain. */
+	wagon->track = Track::Depot;
+
+	const Json wagon_row = VehicleRowOf(wagon);
+	CHECK(wagon_row["is_primary"] == false);
+	CHECK(wagon_row["primary_ref"]["id"] == static_cast<int64_t>(loco->index.base()));
+	CHECK(wagon_row["primary_ref"]["generation"] == loco->generation);
+	CHECK_FALSE(wagon_row.contains("consist"));
+	CHECK(wagon_row["cargo"]["type"] == static_cast<int>(TEST_CARGO_COAL));
+	CHECK(wagon_row["cargo"]["load"] == 12);
+	CHECK(wagon_row["cargo"]["capacity"] == 50);
+	CHECK(wagon_row["in_depot_state"] == true);
+	/* The chain of the wagon is not stopped in a depot, so the chain state is false for the part. */
+	CHECK(wagon_row["in_depot"] == false);
+	CHECK(wagon_row["halted_in_depot"] == false);
+	CHECK(wagon_row["depot_ref"].is_null());
+	CHECK(wagon_row["status"] == "travelling");
+
+	/* The same part with the flag the engine sets on a vehicle it halted: the state name is the state
+	 * of the chain, which is not a depot, so the part reads as stopped and not as in a depot. */
+	wagon->vehstatus.Set(VehState::Stopped);
+	const Json halted_row = VehicleRowOf(wagon);
+	CHECK(halted_row["stopped"] == true);
+	CHECK(halted_row["status"] == "stopped");
+	CHECK(halted_row["halted_in_depot"] == false);
+	wagon->vehstatus.Reset(VehState::Stopped);
+
+	/* The shadow of an aircraft that stands in its hangar: a part, read through the aircraft where the
+	 * engine only answers for a primary vehicle. */
+	REQUIRE(IsHangarTile(hangar.Hangar()));
+	Aircraft *plane = vehicles.Create<Aircraft>();
+	Aircraft *shadow = vehicles.Create<Aircraft>();
+	plane->owner = company.Id();
+	plane->engine_type = engines.aircraft->index;
+	plane->tile = hangar.Hangar();
+	plane->subtype = AIR_AIRCRAFT;
+	plane->vehstatus = {VehState::Hidden, VehState::Stopped, VehState::DefaultPalette};
+	shadow->owner = company.Id();
+	shadow->engine_type = engines.aircraft->index;
+	shadow->tile = hangar.Hangar();
+	shadow->subtype = AIR_SHADOW;
+	shadow->vehstatus = {VehState::Hidden, VehState::Stopped, VehState::DefaultPalette};
+	LoadCargo(plane, TEST_CARGO_PASSENGERS, 100, 40);
+	LoadCargo(shadow, TEST_CARGO_MAIL, 20, 5);
+	plane->SetNext(shadow);
+	REQUIRE(shadow->First() == plane);
+	REQUIRE_FALSE(shadow->IsPrimaryVehicle());
+
+	const Json shadow_row = VehicleRowOf(shadow);
+	CHECK(shadow_row["is_primary"] == false);
+	CHECK(shadow_row["primary_ref"]["id"] == static_cast<int64_t>(plane->index.base()));
+	CHECK_FALSE(shadow_row.contains("consist"));
+	CHECK(shadow_row["cargo"]["type"] == static_cast<int>(TEST_CARGO_MAIL));
+	CHECK(shadow_row["cargo"]["load"] == 5);
+	/* The aircraft and its shadow stand in the hangar: the chain state and the depot state of the
+	 * shadow are both true, and the shadow is read through the aircraft for the depot state. */
+	CHECK(shadow_row["in_depot"] == true);
+	CHECK(shadow_row["in_depot_state"] == true);
+	CHECK(shadow_row["status"] == "in_depot");
+	/* A hangar stores no depot, so an aircraft in its hangar has no depot reference. */
+	CHECK(shadow_row["depot_ref"].is_null());
+
+	const Json plane_row = VehicleRowOf(plane);
+	CHECK(plane_row["in_depot"] == true);
+	CHECK(plane_row["in_depot_state"] == true);
+	CHECK(plane_row["status"] == "in_depot");
+	CHECK(plane_row["depot_ref"].is_null());
+	CHECK(plane_row["consist"]["total_parts"] == 2);
+
+	/* The articulated part of a road vehicle: the depot state of the part is the state of the part,
+	 * which is what the front part of the same chain does not have. */
+	RoadVehicle *bus = vehicles.Create<RoadVehicle>();
+	RoadVehicle *bus_rear = vehicles.Create<RoadVehicle>();
+	const TileIndex road_tile = TileXY(14, 14);
+	bus->owner = company.Id();
+	bus->engine_type = engines.road->index;
+	bus->tile = road_tile;
+	bus->roadtype = ROADTYPE_ROAD;
+	bus->SetFrontEngine();
+	bus->state = RVSB_IN_DEPOT;
+	bus_rear->owner = company.Id();
+	bus_rear->engine_type = engines.road->index;
+	bus_rear->tile = road_tile;
+	bus_rear->roadtype = ROADTYPE_ROAD;
+	bus_rear->SetArticulatedPart();
+	/* State 0 is a track direction, which is not `RVSB_IN_DEPOT`. */
+	bus_rear->state = 0;
+	LoadCargo(bus, TEST_CARGO_PASSENGERS, 40, 20);
+	LoadCargo(bus_rear, TEST_CARGO_PASSENGERS, 40, 15);
+	bus->SetNext(bus_rear);
+	REQUIRE(bus_rear->First() == bus);
+	REQUIRE(bus_rear->IsArticulatedPart());
+	REQUIRE(bus->IsInDepot());
+	REQUIRE_FALSE(bus_rear->IsInDepot());
+
+	const Json bus_rear_row = VehicleRowOf(bus_rear);
+	CHECK(bus_rear_row["is_primary"] == false);
+	CHECK(bus_rear_row["primary_ref"]["id"] == static_cast<int64_t>(bus->index.base()));
+	CHECK_FALSE(bus_rear_row.contains("consist"));
+	CHECK(bus_rear_row["cargo"]["load"] == 15);
+	CHECK(bus_rear_row["in_depot_state"] == false);
+	CHECK(bus_rear_row["in_depot"] == false);
+	CHECK(bus_rear_row["depot_ref"].is_null());
 }
