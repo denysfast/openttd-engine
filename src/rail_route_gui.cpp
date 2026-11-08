@@ -371,6 +371,7 @@ struct RailRouteWindow : Window {
 		this->Summarise(plan, end);
 		this->SetWidgetDirty(WID_RR_INFO);
 		if (!plan.error.empty()) {
+			LogRailRouteFailure(this->start_tile, end, GetOptions(), plan);
 			ShowErrorMessage(GetEncodedString(STR_ERROR_RAIL_ROUTE_CAN_T_BUILD), GetEncodedString(STR_ERROR_RAIL_ROUTE_DETAIL, GetRailRouteErrorText(plan.error)), WarningLevel::Info, x, y);
 			return false;
 		}

@@ -366,3 +366,26 @@ TEST_CASE("RailRouteDoesNotRemoveSignalsForTurnouts")
 	CHECK(plan.prepare.empty());
 	CHECK(plan.build.empty());
 }
+
+TEST_CASE("RailRouteFindsBendsBetweenBlockedSamples")
+{
+	RouteMap map;
+	RailRouteOptions o;
+	o.tracks = 1;
+	o.start = RailRouteStart::X;
+	o.terraform = false;
+	/* Block all four distinct fixed-X samples, leaving other bend positions free. */
+	for (auto [x, y] : {std::pair{45, 30}, {40, 35}, {45, 35}, {50, 35}}) {
+		MakeRailNormal(TileXY(x, y), CompanyID{1}, Track::Y, o.railtype);
+	}
+	auto plan = PlanRailRoute(TileXY(30, 30), TileXY(70, 50), o);
+	REQUIRE(plan.error.empty());
+	CHECK(plan.end == TileXY(70, 50));
+	CHECK(plan.prepare.empty());
+	CHECK(PlannedBits(plan, 30, 30) == Track::X);
+	for (auto [x, y] : {std::pair{45, 30}, {40, 35}, {45, 35}, {50, 35}}) {
+		CHECK(PlannedBits(plan, x, y).None());
+		CHECK(GetTileOwner(TileXY(x, y)) == CompanyID{1});
+		CHECK(GetTrackBits(TileXY(x, y)) == Track::Y);
+	}
+}

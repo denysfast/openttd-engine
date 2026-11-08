@@ -23,6 +23,8 @@
 #include <map>
 #include <set>
 #include "rail_route.h"
+#include "debug.h"
+#include "fileio_func.h"
 #include "bridge_map.h"
 #include "clear_map.h"
 #include "tree_map.h"
@@ -174,6 +176,7 @@ class RoutePlanner {
 	std::vector<int> column_height; ///< Selected corner heights; empty when the original terrain is kept.
 	std::map<TileIndex, TrackBits> track_tiles; ///< Selected route, including terminal pieces.
 	std::vector<RailRoutePiece> pieces; ///< Selected canonical track pieces.
+	std::string failure_detail; ///< Rejection counts for an unsuccessful search.
 
 public:
 	RoutePlanner(const RailRouteOptions &options, RouteFrame frame, int length, int minor) :
@@ -437,6 +440,7 @@ public:
 	bool PlanSteps(std::vector<RailRouteStep> &steps)
 	{
 		int64_t best = INT64_MAX;
+		uint tried = 0, bounds = 0, obstacles_rejected = 0, terrain_rejected = 0;
 		std::set<std::vector<bool>> shapes;
 		const bool straight_start = this->options.start == RailRouteStart::X || this->options.start == RailRouteStart::Y;
 		const bool diagonal_start = this->options.start == RailRouteStart::NS || this->options.start == RailRouteStart::EW;
@@ -454,42 +458,70 @@ public:
 				shapes.insert(std::move(shape));
 			}
 		}
-		for (const auto &shape : shapes) {
-			std::vector<RailRouteStep> candidate(this->length);
-			int bends = 0;
-			for (int c = 0; c < this->length; c++) {
-				candidate[c].diagonal = shape[c];
-				if (c > 0 && shape[c] != shape[c - 1]) bends++;
-			}
-			std::vector<RailRoutePiece> candidate_pieces;
-			auto tiles = this->MakeTrackTiles(candidate, candidate_pieces);
-			if (tiles.empty()) continue;
-			int64_t obstacles = 0;
-			bool blocked = false;
-			for (const auto &[tile, bits] : tiles) {
-				int64_t cost = this->ObstacleCost(tile);
-				if (cost >= ROUTE_BLOCKED_COST) { blocked = true; break; }
-				TrackBits existing = ExistingRouteTracks(tile, this->options.railtype);
-				if (existing.Any() && bits != (bits & existing)) {
-					if (IsRailStationTile(tile) || (HasSignals(tile) && TracksOverlap(bits | existing))) { blocked = true; break; }
+		for (int pass = 0; pass < 2; pass++) {
+			for (const auto &shape : shapes) {
+				tried++;
+				std::vector<RailRouteStep> candidate(this->length);
+				int bends = 0;
+				for (int c = 0; c < this->length; c++) {
+					candidate[c].diagonal = shape[c];
+					if (c > 0 && shape[c] != shape[c - 1]) bends++;
 				}
-				obstacles += cost;
+				std::vector<RailRoutePiece> candidate_pieces;
+				auto tiles = this->MakeTrackTiles(candidate, candidate_pieces);
+				if (tiles.empty()) { bounds++; continue; }
+				int64_t obstacles = 0;
+				bool blocked = false;
+				for (const auto &[tile, bits] : tiles) {
+					int64_t cost = this->ObstacleCost(tile);
+					if (cost >= ROUTE_BLOCKED_COST) { blocked = true; break; }
+					TrackBits existing = ExistingRouteTracks(tile, this->options.railtype);
+					if (existing.Any() && bits != (bits & existing)) {
+						if (IsRailStationTile(tile) || (HasSignals(tile) && TracksOverlap(bits | existing))) { blocked = true; break; }
+					}
+					obstacles += cost;
+				}
+				if (blocked) { obstacles_rejected++; continue; }
+				std::vector<int> heights;
+				int64_t cost = this->KeepTerrain(tiles) ? 0 : this->options.terraform ? this->PlanHeights(candidate, candidate_pieces, tiles, heights) : INT64_MAX;
+				if (cost == INT64_MAX) { terrain_rejected++; continue; }
+				cost += obstacles * 8 + bends;
+				if (cost >= best) continue;
+				best = cost;
+				steps = std::move(candidate);
+				this->pieces = std::move(candidate_pieces);
+				this->track_tiles = std::move(tiles);
+				this->column_height = std::move(heights);
+				/* With no obstacles or earthworks and the minimum number of bends, no later
+				 * candidate can improve this route. Keep previews of long flat lines cheap. */
+				if (best == (this->minor == 0 || this->minor == this->length ? 0 : 1)) break;
 			}
-			if (blocked) continue;
-			std::vector<int> heights;
-			int64_t cost = this->KeepTerrain(tiles) ? 0 : this->options.terraform ? this->PlanHeights(candidate, candidate_pieces, tiles, heights) : INT64_MAX;
-			if (cost == INT64_MAX) continue;
-			cost += obstacles * 8 + bends;
-			if (cost >= best) continue;
-			best = cost;
-			steps = std::move(candidate);
-			this->pieces = std::move(candidate_pieces);
-			this->track_tiles = std::move(tiles);
-			this->column_height = std::move(heights);
-			/* With no obstacles or earthworks and the minimum number of bends, no later
-			 * candidate can improve this route. Keep previews of long flat lines cheap. */
-			if (best == (this->minor == 0 || this->minor == this->length ? 0 : 1)) break;
+			if (best != INT64_MAX) break;
+			/* A few sampled bends can all hit obstacles while a bend between them is clear.
+			 * Retry only a failed plan. Bound the work for long, wide corridors so preview
+			 * failures do not turn into an exhaustive search over the map. */
+			if (pass != 0) break;
+			shapes.clear();
+			int samples = std::clamp(1'000'000 / std::max(1, this->length * static_cast<int>(this->tracks.size())), 8, 128);
+			for (bool diagonal_first : {false, true}) {
+				if ((straight_start && diagonal_first) || (diagonal_start && !diagonal_first)) continue;
+				int outside = diagonal_first ? this->minor : this->length - this->minor;
+				int inside = this->length - outside;
+				int required = this->options.start == RailRouteStart::Auto ? 0 : 1;
+				if (this->options.start != RailRouteStart::Auto) {
+					for (auto [k, skip] : this->tracks) required = std::max(required, diagonal_first ? skip / 2 + 1 : skip + 1);
+				}
+				if (required > outside) continue;
+				int count = std::min(samples, outside - required + 1);
+				for (int i = 0; i < count; i++) {
+					int split = count == 1 ? required : required + static_cast<int>(static_cast<int64_t>(outside - required) * i / (count - 1));
+					std::vector<bool> shape(this->length, diagonal_first);
+					std::fill(shape.begin() + split, shape.begin() + split + inside, !diagonal_first);
+					shapes.insert(std::move(shape));
+				}
+			}
 		}
+		if (best == INT64_MAX) this->failure_detail = fmt::format("candidates={} bounds={} protected={} terrain={}", tried, bounds, obstacles_rejected, terrain_rejected);
 		return best != INT64_MAX;
 	}
 
@@ -499,6 +531,7 @@ public:
 		std::vector<RailRouteStep> steps;
 		if (!this->PlanSteps(steps)) {
 			plan.error = "no route found";
+			plan.diagnostics = this->failure_detail;
 			return;
 		}
 		plan.length = this->length;
@@ -854,4 +887,23 @@ RailRoutePlan PlanRailRoute(TileIndex from, TileIndex to, const RailRouteOptions
 	}
 	plan.error = "the route does not fit the start";
 	return plan;
+}
+
+/**
+ * Persist an explicitly requested failed route, without logging mouse-hover previews.
+ * Records only route coordinates, options and rejection counts; the file is bounded to 64 KiB.
+ */
+void LogRailRouteFailure(TileIndex from, TileIndex to, const RailRouteOptions &options, const RailRoutePlan &plan)
+{
+	if (plan.error.empty() || from >= Map::Size() || to >= Map::Size()) return;
+	bool truncate = false;
+	if (auto previous = FioFOpenFile("rail-route.log", "rb", Subdirectory::Save); previous.has_value()) {
+		if (fseek(*previous, 0, SEEK_END) == 0) truncate = ftell(*previous) > 63 * 1024;
+	}
+	if (auto log = FioFOpenFile("rail-route.log", truncate ? "wb" : "ab", Subdirectory::Save); log.has_value()) {
+		fmt::print(*log, "{}from={},{} to={},{} company={} tracks={} start={} railtype={} terraform={} water={} demolish={} sea={} error={} {}\n",
+				GetLogPrefix(true), TileX(from), TileY(from), TileX(to), TileY(to), _current_company.base(), options.tracks,
+				to_underlying(options.start), to_underlying(options.railtype), options.terraform, options.remove_water, options.demolish,
+				options.raise_sea_level, plan.error, plan.diagnostics);
+	}
 }

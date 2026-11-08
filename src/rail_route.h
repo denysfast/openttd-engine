@@ -84,6 +84,7 @@ struct RailRouteEstimate {
 
 /** A planned trunk line. */
 struct RailRoutePlan {
+	std::string diagnostics; ///< Bounded search rejection counts for explicit failure logging.
 	std::string error{}; ///< Why the route cannot be built; empty when it can.
 	TileIndex origin = INVALID_TILE; ///< Tile the offsets of all chunks are relative to.
 	std::vector<BlueprintChunkData> prepare{}; ///< #Commands::PrepareRailRoute chunks: clearing first, then levelling.
@@ -119,5 +120,7 @@ struct RailRoutePiece {
 };
 
 std::vector<RailRoutePiece> GetRailRoutePieces(const std::vector<RailRouteStep> &steps);
+
+void LogRailRouteFailure(TileIndex from, TileIndex to, const RailRouteOptions &options, const RailRoutePlan &plan);
 
 #endif /* RAIL_ROUTE_H */
