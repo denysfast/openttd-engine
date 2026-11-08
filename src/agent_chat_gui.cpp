@@ -4338,22 +4338,11 @@ nlohmann::json DescribeAgentChatUi()
 		for (size_t i = 0; i < chips.size(); i++) {
 			const int remove_width = GetCharacterHeight(FontSize::Normal);
 			const AgentChatAttachment &attachment = _agent_chat.tray[i];
-			Json entry = Json::object();
-			entry["name"] = GetAttachmentDisplayLabel(attachment);
-			/* The chip is a rectangle; the identity of the reference it shows is added, so a test can
-			 * match a chip to the tray entry without guessing which chip belongs to which object. */
-			entry["type"] = attachment.type;
-			if (attachment.id >= 0) entry["id"] = attachment.id;
-			if (attachment.generation >= 0) entry["generation"] = attachment.generation;
-			if (attachment.tile != INVALID_TILE) entry["tile"] = Json{{"x", TileX(attachment.tile)}, {"y", TileY(attachment.tile)}};
-			if (!attachment.setting_name.empty()) {
-				/* A setting names its scope and, when it is owned, the company and its lifetime. */
-				entry["setting_name"] = attachment.setting_name;
-				entry["scope"] = attachment.scope;
-				if (attachment.company_id >= 0) entry["company_id"] = attachment.company_id;
-				if (attachment.company_generation >= 0) entry["company_generation"] = attachment.company_generation;
-			}
-			entry["stale"] = IsAttachmentStale(attachment);
+			/* The chip is a rectangle; the identity of the reference it shows is the canonical one
+			 * this object reports for the tray, so a test can match a chip to the tray entry - a
+			 * fingerprint, a town generation or any other field the backend reported included -
+			 * without guessing which chip belongs to which object. */
+			Json entry = ReferenceToUiJson(attachment);
 			entry["rect"] = RectToJson(ToScreenRect(*w, chips[i]));
 			entry["remove_rect"] = RectToJson(ToScreenRect(*w, Rect{chips[i].right - remove_width, chips[i].top, chips[i].right, chips[i].bottom}));
 			tray_rows.push_back(std::move(entry));
