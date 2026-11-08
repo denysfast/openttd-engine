@@ -1460,6 +1460,93 @@ TEST_CASE("agent_game_tools: a road stop access reports the entries of its own t
 	CHECK(RoadStopAccessJson(TileXY(30, 11)).is_null());
 }
 
+TEST_CASE("agent_game_tools: a mixed road and tram stop reads each family on its own")
+{
+	/* A bus stop tile can carry a road and a tram road type at once, and the two are separate track.
+	 * Each family is therefore read on its own: a neighbour with road only must not answer for tram,
+	 * and a one-way road must not block the tram track beside it. The stop is a drive-through one,
+	 * because the game lets trams on drive-through stops only: `CmdBuildRoadStop` refuses a bay stop
+	 * whose road type is a tram. */
+	TestRoadMap map;
+
+	MakeDriveThroughRoadStop(TileXY(30, 10), OWNER_NONE, OWNER_NONE, OWNER_NONE, StationID(0), StationType::Bus, ROADTYPE_ROAD, ROADTYPE_TRAM, Axis::Y);
+
+	/* The platform runs along the y axis, so it is entered from either end: the neighbour to the
+	 * south-east (30, 11) and the one to the north-west (30, 9). The order of the entries is the
+	 * engine's, so an entry is picked by its own direction and family, never by an index. */
+	const auto entry = [](const Json &entries, const char *direction, const char *family) -> Json {
+		for (const Json &candidate : entries) {
+			if (candidate["direction"] == direction && candidate["family"] == family) return candidate;
+		}
+		FAIL("no entry for that direction and family");
+		return Json(nullptr);
+	};
+
+	/* A road-only neighbour at the south-east end: the road family reaches the stop, the tram family
+	 * cannot, because that tile carries no tram track at all. */
+	MakeRoadNormal(TileXY(30, 11), ROAD_Y, ROADTYPE_ROAD, INVALID_ROADTYPE, TownID::Invalid(), OWNER_NONE, OWNER_NONE);
+
+	const Json road_only = RoadStopAccessJson(TileXY(30, 10));
+	CHECK(road_only["type"] == "bus");
+	CHECK(road_only["kind"] == "drive_through");
+	CHECK(road_only["axis"] == "y");
+	REQUIRE(road_only.contains("road"));
+	REQUIRE(road_only.contains("tram"));
+	REQUIRE(road_only["road"]["entries"].size() == 2);
+	REQUIRE(road_only["tram"]["entries"].size() == 2);
+	CHECK(road_only["road"]["road_type_id"] == static_cast<int>(ROADTYPE_ROAD));
+	CHECK(road_only["tram"]["road_type_id"] == static_cast<int>(ROADTYPE_TRAM));
+
+	const Json se_road = entry(road_only["road"]["entries"], "se", "road");
+	CHECK(se_road["tile"]["x"] == 30);
+	CHECK(se_road["tile"]["y"] == 11);
+	CHECK(se_road["connected"] == true);
+	CHECK(Contains(se_road["road_bits"], "nw"));
+
+	const Json se_tram = entry(road_only["tram"]["entries"], "se", "tram");
+	CHECK(se_tram["connected"] == false);
+	CHECK(se_tram["has_required_bit"] == false);
+	CHECK(se_tram["road_bits"].empty());
+
+	/* Nothing lies at the other end, so neither family reaches the stop from there. */
+	CHECK(entry(road_only["road"]["entries"], "nw", "road")["connected"] == false);
+	CHECK(entry(road_only["tram"]["entries"], "nw", "tram")["connected"] == false);
+
+	/* The combined list carries both families, one entry per family and end, each labelled with its
+	 * own `family`. That label is all the combined list gives: a mixed stop has a road entry and a
+	 * tram entry for the same end, so a reader that wants one family has to select on `family` (or
+	 * take that family's subobject) and cannot read an entry of the other family as its answer. */
+	REQUIRE(road_only["entries"].size() == 4);
+	CHECK(entry(road_only["entries"], "se", "road")["connected"] == true);
+	CHECK(entry(road_only["entries"], "se", "tram")["connected"] == false);
+	CHECK(entry(road_only["entries"], "nw", "road")["connected"] == false);
+	CHECK(entry(road_only["entries"], "nw", "tram")["connected"] == false);
+
+	/* Tram track on the neighbour makes the tram family reachable as well. */
+	MakeRoadNormal(TileXY(30, 11), ROAD_Y, ROADTYPE_ROAD, ROADTYPE_TRAM, TownID::Invalid(), OWNER_NONE, OWNER_NONE);
+	const Json both = RoadStopAccessJson(TileXY(30, 10));
+	CHECK(entry(both["road"]["entries"], "se", "road")["connected"] == true);
+	CHECK(entry(both["tram"]["entries"], "se", "tram")["connected"] == true);
+
+	/* A one-way restriction belongs to the road family only: the engine leaves the tram trackdirs
+	 * unscaled, so the tram entry stays usable while the road entry is blocked. */
+	SetDisallowedRoadDirections(TileXY(30, 11), DisallowedRoadDirections{DisallowedRoadDirection::Northbound});
+	const Json one_way = RoadStopAccessJson(TileXY(30, 10));
+	const Json one_way_road = entry(one_way["road"]["entries"], "se", "road");
+	CHECK(one_way_road["has_required_bit"] == true);
+	CHECK(one_way_road["drivable"] == false);
+	CHECK(one_way_road["connected"] == false);
+	CHECK(entry(one_way["tram"]["entries"], "se", "tram")["connected"] == true);
+
+	/* A stop with a road type only has no tram family at all, so nothing can be read as tram. */
+	MakeRoadStop(TileXY(40, 10), OWNER_NONE, StationID(1), RoadStopType::Truck, ROADTYPE_ROAD, INVALID_ROADTYPE, DiagDirection::SE);
+	const Json road_family_only = RoadStopAccessJson(TileXY(40, 10));
+	CHECK(road_family_only.contains("road"));
+	CHECK_FALSE(road_family_only.contains("tram"));
+	REQUIRE(road_family_only["entries"].size() == 1);
+	CHECK(road_family_only["entries"][0]["family"] == "road");
+}
+
 TEST_CASE("agent_game_tools: a planned depot exit reports only the neighbour tile")
 {
 	/* A dry run builds nothing, so the depot tile carries no exit piece. The proposal therefore

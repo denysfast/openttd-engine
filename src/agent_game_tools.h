@@ -156,6 +156,8 @@ void AgentCloneVehicleCallback(Commands cmd, const CommandCost &result, VehicleI
  * a remembered build.
  *
  * One connection (a depot exit or a stop entry) is reported as an object with these fields:
+ *   `family`             `road` or `tram`: the road or tram family this connection was read for. The
+ *                        two are separate track, so they are always read separately.
  *   `direction`          the direction from the reported tile to the neighbour tile, as `ne`/`se`/
  *                        `sw`/`nw` (the engine's `DiagDirection`).
  *   `tile`               the neighbour tile, from the engine's own `TileAddByDiagDir`, or null when
@@ -198,7 +200,7 @@ Json RoadDepotEntranceJson(TileIndex depot_tile);
  * @param depot_tile Tile the depot is planned for.
  * @param dir The planned exit direction.
  * @param rtt The planned road or tram family.
- * @return `{direction, tile, required_road_bit, road_bits, has_required_bit, planned,
+ * @return `{family, direction, tile, required_road_bit, road_bits, has_required_bit, planned,
  *         neighbour_drivable}`. `neighbour_drivable` is the engine's track test on the neighbour
  *         tile alone, for a vehicle entering it from the depot side, so a one-piece stub is caught
  *         before the depot exists. A built depot always carries its own exit piece, so the depot is
@@ -214,11 +216,22 @@ Json RoadDepotExitProposalJson(TileIndex depot_tile, DiagDirection dir, RoadTram
  * `GetDriveThroughStopAxis`, so it has two. A multi-tile drive-through platform is reported one
  * tile at a time, exactly as the engine stores it: the entries of the reported tile are its own
  * neighbours.
+ *
+ * A stop tile can carry a road and a tram road type at once, and those are separate track. Every
+ * family the tile carries is read on its own, so a road-only neighbour never answers for tram and the
+ * road-only one-way rule never blocks tram track.
  * @param stop_tile Tile of the road stop.
- * @return `{tile, station_id, type, kind, axis?, entries}` where `type` is `bus` or `truck`, `kind`
- *         is `bay` or `drive_through`, `axis` is `x` or `y` for a drive-through stop only, and
- *         `entries` is a list of connection objects (one for a bay, two for a drive-through); null
- *         when the tile is not a bus or truck stop.
+ * @return `{tile, station_id, type, kind, axis?, road?, tram?, entries}` where `type` is `bus` or
+ *         `truck`, `kind` is `bay` or `drive_through`, `axis` is `x` or `y` for a drive-through stop
+ *         only. `road` and `tram` are present for each family the tile carries, as
+ *         `{road_type_id, entries}`, and their `entries` hold the connection objects of that family
+ *         alone (one for a bay, two for a drive-through). `entries` is the combined list kept for
+ *         existing readers: the road entries first, then the tram entries, each carrying its own
+ *         `family`. That label is all the combined list gives: a mixed stop has a road entry and a
+ *         tram entry for the same end, so one entry of `entries` is not the answer for the other
+ *         family, and a reader that needs the access of one family must take that family's subobject
+ *         or select the entries whose `family` it wants. Null when the tile is not a bus or truck
+ *         stop.
  */
 Json RoadStopAccessJson(TileIndex stop_tile);
 

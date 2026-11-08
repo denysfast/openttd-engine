@@ -792,10 +792,10 @@ std::string_view DisallowedRoadDirectionName(DisallowedRoadDirection dir)
 }
 
 /**
- * The road or tram family a tile carries, as the engine records it.
+ * The one road or tram family a tile carries, as the engine records it.
  *
- * A road depot or a road stop tile stores the family it was built for in the same field, so the
- * family is read from the tile and never assumed.
+ * A depot tile stores exactly one family, so it is read from the tile and never assumed. A stop tile
+ * can carry both at once; its reader walks the families instead of choosing one.
  * @param tile The tile.
  * @return \c RoadTramType::Road when the tile carries a road-type road, else \c RoadTramType::Tram.
  */
@@ -825,6 +825,7 @@ Json RoadNeighbourJson(TileIndex tile, DiagDirection dir, RoadTramType rtt)
 	const std::optional<RoadBit> required_bit = required.GetNthSetBit(0);
 
 	Json result = Json::object();
+	result["family"] = rtt == RoadTramType::Tram ? "tram" : "road";
 	result["direction"] = DiagDirName(dir);
 	result["tile"] = IsValidTile(neighbour) ? TileJson(neighbour) : Json(nullptr);
 	result["required_road_bit"] = required_bit.has_value() ? Json(RoadBitName(*required_bit)) : Json(nullptr);
@@ -901,6 +902,31 @@ Json RoadExitJson(TileIndex depot_tile, DiagDirection dir, RoadTramType rtt)
 Json RoadEntryJson(TileIndex stop_tile, DiagDirection dir, RoadTramType rtt)
 {
 	return RoadLinkJson(stop_tile, dir, rtt, false);
+}
+
+/**
+ * The entries of one road stop tile for one road or tram family.
+ *
+ * A bay stop is entered from the one side the engine stored for it; a drive-through stop is entered
+ * from either end of the axis the engine stored, so it has two.
+ * @param stop_tile Tile of the stop.
+ * @param rtt The family to read.
+ * @param bay True for a bay stop, false for a drive-through stop.
+ * @return The list of connection objects of that family.
+ */
+Json RoadStopEntriesJson(TileIndex stop_tile, RoadTramType rtt, bool bay)
+{
+	Json entries = Json::array();
+	if (bay) {
+		entries.push_back(RoadEntryJson(stop_tile, GetBayRoadStopDir(stop_tile), rtt));
+	} else {
+		const Axis axis = GetDriveThroughStopAxis(stop_tile);
+		for (const DiagDirection dir : {DiagDirection::NE, DiagDirection::SE, DiagDirection::SW, DiagDirection::NW}) {
+			if (DiagDirToAxis(dir) != axis) continue;
+			entries.push_back(RoadEntryJson(stop_tile, dir, rtt));
+		}
+	}
+	return entries;
 }
 
 /* -- read-only inventory ----------------------------------------------------------------- */
@@ -3340,21 +3366,7 @@ Json RoadStopAccessJson(TileIndex stop_tile)
 	if (!IsValidTile(stop_tile) || !IsStationRoadStopTile(stop_tile)) return Json(nullptr);
 
 	const RoadStopType rst = GetRoadStopType(stop_tile);
-	const RoadTramType rtt = TileRoadTramType(stop_tile);
 	const bool bay = IsBayRoadStopTile(stop_tile);
-
-	/* A bay stop is entered from the one side the engine stored for it; a drive-through stop is
-	 * entered from either end of the axis the engine stored, so both ends are reported. */
-	Json entries = Json::array();
-	if (bay) {
-		entries.push_back(RoadEntryJson(stop_tile, GetBayRoadStopDir(stop_tile), rtt));
-	} else {
-		const Axis axis = GetDriveThroughStopAxis(stop_tile);
-		for (const DiagDirection dir : {DiagDirection::NE, DiagDirection::SE, DiagDirection::SW, DiagDirection::NW}) {
-			if (DiagDirToAxis(dir) != axis) continue;
-			entries.push_back(RoadEntryJson(stop_tile, dir, rtt));
-		}
-	}
 
 	Json result = Json::object();
 	result["tile"] = TileJson(stop_tile);
@@ -3362,7 +3374,22 @@ Json RoadStopAccessJson(TileIndex stop_tile)
 	result["type"] = rst == RoadStopType::Bus ? "bus" : "truck";
 	result["kind"] = bay ? "bay" : "drive_through";
 	if (!bay) result["axis"] = GetDriveThroughStopAxis(stop_tile) == Axis::X ? "x" : "y";
-	result["entries"] = std::move(entries);
+
+	/* A stop tile can carry a road and a tram road type at once, and the two are separate track: each
+	 * family the tile carries is read on its own, so a road-only neighbour never answers for tram and
+	 * the road-only one-way rule never reaches the tram track. `entries` stays as the combined list
+	 * for existing readers: road entries first, then tram entries, each labelled with its family. */
+	Json combined = Json::array();
+	for (const RoadTramType rtt : {RoadTramType::Road, RoadTramType::Tram}) {
+		if (!HasTileRoadType(stop_tile, rtt)) continue;
+		Json entries = RoadStopEntriesJson(stop_tile, rtt, bay);
+		for (const Json &entry : entries) combined.push_back(entry);
+		result[rtt == RoadTramType::Tram ? "tram" : "road"] = Json{
+			{"road_type_id", static_cast<uint8_t>(GetRoadType(stop_tile, rtt))},
+			{"entries", std::move(entries)},
+		};
+	}
+	result["entries"] = std::move(combined);
 	return result;
 }
 
