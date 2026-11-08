@@ -15,8 +15,10 @@
 #include "cargotype.h"
 #include "command_func.h"
 #include "company_base.h"
+#include "core/backup_type.hpp"
 #include "depot_base.h"
 #include "depot_map.h"
+#include "direction_func.h"
 #include "direction_type.h"
 #include "engine_base.h"
 #include "group.h"
@@ -27,15 +29,21 @@
 #include "order_base.h"
 #include "order_cmd.h"
 #include "order_type.h"
+#include "road.h"
 #include "road_cmd.h"
+#include "road_func.h"
 #include "road_type.h"
+#include "road_map.h"
 #include "roadveh.h"
 #include "station_base.h"
 #include "station_cmd.h"
+#include "station_map.h"
 #include "station_type.h"
 #include "strings_func.h"
+#include "tile_cmd.h"
 #include "timer/timer_game_calendar.h"
 #include "timetable_cmd.h"
+#include "track_func.h"
 #include "train.h"
 #include "vehicle_base.h"
 #include "vehicle_cmd.h"
@@ -280,7 +288,9 @@ public:
 	explicit CompanyContext(CompanyID company) : backup(_current_company, company) {}
 
 private:
-	Backup<CompanyID> backup; ///< Restores the previous company on destruction.
+	/* The company is restored on every return path of the command, so the automatic backup is the
+	 * right one: the manual `Backup` would report a value it was expected to restore by hand. */
+	AutoRestoreBackup<CompanyID> backup; ///< Restores the previous company on destruction.
 };
 
 /**
@@ -722,6 +732,226 @@ bool ReadDiagDirection(const Json &params, DiagDirection &dir)
 	return false;
 }
 
+/**
+ * Name of a diagonal direction, as the tool protocol spells it.
+ * @param dir The direction.
+ * @return The name.
+ */
+std::string DiagDirName(DiagDirection dir)
+{
+	switch (dir) {
+		case DiagDirection::NE: return "ne";
+		case DiagDirection::SE: return "se";
+		case DiagDirection::SW: return "sw";
+		case DiagDirection::NW: return "nw";
+		default: return "invalid";
+	}
+}
+
+/**
+ * Name of one road piece, as the tool protocol spells it.
+ * @param bit The road piece.
+ * @return The name.
+ */
+std::string RoadBitName(RoadBit bit)
+{
+	switch (bit) {
+		case RoadBit::NW: return "nw";
+		case RoadBit::SW: return "sw";
+		case RoadBit::SE: return "se";
+		case RoadBit::NE: return "ne";
+		default: return "invalid";
+	}
+}
+
+/**
+ * Serialise the road pieces of a tile as protocol names.
+ * @param bits The pieces.
+ * @return JSON array of names, in the engine's own piece order.
+ */
+Json RoadBitsJson(RoadBits bits)
+{
+	static constexpr RoadBit all[]{RoadBit::NW, RoadBit::SW, RoadBit::SE, RoadBit::NE};
+
+	Json result = Json::array();
+	for (const RoadBit bit : all) {
+		if (bits.Test(bit)) result.push_back(RoadBitName(bit));
+	}
+	return result;
+}
+
+/**
+ * Name of one disallowed travel direction, as the engine stores it on a one-way road tile.
+ * @param dir The engine's own value; it is not a screen direction.
+ * @return The name.
+ */
+std::string_view DisallowedRoadDirectionName(DisallowedRoadDirection dir)
+{
+	switch (dir) {
+		case DisallowedRoadDirection::Southbound: return "southbound";
+		case DisallowedRoadDirection::Northbound: return "northbound";
+		default: return "invalid";
+	}
+}
+
+/**
+ * The one road or tram family a tile carries, as the engine records it.
+ *
+ * A depot tile stores exactly one family, so it is read from the tile and never assumed. A stop tile
+ * can carry both at once; its reader walks the families instead of choosing one.
+ * @param tile The tile.
+ * @return \c RoadTramType::Road when the tile carries a road-type road, else \c RoadTramType::Tram.
+ */
+RoadTramType TileRoadTramType(TileIndex tile)
+{
+	if (IsValidTile(tile) && MayHaveRoad(tile) && GetRoadType(tile, RoadTramType::Road) != INVALID_ROADTYPE) {
+		return RoadTramType::Road;
+	}
+	return RoadTramType::Tram;
+}
+
+/**
+ * The neighbour of one road connection: the tile in a direction and what that tile carries.
+ *
+ * The piece the neighbour needs is the one on its side facing the reported tile, which is the piece
+ * `ScriptRoad::AreRoadTilesConnected` and the road pathfinder both look for.
+ * @param tile The reported tile.
+ * @param dir The direction from \a tile to the neighbour tile.
+ * @param rtt The road or tram family.
+ * @return `{direction, tile, required_road_bit, road_bits, has_required_bit}`.
+ */
+Json RoadNeighbourJson(TileIndex tile, DiagDirection dir, RoadTramType rtt)
+{
+	const TileIndex neighbour = TileAddByDiagDir(tile, dir);
+	const RoadBits required = DiagDirToRoadBits(ReverseDiagDir(dir));
+	const RoadBits present = IsValidTile(neighbour) ? GetAnyRoadBits(neighbour, rtt, false) : RoadBits{};
+	const std::optional<RoadBit> required_bit = required.GetNthSetBit(0);
+
+	Json result = Json::object();
+	result["family"] = rtt == RoadTramType::Tram ? "tram" : "road";
+	result["direction"] = DiagDirName(dir);
+	result["tile"] = IsValidTile(neighbour) ? TileJson(neighbour) : Json(nullptr);
+	result["required_road_bit"] = required_bit.has_value() ? Json(RoadBitName(*required_bit)) : Json(nullptr);
+	result["road_bits"] = RoadBitsJson(present);
+	result["has_required_bit"] = present.Any(required);
+	return result;
+}
+
+/**
+ * One road connection of a tile: the neighbour tile in a direction and whether a vehicle can drive
+ * between the two.
+ *
+ * The engine lets a road vehicle drive into a tile only if the tile it comes from carries the road
+ * piece towards that tile and the tile it drives into offers a track reachable from the direction it
+ * moves in: `RoadFindPathToDest` keeps only
+ * `GetTileTrackStatus(entered) & DiagdirReachesTrackdirs(enterdir)`, and `enterdir` there is the
+ * direction of motion, not the side the vehicle comes from. The depot and bay stop resets in that
+ * same function show it: a vehicle entering a depot through its door moves opposite to the stored
+ * depot direction, and it is the stored direction that is rejected. The track status of the entered
+ * tile already has its one-way restriction applied (`GetTileTrackStatus_Road` scales the trackdirs
+ * by the disallowed directions), so a one-way tile only lets a vehicle in along its arrow.
+ * A vehicle that drives in from a neighbour stands on that neighbour first, and the neighbour is what
+ * decides which way it may leave: a one-way arrow there that points away from the reported tile takes
+ * the trackdir which exits towards it out of the neighbour's track status, so a stop entry whose
+ * neighbour points the other way is as much a trap as a one-way tile driven into. A depot tile
+ * carries the exit direction it stores and is never one-way, so only the entering case needs that.
+ * The raw piece test alone is not enough: a one-piece stub carries the piece but has no drivable
+ * track at all, so \c connected is the pair and a stub never reads as a usable connection.
+ * @param tile The reported tile.
+ * @param dir The direction from \a tile to the neighbour tile.
+ * @param rtt The road or tram family.
+ * @param leaving True when the vehicle drives out of \a tile into the neighbour (a depot exit),
+ *                false when it drives from the neighbour into \a tile (a stop entry).
+ * @return `{direction, tile, required_road_bit, road_bits, has_required_bit, drivable, connected}`.
+ */
+Json RoadLinkJson(TileIndex tile, DiagDirection dir, RoadTramType rtt, bool leaving)
+{
+	const TileIndex neighbour = TileAddByDiagDir(tile, dir);
+	const TileIndex entered = leaving ? neighbour : tile;
+	/* The direction of motion when the vehicle drives into `entered`. */
+	const DiagDirection motion = leaving ? dir : ReverseDiagDir(dir);
+	const bool valid = IsValidTile(neighbour) && IsValidTile(entered);
+
+	const RoadBits own = IsValidTile(tile) ? GetAnyRoadBits(tile, rtt, false) : RoadBits{};
+	const RoadBits required = DiagDirToRoadBits(ReverseDiagDir(dir));
+	const RoadBits present = IsValidTile(neighbour) ? GetAnyRoadBits(neighbour, rtt, false) : RoadBits{};
+	const bool has_required_bit = present.Any(required);
+	/* The tile the vehicle comes from must carry the piece towards the other one. */
+	const bool from_ok = leaving ? own.Any(DiagDirToRoadBits(dir)) : has_required_bit;
+	/* The tile the vehicle comes from must also offer a trackdir that leaves towards the other one.
+	 * A one-way arrow on that tile points away exactly when the trackdir which exits towards the other
+	 * tile is gone from its track status (`GetTileTrackStatus_Road` scales the trackdirs by the
+	 * disallowed directions), and a vehicle standing there then drives off the other way. A depot tile
+	 * carries the exit direction it stores and is never one-way, so only the entering case needs it. */
+	bool from_leaves = true;
+	if (!leaving && valid) {
+		from_leaves = false;
+		for (const Trackdir trackdir : GetTileTrackStatus(neighbour, TransportType::Road, rtt).trackdirs) {
+			if (TrackdirToExitdir(trackdir) == motion) {
+				from_leaves = true;
+				break;
+			}
+		}
+	}
+	/* The engine's own reachability test on the tile the vehicle drives into. */
+	const bool drivable = valid && from_ok && from_leaves &&
+			(GetTileTrackStatus(entered, TransportType::Road, rtt).trackdirs & DiagdirReachesTrackdirs(motion)).Any();
+
+	Json result = RoadNeighbourJson(tile, dir, rtt);
+	result["drivable"] = drivable;
+	result["connected"] = has_required_bit && drivable;
+	return result;
+}
+
+/**
+ * The exit of a road depot: a vehicle drives out of the depot tile into the neighbour tile.
+ * @param depot_tile Tile of the depot.
+ * @param dir The direction of the depot exit.
+ * @param rtt The road or tram family.
+ * @return The connection object described at #RoadLinkJson.
+ */
+Json RoadExitJson(TileIndex depot_tile, DiagDirection dir, RoadTramType rtt)
+{
+	return RoadLinkJson(depot_tile, dir, rtt, true);
+}
+
+/**
+ * One entry of a road stop: a vehicle drives from the neighbour tile into the stop tile.
+ * @param stop_tile Tile of the stop.
+ * @param dir The direction from the stop tile to the neighbour the vehicle comes from.
+ * @param rtt The road or tram family.
+ * @return The connection object described at #RoadLinkJson.
+ */
+Json RoadEntryJson(TileIndex stop_tile, DiagDirection dir, RoadTramType rtt)
+{
+	return RoadLinkJson(stop_tile, dir, rtt, false);
+}
+
+/**
+ * The entries of one road stop tile for one road or tram family.
+ *
+ * A bay stop is entered from the one side the engine stored for it; a drive-through stop is entered
+ * from either end of the axis the engine stored, so it has two.
+ * @param stop_tile Tile of the stop.
+ * @param rtt The family to read.
+ * @param bay True for a bay stop, false for a drive-through stop.
+ * @return The list of connection objects of that family.
+ */
+Json RoadStopEntriesJson(TileIndex stop_tile, RoadTramType rtt, bool bay)
+{
+	Json entries = Json::array();
+	if (bay) {
+		entries.push_back(RoadEntryJson(stop_tile, GetBayRoadStopDir(stop_tile), rtt));
+	} else {
+		const Axis axis = GetDriveThroughStopAxis(stop_tile);
+		for (const DiagDirection dir : {DiagDirection::NE, DiagDirection::SE, DiagDirection::SW, DiagDirection::NW}) {
+			if (DiagDirToAxis(dir) != axis) continue;
+			entries.push_back(RoadEntryJson(stop_tile, dir, rtt));
+		}
+	}
+	return entries;
+}
+
 /* -- read-only inventory ----------------------------------------------------------------- */
 
 /** Default number of rows one `world.query` returns. */
@@ -732,6 +962,8 @@ constexpr int64_t MAX_QUERY_LIMIT = 500;
 constexpr size_t MAX_NAME_FILTER = 64;
 /** Largest number of order summaries one vehicle row carries. */
 constexpr size_t MAX_ROW_ORDERS = 64;
+/** Largest number of consist parts one vehicle row carries. */
+constexpr size_t MAX_CONSIST_PARTS = 128;
 
 /**
  * Readable name of a cargo type.
@@ -756,6 +988,37 @@ std::string CargoLabelText(CargoType cargo)
 }
 
 /**
+ * Read the engine's own stopped-in-depot state of the chain a vehicle belongs to.
+ *
+ * `Vehicle::IsStoppedInDepot()` asserts that it is asked for the head of a chain, and what it answers
+ * is a property of the whole chain: it is true only when every part is in the depot
+ * (`GroundVehicle::IsChainInDepot()`). A part of a chain is therefore read through the head, and a
+ * vehicle that stands alone is its own head, so every row reports the state of the chain it is in.
+ * @param v The vehicle.
+ * @return True if and only if the chain of the vehicle is in a depot and stopped there.
+ */
+bool ChainIsStoppedInDepot(const Vehicle *v)
+{
+	return v->First()->IsStoppedInDepot();
+}
+
+/**
+ * Read the engine's own depot state (`IsInDepot()`) of one vehicle.
+ *
+ * Every vehicle type answers this for every part of a chain, except the aircraft: `Aircraft::IsInDepot()`
+ * asserts that it is asked for a primary vehicle, and the shadow of an aircraft is a part that stands in
+ * the hangar of the aircraft it belongs to. The shadow is read through its aircraft and every other part
+ * is read directly, so the field stays the state of that part and not the state of its chain.
+ * @param v The vehicle.
+ * @return True if and only if the vehicle is in the depot.
+ */
+bool VehicleIsInDepot(const Vehicle *v)
+{
+	if (v->type == VehicleType::Aircraft && !v->IsPrimaryVehicle()) return v->First()->IsInDepot();
+	return v->IsInDepot();
+}
+
+/**
  * Map the state of a vehicle onto the protocol name.
  * @param v The vehicle.
  * @return Protocol name of the state the vehicle is in.
@@ -764,7 +1027,7 @@ std::string_view VehicleStatusName(const Vehicle *v)
 {
 	if (v->vehstatus.Test(VehState::Crashed)) return "crashed";
 	if (v->breakdown_ctr == 1) return "broken_down";
-	if (v->vehstatus.Test(VehState::Stopped)) return v->IsStoppedInDepot() ? "in_depot" : "stopped";
+	if (v->vehstatus.Test(VehState::Stopped)) return ChainIsStoppedInDepot(v) ? "in_depot" : "stopped";
 	if (v->current_order.IsType(OT_LOADING)) return "loading";
 	return "travelling";
 }
@@ -872,6 +1135,70 @@ Json VehicleCargoJson(const Vehicle *v)
 	cargo["load"] = v->cargo.TotalCount();
 	cargo["capacity"] = v->cargo_cap;
 	return cargo;
+}
+
+/**
+ * Serialise the consist a primary vehicle actually hauls.
+ *
+ * A vehicle row is one vehicle, so the row of a locomotive says nothing about the wagons behind it:
+ * a wagon row carries its own cargo but not the head it is coupled to, and a wagon that stands alone
+ * in a depot is a row of the same shape as a wagon of a train. The consist is the engine's own chain,
+ * walked from the primary vehicle with `Next()`, so the order of the parts and every part's own cargo
+ * are the engine's values and not a reconstruction from the pool.
+ *
+ * Only the primary row of a chain carries this field: a chain is walked once, from its head, so a
+ * query that returns every vehicle does not walk the same chain once per part.
+ *
+ * @param v The primary vehicle the chain starts at.
+ * @return `{total_parts, truncated, parts, cargo}`: the number of parts in the chain, whether the
+ *         parts list was cut at #MAX_CONSIST_PARTS, the parts in chain order with their own cargo,
+ *         and the exact per-cargo load and capacity totals over the whole chain.
+ */
+Json VehicleConsistJson(const Vehicle *v)
+{
+	/** Cargo of a whole chain, per cargo type. */
+	struct ConsistCargo {
+		uint64_t load = 0;     ///< Cargo on board over the whole chain.
+		uint64_t capacity = 0; ///< Capacity over the whole chain.
+	};
+
+	/* The totals are summed over every part even when the parts list below is truncated, and the
+	 * counters are wide: the parts are bounded but the cargo of a chain is not, so a total must never
+	 * wrap. The map orders the answer by cargo type, so the same chain always reads the same way. */
+	std::map<CargoType, ConsistCargo> cargo_totals;
+
+	Json parts = Json::array();
+	int64_t total_parts = 0;
+	for (const Vehicle *part = v; part != nullptr; part = part->Next()) {
+		total_parts++;
+		if (parts.size() < MAX_CONSIST_PARTS) {
+			Json entry = Json::object();
+			entry["ref"] = PoolRef("vehicle", part);
+			entry["cargo"] = VehicleCargoJson(part);
+			parts.push_back(std::move(entry));
+		}
+
+		ConsistCargo &total = cargo_totals[part->cargo_type];
+		total.load += part->cargo.TotalCount();
+		total.capacity += part->cargo_cap;
+	}
+
+	Json cargo = Json::array();
+	for (const auto &[type, total] : cargo_totals) {
+		Json entry = Json::object();
+		entry["type"] = static_cast<uint8_t>(type);
+		entry["label"] = IsValidCargoType(type) ? Json(CargoLabelText(type)) : Json(nullptr);
+		entry["load"] = total.load;
+		entry["capacity"] = total.capacity;
+		cargo.push_back(std::move(entry));
+	}
+
+	Json consist = Json::object();
+	consist["total_parts"] = total_parts;
+	consist["truncated"] = total_parts > static_cast<int64_t>(MAX_CONSIST_PARTS);
+	consist["parts"] = std::move(parts);
+	consist["cargo"] = std::move(cargo);
+	return consist;
 }
 
 /**
@@ -1035,6 +1362,17 @@ Json VehicleRow(const Vehicle *v)
 	row["ref"] = PoolRef("vehicle", v);
 	row["id"] = v->index.base();
 	row["type"] = std::string(VehicleTypeName(v->type));
+	/* The chain the vehicle belongs to, as the engine has it now. `is_primary` is the engine's own
+	 * test for the vehicle that carries the orders and the income of a consist; `primary_ref` names
+	 * the head of the chain only when that head really is a primary vehicle. A wagon that stands
+	 * alone is its own head and is no primary vehicle, so its head is null instead of the wagon
+	 * itself or a guessed front engine, and a stale head can never be reported as a live one. */
+	row["is_primary"] = v->IsPrimaryVehicle();
+	const Vehicle *head = v->First();
+	row["primary_ref"] = head->IsPrimaryVehicle() ? PoolRef("vehicle", head) : Json(nullptr);
+	/* Only the head of a chain carries the consist: the other parts of the same chain are already in
+	 * that answer, so a query that returns every vehicle walks each chain once. */
+	if (v->IsPrimaryVehicle()) row["consist"] = VehicleConsistJson(v);
 	AddRoadTypeFields(row, v);
 	row["owner"] = v->owner.base();
 	row["name"] = v->name;
@@ -1046,7 +1384,18 @@ Json VehicleRow(const Vehicle *v)
 	row["tile"] = TileJson(v->tile);
 	row["status"] = std::string(VehicleStatusName(v));
 	row["stopped"] = v->vehstatus.Test(VehState::Stopped);
-	row["in_depot"] = v->IsStoppedInDepot();
+	/* The engine's own stopped-in-depot state of the chain this vehicle belongs to: a part of a chain
+	 * is in the depot exactly when its chain is, and the engine asks the head of the chain for it. */
+	row["in_depot"] = ChainIsStoppedInDepot(v);
+	/* Exactly the engine's own depot state of this vehicle (`IsInDepot()`, i.e. `RVSB_IN_DEPOT`). It
+	 * stays true for a vehicle that was started but has not left the depot yet, where `in_depot` above
+	 * is already false. It is a state flag, not proof of movement: a vehicle turning around on its
+	 * depot tile is out of this state and still on the tile, which is what `on_depot_tile` below
+	 * reports. */
+	row["in_depot_state"] = VehicleIsInDepot(v);
+	/* Exactly `IsDepotTile(v->tile)`: the tile the vehicle is on now is a depot tile. This is a map
+	 * read of the current tile and does not depend on any vehicle state. */
+	row["on_depot_tile"] = IsDepotTile(v->tile);
 	row["crashed"] = v->vehstatus.Test(VehState::Crashed);
 	row["broken_down"] = v->breakdown_ctr == 1;
 	row["speed"] = v->cur_speed;
@@ -1060,7 +1409,7 @@ Json VehicleRow(const Vehicle *v)
 	row["profit_last_year"] = static_cast<int64_t>(v->GetDisplayProfitLastYear());
 	row["value"] = static_cast<int64_t>(v->value);
 	row["running_cost"] = static_cast<int64_t>(v->GetRunningCost());
-	row["halted_in_depot"] = v->vehstatus.Test(VehState::Stopped) && v->IsStoppedInDepot();
+	row["halted_in_depot"] = v->vehstatus.Test(VehState::Stopped) && ChainIsStoppedInDepot(v);
 	/* The wait state: the engine's own tick counters, the type specific ones null elsewhere. */
 	row.update(VehicleWaitJson(v));
 
@@ -1069,7 +1418,11 @@ Json VehicleRow(const Vehicle *v)
 	row["group_ref"] = group != nullptr ? PoolRef("group", group) : Json(nullptr);
 	row["group_name"] = group != nullptr ? Json(group->name) : Json(nullptr);
 
-	const Depot *depot = v->IsStoppedInDepot() ? Depot::GetByTile(v->tile) : nullptr;
+	/* `Depot::GetByTile()` needs a rail, road or ship depot tile: a hangar stores no depot, so an
+	 * aircraft that is stopped in its hangar has no depot reference. The head of the chain stands on
+	 * the tile the whole chain stands on. */
+	const bool depot_tile = IsRailDepotTile(head->tile) || IsRoadDepotTile(head->tile) || IsShipDepotTile(head->tile);
+	const Depot *depot = depot_tile && ChainIsStoppedInDepot(v) ? Depot::GetByTile(head->tile) : nullptr;
 	row["depot_ref"] = depot != nullptr ? PoolRef("depot", depot) : Json(nullptr);
 
 	row["orders"] = v->GetNumOrders();
@@ -1405,7 +1758,7 @@ Json QueryVehicles(const Json &params, CompanyID company)
 		if (filters.group_id != GroupID::Invalid() && v->group_id != filters.group_id) continue;
 		if (IsValidCargoType(filters.cargo) && v->cargo_type != filters.cargo) continue;
 		if (!filters.name_contains.empty() && v->name.find(filters.name_contains) == std::string::npos) continue;
-		if (filters.in_depot.has_value() && v->IsStoppedInDepot() != *filters.in_depot) continue;
+		if (filters.in_depot.has_value() && ChainIsStoppedInDepot(v) != *filters.in_depot) continue;
 		if (filters.stopped.has_value() && v->vehstatus.Test(VehState::Stopped) != *filters.stopped) continue;
 		if (total++ < offset) continue;
 		if (static_cast<int64_t>(rows.size()) >= limit) continue;
@@ -1837,6 +2190,18 @@ Json ConstructDepot(const Json &params, CompanyID company, RoadType rt, bool dry
 	if (!dry_run) {
 		const Depot *d = Depot::GetByTile(tile);
 		if (d != nullptr) result["depot_id"] = d->index.base();
+	}
+
+	/* A depot whose entrance tile has no road on the side facing the depot is accepted by
+	 * CmdBuildRoadDepot and then traps every vehicle that leaves it. A depot that is on the map is
+	 * read as it is now, exactly as `world.query` and `world.objects` read it, so a caller that lays
+	 * the road afterwards can see the answer change. A dry run builds nothing and a posted command
+	 * may not have run yet: then the depot tile carries no exit piece, so only the neighbour is
+	 * reported and no `connected` is claimed. */
+	if (!dry_run && IsRoadDepotTile(tile)) {
+		result["entrance"] = RoadDepotEntranceJson(tile);
+	} else {
+		result["entrance"] = RoadDepotExitProposalJson(tile, dir, GetRoadTramType(rt));
 	}
 	return MarkExecution(CommandResult(_posted, std::move(result)), dry_run);
 }
@@ -3108,6 +3473,104 @@ std::optional<Json> ReadOrderForTest(const Json &entry, Order &order)
 	return ReadOrder(entry, order);
 }
 
+Json RoadDepotEntranceJson(TileIndex depot_tile)
+{
+	if (!IsValidTile(depot_tile) || !IsRoadDepotTile(depot_tile)) return Json(nullptr);
+
+	/* Both facts are the engine's: the exit direction it stores on the depot tile, and the road or
+	 * tram family the tile carries. Nothing here is remembered from the build. */
+	return RoadExitJson(depot_tile, GetRoadDepotDirection(depot_tile), TileRoadTramType(depot_tile));
+}
+
+Json RoadDepotExitProposalJson(TileIndex depot_tile, DiagDirection dir, RoadTramType rtt)
+{
+	const TileIndex neighbour = TileAddByDiagDir(depot_tile, dir);
+
+	/* The planned depot is not on the map yet, so it has no exit piece: only the neighbour tile can
+	 * be read. `neighbour_drivable` is the engine's test on that tile alone (a vehicle entering it
+	 * from the depot side), so a one-piece stub is caught even before the depot exists. */
+	const bool neighbour_drivable = IsValidTile(neighbour) &&
+			(GetTileTrackStatus(neighbour, TransportType::Road, rtt).trackdirs & DiagdirReachesTrackdirs(dir)).Any();
+
+	Json result = RoadNeighbourJson(depot_tile, dir, rtt);
+	result["planned"] = true;
+	result["neighbour_drivable"] = neighbour_drivable;
+	return result;
+}
+
+Json RoadStopAccessJson(TileIndex stop_tile)
+{
+	if (!IsValidTile(stop_tile) || !IsStationRoadStopTile(stop_tile)) return Json(nullptr);
+
+	const RoadStopType rst = GetRoadStopType(stop_tile);
+	const bool bay = IsBayRoadStopTile(stop_tile);
+
+	Json result = Json::object();
+	result["tile"] = TileJson(stop_tile);
+	result["station_id"] = GetStationIndex(stop_tile).base();
+	result["type"] = rst == RoadStopType::Bus ? "bus" : "truck";
+	result["kind"] = bay ? "bay" : "drive_through";
+	if (!bay) result["axis"] = GetDriveThroughStopAxis(stop_tile) == Axis::X ? "x" : "y";
+
+	/* A stop tile can carry a road and a tram road type at once, and the two are separate track: each
+	 * family the tile carries is read on its own, so a road-only neighbour never answers for tram and
+	 * the road-only one-way rule never reaches the tram track. `entries` stays as the combined list
+	 * for existing readers: road entries first, then tram entries, each labelled with its family. */
+	Json combined = Json::array();
+	for (const RoadTramType rtt : {RoadTramType::Road, RoadTramType::Tram}) {
+		if (!HasTileRoadType(stop_tile, rtt)) continue;
+		Json entries = RoadStopEntriesJson(stop_tile, rtt, bay);
+		for (const Json &entry : entries) combined.push_back(entry);
+		result[rtt == RoadTramType::Tram ? "tram" : "road"] = Json{
+			{"road_type_id", static_cast<uint8_t>(GetRoadType(stop_tile, rtt))},
+			{"entries", std::move(entries)},
+		};
+	}
+	result["entries"] = std::move(combined);
+	return result;
+}
+
+Json RoadTileJson(TileIndex tile, RoadTramType rtt)
+{
+	const bool valid = IsValidTile(tile);
+	const bool may_have_road = valid && MayHaveRoad(tile);
+	const RoadBits present = may_have_road ? GetAnyRoadBits(tile, rtt, false) : RoadBits{};
+	const RoadType rt = may_have_road ? GetRoadType(tile, rtt) : INVALID_ROADTYPE;
+	const TrackStatus status = may_have_road ? GetTileTrackStatus(tile, TransportType::Road, rtt) : TrackStatus{};
+	const DisallowedRoadDirections disallowed = valid && IsNormalRoadTile(tile) ? GetDisallowedRoadDirections(tile) : DisallowedRoadDirections{};
+
+	/* The directions a vehicle can actually drive off this tile in. `TrackdirToExitdir` is the
+	 * engine's own map from a trackdir to the tile edge it leaves by, and the track status already
+	 * carries the one-way restriction of this tile (`GetTileTrackStatus_Road` scales the trackdirs by
+	 * the disallowed directions), so a one-way tile offers only the direction it allows. The
+	 * one-way state of the neighbouring tiles is a per-pair test and is not folded in here. */
+	bool exit_dirs[4] = {false, false, false, false};
+	for (const Trackdir trackdir : status.trackdirs) {
+		exit_dirs[to_underlying(TrackdirToExitdir(trackdir))] = true;
+	}
+
+	Json exits = Json::array();
+	for (const DiagDirection dir : {DiagDirection::NE, DiagDirection::SE, DiagDirection::SW, DiagDirection::NW}) {
+		if (exit_dirs[to_underlying(dir)]) exits.push_back(DiagDirName(dir));
+	}
+
+	Json directions = Json::array();
+	for (const DisallowedRoadDirection dir : {DisallowedRoadDirection::Southbound, DisallowedRoadDirection::Northbound}) {
+		if (disallowed.Test(dir)) directions.push_back(std::string(DisallowedRoadDirectionName(dir)));
+	}
+
+	Json result = Json::object();
+	result["road_bits"] = RoadBitsJson(present);
+	/* The same pair of fields a vehicle row carries: the engine's type id and the engine's own
+	 * classification of it. */
+	result["road_type_id"] = rt == INVALID_ROADTYPE ? Json(nullptr) : Json(static_cast<uint8_t>(rt));
+	result["road_type"] = rt == INVALID_ROADTYPE ? Json(nullptr) : Json(std::string(RoadTypeIsTram(rt) ? "tram" : "road"));
+	result["one_way"] = valid && IsOneWayRoadTile(tile);
+	result["disallowed_directions"] = std::move(directions);
+	result["drivable_exits"] = std::move(exits);
+	return result;
+}
+
 Json OrdersPlanForTest(const Json &orders)
 {
 	Json result = Json::object();
@@ -3254,6 +3717,7 @@ Json GameToolCapabilities()
 		"world.query ownership is explicit: `company_id` filters a company scoped kind, `company_id: null` asks for every owner, and the scope that was applied is reported in `scope.company_id`.",
 		"A vehicle row carries its order list compactly (`current_orders`, at most 64 entries, with `current_orders_truncated`), its group and depot references and the running cost, so the fleet can be audited without a second query.",
 		"A vehicle row carries the engine's own wait counters as raw ticks: `current_order_time` (ticks since the current order started), `load_unload_ticks` (ticks left before the next loading step), `wait_counter` for a train and `turn_counter` for an aircraft. `wait_counter` is one engine field for waiting in front of a signal, being stuck or the forced-proceeding counter, so it is the raw value and not a duration; a counter of another vehicle type is null.",
+		"A vehicle row names its place in a consist: `is_primary` is the engine's own test for the vehicle that carries the orders and the income, and `primary_ref` is the full generation reference of the head of the chain, null when that head is not a primary vehicle (a free wagon is its own head). The primary row adds `consist` with the number of parts in the chain (`total_parts`), whether the parts list was cut at 128 entries (`truncated`), the parts in chain order with their own ref and their own cargo, and the exact per-cargo `load`/`capacity` totals over the whole chain. The row's own `cargo` stays the cargo of that one vehicle.",
 	});
 	return result;
 }

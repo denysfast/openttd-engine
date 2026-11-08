@@ -22,14 +22,17 @@ add_test_files(
     string_func.cpp
     test_agent_admin_tools.cpp
     test_agent_blueprint_tools.cpp
+    test_agent_bridge_guard.cpp
     test_agent_bridge_poll.cpp
     test_agent_bridge_query.cpp
     test_agent_bridge_refs.cpp
     test_agent_bridge_transport.cpp
     test_agent_capture.cpp
+    test_agent_chat_cache.cpp
     test_agent_chat_image.cpp
     test_agent_chat_selection.cpp
     test_agent_chat_send_ack.cpp
+    test_agent_chat_settings.cpp
     test_agent_command_catalog.cpp
     test_agent_company_economy.cpp
     test_agent_game_tools.cpp

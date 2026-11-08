@@ -44,7 +44,10 @@
 #include "rail_map.h"
 #include "rev.h"
 #include "saveload/saveload_func.h"
+#include "settings_internal.h"
+#include "settings_type.h"
 #include "road_map.h"
+#include "roadstop_base.h"
 #include "signs_base.h"
 #include "signs_cmd.h"
 #include "station_base.h"
@@ -973,24 +976,86 @@ Owner TileObjectOwner(TileIndex tile, TileObjectKind kind)
 }
 
 /**
+ * Mix the state of the road tile a road object or a tram object stands on.
+ *
+ * A road and a tram on one tile share one cell: the road bits, the tram bits, the road type, the
+ * tram type, the owner of each family and the one-way state of the road are stored in the same map
+ * array, and a whole-cell write — a demolition, a rebuild — replaces all of them at once. A guard
+ * that mixed only its own family would stay current while the other family was added, changed or
+ * removed on that tile, so both families are mixed here, present or absent, and the road and the
+ * tram row of one tile carry the same fingerprint.
+ *
+ * The geometry is read through the subtype-safe `GetAnyRoadBits()`: `GetRoadBits()` asserts a normal
+ * road, and a depot stores the direction of its exit where a normal road stores its pieces. The
+ * one-way state exists on a normal road only, so it is read behind `IsNormalRoad()`; a depot and a
+ * level crossing store other values in those bits. A level crossing carries rail in the same cell,
+ * so its rail type and track are mixed in as well. A road depot is a pooled object, so its pool
+ * lifetime is mixed in too.
+ * @param hash The fingerprint so far.
+ * @param tile The road tile.
+ * @pre IsTileType(tile, TileType::Road).
+ */
+void MixRoadTileFingerprint(uint32_t &hash, TileIndex tile)
+{
+	/* The subtype says how the geometry is stored, and the same bits mean something else on a normal
+	 * road, a level crossing and a depot. */
+	MixFingerprint(hash, to_underlying(GetRoadTileType(tile)));
+	MixFingerprint(hash, to_underlying(GetRoadType(tile, RoadTramType::Road)));
+	MixFingerprint(hash, to_underlying(GetRoadType(tile, RoadTramType::Tram)));
+	MixFingerprint(hash, GetRoadOwner(tile, RoadTramType::Road).base());
+	MixFingerprint(hash, GetRoadOwner(tile, RoadTramType::Tram).base());
+	MixFingerprint(hash, GetAnyRoadBits(tile, RoadTramType::Road).base());
+	MixFingerprint(hash, GetAnyRoadBits(tile, RoadTramType::Tram).base());
+
+	/* A one-way road is a normal road: on a depot or a level crossing these bits are no direction. */
+	if (IsNormalRoad(tile)) MixFingerprint(hash, GetDisallowedRoadDirections(tile).base());
+
+	/* A level crossing carries rail in the same cell: its rail type is stored on the tile, and the
+	 * track it carries follows the road axis, so both are part of the state a demolition removes. */
+	if (IsLevelCrossing(tile)) {
+		MixFingerprint(hash, to_underlying(GetRailType(tile)));
+		MixFingerprint(hash, to_underlying(GetCrossingRailTrack(tile)));
+	}
+
+	/* A road depot is a pooled object as well: a rebuilt depot is not the one the caller saw. */
+	if (IsRoadDepotTile(tile)) {
+		const Depot *depot = Depot::GetByTile(tile);
+		MixFingerprint64(hash, depot == nullptr ? 0 : depot->generation);
+	}
+}
+
+/**
  * Compute the state fingerprint of a typed tile object.
  *
  * Only the native values that identify the object and its state are mixed in, per category:
- * - every category: the tile type and the tile height;
+ * - every category: the tile type, the height of the north corner and the slope of the tile. The
+ *   height is the north corner only, and the other three corners are the north corners of the
+ *   neighbouring tiles, so the height alone misses an object drawn on a different slope: both are
+ *   mixed for every category, and the engine's own `GetTileSlope()` clamps at the map edge;
  * - every category the engine records an owner for: that owner (road and tram use the owner of
  *   their own transport type, water and map objects the tile owner), because an ownership change
  *   is part of the precondition a caller observed;
- * - terrain: clear ground, clear density and slope;
+ * - terrain: clear ground and clear density;
  * - water: water tile type and water class (the coast, canal and river flags are part of it);
- * - tree: ground, density and tree type;
+ * - tree: ground, density, tree type and the tree count. The density is not a count: planting
+ *   another tree of the same type on the tile only moves `GetTreeCount()`, so the count is part of
+ *   the state. The growth stage is left out, because it advances with the growth counter on its own
+ *   and would make a reference stale while nobody touched the tile;
  * - rail: rail tile type, rail type and, for plain rail, the track bits;
  * - signal: the signal variant of every track, the present signals and the signal states (traffic
  *   can change these, so a signal reference may go stale without anyone building anything);
- * - road and tram: the road type, the subtype of the road tile and the road bits of that tram
- *   type. The bits are read through the subtype-safe `GetAnyRoadBits()`, because a road depot
- *   and a level crossing store their geometry where a normal road does not: on a depot the bits
- *   are the direction of its exit. A depot is a pooled object as well, so its pool lifetime is
- *   mixed in, and a rebuilt depot on the same tile is not the depot the caller looked at;
+ * - road and tram: the whole cell the two families share — the subtype of the road tile, the road
+ *   type, the tram type, the owner of each family, the road bits and the tram bits, each present or
+ *   absent, plus the one-way state of a normal road. A road and a tram on one tile are one cell, and
+ *   a whole-cell write (a demolition, a rebuild) replaces both families at once, so both guards mix
+ *   the state of both families and the two rows of one tile carry the same fingerprint; they differ
+ *   in `type` and `owner`. The geometry is read through the subtype-safe `GetAnyRoadBits()`, because
+ *   `GetRoadBits()` asserts a normal road and a road depot and a level crossing store their geometry
+ *   where a normal road does not: on a depot the bits are the direction of its exit. The one-way
+ *   state exists on a normal road only, so it is read behind `IsNormalRoad()`. A level crossing
+ *   carries rail in the same cell, so its rail type and track are mixed in as well. A depot is a
+ *   pooled object, so its pool lifetime is mixed in, and a rebuilt depot on the same tile is not the
+ *   depot the caller looked at;
  * - bridge and tunnel: transport type and direction, plus the bridge type for a bridge;
  * - mapobject: the object type, the pooled object id and the full 64 bit generation of that
  *   object, so replacing an object with one of the same type is a different identity;
@@ -1007,6 +1072,10 @@ uint32_t TileObjectFingerprint(TileObjectKind kind, TileIndex tile)
 	uint32_t hash = FINGERPRINT_SEED;
 	MixFingerprint(hash, to_underlying(GetTileType(tile)));
 	MixFingerprint(hash, TileHeight(tile));
+	/* TileHeight() is the north corner only: the other three corners are the north corners of the
+	 * neighbouring tiles, so a slope change elsewhere on the tile leaves the height alone while the
+	 * object is drawn on another slope. GetTileSlope() clamps at the map edge, so it is safe here. */
+	MixFingerprint(hash, to_underlying(GetTileSlope(tile)));
 
 	/* Ownership is part of the observed precondition, not only the type, height and bits. */
 	switch (kind) {
@@ -1020,14 +1089,10 @@ uint32_t TileObjectFingerprint(TileObjectKind kind, TileIndex tile)
 			break;
 
 		case TileObjectKind::Road:
-			/* The road and the tram on one tile can belong to different companies. */
-			MixFingerprint(hash, GetTileOwner(tile).base());
-			MixFingerprint(hash, GetRoadOwner(tile, RoadTramType::Road).base());
-			break;
-
 		case TileObjectKind::Tram:
+			/* The road and the tram on one tile can belong to different companies: the owner of each
+			 * family is mixed with the rest of the shared cell in the road case below. */
 			MixFingerprint(hash, GetTileOwner(tile).base());
-			MixFingerprint(hash, GetRoadOwner(tile, RoadTramType::Tram).base());
 			break;
 
 		default:
@@ -1039,7 +1104,6 @@ uint32_t TileObjectFingerprint(TileObjectKind kind, TileIndex tile)
 		case TileObjectKind::Terrain:
 			MixFingerprint(hash, to_underlying(GetClearGround(tile)));
 			MixFingerprint(hash, GetClearDensity(tile));
-			MixFingerprint(hash, to_underlying(GetTileSlope(tile)));
 			break;
 
 		case TileObjectKind::Water:
@@ -1051,6 +1115,9 @@ uint32_t TileObjectFingerprint(TileObjectKind kind, TileIndex tile)
 			MixFingerprint(hash, to_underlying(GetTreeGround(tile)));
 			MixFingerprint(hash, GetTreeDensity(tile));
 			MixFingerprint(hash, to_underlying(GetTreeType(tile)));
+			/* The density is not a count: another tree of the same type only moves GetTreeCount().
+			 * The growth stage stays out: it advances with the growth counter on its own. */
+			MixFingerprint(hash, GetTreeCount(tile));
 			break;
 
 		case TileObjectKind::Rail: {
@@ -1070,21 +1137,10 @@ uint32_t TileObjectFingerprint(TileObjectKind kind, TileIndex tile)
 			break;
 
 		case TileObjectKind::Road:
-		case TileObjectKind::Tram: {
-			const RoadTramType tram_type = kind == TileObjectKind::Tram ? RoadTramType::Tram : RoadTramType::Road;
-			MixFingerprint(hash, to_underlying(GetRoadType(tile, tram_type)));
-			/* The subtype says how the geometry is stored, and the same bits mean something else on a
-			 * normal road, a level crossing and a depot. GetRoadBits() asserts a normal road, so the
-			 * bits come from the subtype-safe GetAnyRoadBits(): on a depot they are its exit direction. */
-			if (IsTileType(tile, TileType::Road)) MixFingerprint(hash, to_underlying(GetRoadTileType(tile)));
-			MixFingerprint(hash, GetAnyRoadBits(tile, tram_type).base());
-			/* A road depot is a pooled object as well: a rebuilt depot is not the one the caller saw. */
-			if (IsRoadDepotTile(tile)) {
-				const Depot *depot = Depot::GetByTile(tile);
-				MixFingerprint64(hash, depot == nullptr ? 0 : depot->generation);
-			}
+		case TileObjectKind::Tram:
+			/* A road and a tram on one tile are one cell: both guards mix both families. */
+			MixRoadTileFingerprint(hash, tile);
 			break;
-		}
 
 		case TileObjectKind::Bridge:
 		case TileObjectKind::Tunnel:
@@ -1157,6 +1213,12 @@ Json TileObjectRow(TileIndex tile, TileObjectKind kind, std::string_view subtype
 		const Object *object = Object::GetByTile(tile);
 		row["object_id"] = object == nullptr ? Json(nullptr) : Json(object->index.base());
 		row["object_generation"] = object == nullptr ? Json(nullptr) : Json(object->generation);
+	}
+
+	/* A road or tram object carries the pieces, the type and the one-way state of its own family,
+	 * so two neighbouring road tiles are not taken for connected track by their tile type alone. */
+	if (kind == TileObjectKind::Road || kind == TileObjectKind::Tram) {
+		row.update(RoadTileJson(tile, kind == TileObjectKind::Tram ? RoadTramType::Tram : RoadTramType::Road));
 	}
 
 	return row;
@@ -1280,6 +1342,18 @@ Json TileRow(TileIndex tile)
 			const Owner owner = GetTileOwner(tile);
 			if (owner != OWNER_NONE && owner != INVALID_OWNER) row["owner"] = owner.base();
 		}
+
+		/* The road or tram state of the tile itself, per family: the tile type alone does not say
+		 * which pieces are there, so two adjacent road tiles are not taken for connected track. */
+		if (type == TileType::Road) {
+			if (GetRoadType(tile, RoadTramType::Road) != INVALID_ROADTYPE) row["road"] = RoadTileJson(tile, RoadTramType::Road);
+			if (GetRoadType(tile, RoadTramType::Tram) != INVALID_ROADTYPE) row["tram"] = RoadTileJson(tile, RoadTramType::Tram);
+			/* A depot tile stores its exit direction; the entrance facts are read from the tile. */
+			if (IsRoadDepotTile(tile)) row["depot"] = RoadDepotEntranceJson(tile);
+		}
+
+		/* A bus or truck stop tile stores its own access; a road waypoint is not a stop. */
+		if (IsStationRoadStopTile(tile)) row["stop"] = RoadStopAccessJson(tile);
 	}
 
 	return row;
@@ -1592,6 +1666,41 @@ Json StationAirportJson(const Station &st)
 	};
 }
 
+/** Largest number of road stops one station row lists, so an answer stays bounded. */
+constexpr uint MAX_STATION_ROAD_STOPS = 8;
+
+/**
+ * The road stops of a station, with the access of each stop read from its own tile.
+ *
+ * The stops are the engine's own lists (`Station::GetPrimaryRoadStop()` and `RoadStop::next`), not
+ * the station's tile area, so a stop is reported exactly where the engine keeps it. Each stop
+ * carries the current entrance facts of its tile (see RoadStopAccessJson in agent_game_tools.h), so
+ * a station row follows the map when a road is built or removed next to a stop. The list is bounded
+ * and says so instead of dropping stops silently.
+ * @param st The station.
+ * @return `{total, truncated, stops}`; an empty list for a station without road stops.
+ */
+Json StationRoadStopsJson(const Station &st)
+{
+	Json stops = Json::array();
+	uint total = 0;
+	for (const RoadStopType type : {RoadStopType::Bus, RoadStopType::Truck}) {
+		for (const RoadStop *rs = st.GetPrimaryRoadStop(type); rs != nullptr; rs = rs->next) {
+			if (total < MAX_STATION_ROAD_STOPS) {
+				const Json access = RoadStopAccessJson(rs->xy);
+				if (!access.is_null()) stops.push_back(access);
+			}
+			total++;
+		}
+	}
+
+	return {
+		{"total", total},
+		{"truncated", total > MAX_STATION_ROAD_STOPS},
+		{"stops", std::move(stops)},
+	};
+}
+
 /**
  * Implement world.query for towns, companies, stations, waypoints, depots, industries, vehicles,
  * signs and tiles.
@@ -1699,6 +1808,8 @@ Json WorldQuery(const Json &params)
 			 * for a station that has no airport at all. */
 			const Json airport = StationAirportJson(*st);
 			if (!airport.is_null()) row["airport"] = airport;
+			/* The same current road stop access as the resolved station below. */
+			row["road_stops"] = StationRoadStopsJson(*st);
 			add_row(std::move(row));
 		}
 	} else if (kind == "waypoints") {
@@ -1728,6 +1839,9 @@ Json WorldQuery(const Json &params)
 			if (company_id >= 0 && (!valid_tile || static_cast<int>(GetTileOwner(d->xy).base()) != company_id)) continue;
 			if (!ContainsAsciiCI(d->name, name)) continue;
 			if (range.active && (!valid_tile || !range.Contains(d->xy))) continue;
+			/* The entrance is read from the depot tile as it is now, not from the build receipt:
+			 * a road laid or removed next to the depot changes the answer. A depot that is not a
+			 * road or tram depot has no road entrance, so the field is null for it. */
 			add_row({
 				{"id", d->index.base()},
 				{"generation", d->generation},
@@ -1736,6 +1850,7 @@ Json WorldQuery(const Json &params)
 				{"owner", valid_tile ? Json(GetTileOwner(d->xy).base()) : Json(nullptr)},
 				{"what", valid_tile ? Json(std::string(TileTypeName(GetTileType(d->xy)))) : Json(nullptr)},
 				{"town_id", d->town != nullptr ? d->town->index.base() : -1},
+				{"entrance", valid_tile ? RoadDepotEntranceJson(d->xy) : Json(nullptr)},
 			});
 		}
 	} else if (kind == "industries") {
@@ -1964,6 +2079,147 @@ std::string_view StationKindName(StationType type)
 	}
 }
 
+/** The pooled structure a tile stands on, when the tile itself carries no typed landscape object. */
+enum class TileStructureKind : uint8_t {
+	Station,  ///< A station tile: rail station, airport, road stop, dock, buoy or waypoint.
+	Industry, ///< An industry tile.
+};
+
+/**
+ * Get the protocol name of a pooled tile structure.
+ * @param kind The structure kind.
+ * @return The name used as the `what` of a generic tile row.
+ */
+std::string_view TileStructureKindName(TileStructureKind kind)
+{
+	switch (kind) {
+		case TileStructureKind::Station: return "station";
+		case TileStructureKind::Industry: return "industry";
+	}
+	return "unknown";
+}
+
+/**
+ * Map a `what` onto a pooled tile structure kind.
+ * @param name The requested name.
+ * @return The structure kind, or nothing when the name is not one.
+ */
+std::optional<TileStructureKind> TileStructureKindFromName(std::string_view name)
+{
+	if (name == "station") return TileStructureKind::Station;
+	if (name == "industry") return TileStructureKind::Industry;
+	return std::nullopt;
+}
+
+/**
+ * The pooled structure a tile stands on.
+ *
+ * A station tile is a tile of a `BaseStation` of the station pool: a `Station` (rail station,
+ * airport, road stop, dock, buoy, oilrig) or a `Waypoint` (rail or road). An industry tile is a tile
+ * of an `Industry`. A tile whose pool item is gone carries no structure, which is the honest answer
+ * for it.
+ * @param tile The tile.
+ * @return The structure kind, or nothing when the tile carries none.
+ */
+std::optional<TileStructureKind> TileStructureKindAt(TileIndex tile)
+{
+	if (!IsValidTile(tile)) return std::nullopt;
+	switch (GetTileType(tile)) {
+		case TileType::Station:
+			if (BaseStation::GetIfValid(GetStationIndex(tile)) != nullptr) return TileStructureKind::Station;
+			break;
+
+		case TileType::Industry:
+			if (Industry::GetIfValid(GetIndustryIndex(tile)) != nullptr) return TileStructureKind::Industry;
+			break;
+
+		default:
+			break;
+	}
+	return std::nullopt;
+}
+
+/**
+ * Compute the state fingerprint of the pooled structure a tile stands on.
+ *
+ * A structure tile carries no typed landscape object of its own, so its identity is the whole native
+ * state of the tile plus the lifetime of the pool item behind it:
+ * - every field of the tile's map entry (`type`, `height` and `m1`..`m8`), which holds the owner,
+ *   the pool index, the geometry and the NewGRF/random data the engine stores for the tile;
+ * - the pooled id and both halves of the 64 bit generation of the `BaseStation` (station, road stop,
+ *   airport, dock, buoy, waypoint) or of the `Industry` behind it, so the same id on the same
+ *   footprint with a new lifetime is a different structure and an old reference is rejected.
+ * @param tile The tile.
+ * @return The fingerprint.
+ */
+uint32_t TileStructureFingerprint(TileIndex tile)
+{
+	uint32_t hash = FINGERPRINT_SEED;
+	Tile tile_data(tile);
+	MixFingerprint(hash, tile_data.type());
+	MixFingerprint(hash, tile_data.height());
+	MixFingerprint(hash, tile_data.m1());
+	MixFingerprint(hash, tile_data.m2());
+	MixFingerprint(hash, tile_data.m3());
+	MixFingerprint(hash, tile_data.m4());
+	MixFingerprint(hash, tile_data.m5());
+	MixFingerprint(hash, tile_data.m6());
+	MixFingerprint(hash, tile_data.m7());
+	MixFingerprint(hash, tile_data.m8());
+
+	if (GetTileType(tile) == TileType::Station) {
+		const BaseStation *station = BaseStation::GetIfValid(GetStationIndex(tile));
+		MixFingerprint(hash, station == nullptr ? 0 : station->index.base());
+		MixFingerprint64(hash, station == nullptr ? 0 : station->generation);
+	} else if (GetTileType(tile) == TileType::Industry) {
+		const Industry *industry = Industry::GetIfValid(GetIndustryIndex(tile));
+		MixFingerprint(hash, industry == nullptr ? 0 : industry->index.base());
+		MixFingerprint64(hash, industry == nullptr ? 0 : industry->generation);
+	}
+
+	return hash;
+}
+
+/**
+ * Describe the pooled structure a tile stands on as a generic tile row.
+ *
+ * A station or an industry tile carries no typed landscape object of its own, so the generic `tile`
+ * spelling resolves the structure that actually stands there: `what` is the structure kind
+ * (`station` or `industry`), `subtype` the readable station kind (`bus_stop`, `airport`, ...) or the
+ * industry type, and the fingerprint covers the tile and the pool lifetime behind it. The row is
+ * neither a typed landscape category nor a pooled reference: it carries the tile identity only, so
+ * it never claims a pool id as the identity of a tile.
+ * @param tile The tile.
+ * @return The row, or nothing when the tile carries no pooled structure.
+ */
+std::optional<Json> TileStructureRow(TileIndex tile)
+{
+	const std::optional<TileStructureKind> kind = TileStructureKindAt(tile);
+	if (!kind.has_value()) return std::nullopt;
+
+	Json row = {
+		{"type", "tile"},
+		{"what", std::string(TileStructureKindName(*kind))},
+		{"identity", "tile"},
+		{"tile", Json{{"x", TileX(tile)}, {"y", TileY(tile)}}},
+		{"fingerprint", TileStructureFingerprint(tile)},
+	};
+
+	if (*kind == TileStructureKind::Station) {
+		/* A station tile is owned by the company the station belongs to. */
+		const Owner owner = GetTileOwner(tile);
+		row["subtype"] = std::string(StationKindName(GetStationType(tile)));
+		row["owner"] = (owner == INVALID_OWNER || owner == OWNER_NONE || owner == OWNER_WATER) ? Json(nullptr) : Json(owner.base());
+	} else {
+		/* An industry tile stores no company owner: the industry is not a company's. */
+		const Industry *industry = Industry::GetIfValid(GetIndustryIndex(tile));
+		row["subtype"] = industry == nullptr ? std::string("industry") : fmt::format("type_{}", industry->type);
+		row["owner"] = nullptr;
+	}
+
+	return row;
+}
+
 /**
  * Resolve a reference to an object the tile itself carries.
  *
@@ -1971,7 +2227,10 @@ std::string_view StationKindName(StationType type)
  * is one of the typed tile categories (`terrain`, `water`, `tree`, `rail`, `signal`, `road`,
  * `tram`, `bridge`, `tunnel`, `mapobject`, `house`), the generic `tile` spelling — then `what`
  * names the category, or the most specific object of the tile is used — or `point`, which names a
- * location only.
+ * location only. The generic spelling also resolves the pooled structure that stands on a station or
+ * an industry tile, which carries no typed object of its own: its row has `what` = `station` or
+ * `industry` and a fingerprint over the whole tile and the lifetime of the `BaseStation` or
+ * `Industry` behind it, so a removal of that structure can be guarded by a read of the tile.
  *
  * A read resolves whatever the tile carries now and reports the current fingerprint, so a caller
  * can build a strict reference from the answer. A write (`require_identity`) has to name the
@@ -2004,14 +2263,20 @@ Json ResolveTileObjectRef(std::string_view ref_type, const Json &ref, bool requi
 
 	/* The category the reference names; the generic `tile` spelling may leave it to the answer. */
 	std::optional<TileObjectKind> requested;
+	/* A `what` that names a pooled structure instead of a typed landscape category. */
+	std::optional<TileStructureKind> requested_structure;
+	std::string named_what;
 	if (ref_type != "tile") {
 		requested = TileObjectKindFromName(ref_type);
 		if (!requested.has_value()) return RefFailure(ref_type, "unknown_type", "unsupported_ref_type");
 	} else {
-		const std::string what = JsonString(ref, "what");
-		if (!what.empty()) {
-			requested = TileObjectKindFromName(what);
-			if (!requested.has_value()) return RefFailure(ref_type, "unknown_what", "invalid_params");
+		named_what = JsonString(ref, "what");
+		if (!named_what.empty()) {
+			requested = TileObjectKindFromName(named_what);
+			if (!requested.has_value()) {
+				requested_structure = TileStructureKindFromName(named_what);
+				if (!requested_structure.has_value()) return RefFailure(ref_type, "unknown_what", "invalid_params");
+			}
 		}
 	}
 
@@ -2023,9 +2288,24 @@ Json ResolveTileObjectRef(std::string_view ref_type, const Json &ref, bool requi
 				found = &object;
 				break;
 			}
-		} else if (found == nullptr) {
+		} else if (!requested_structure.has_value() && found == nullptr) {
 			/* The generic spelling without `what` names the most specific object of the tile. */
 			found = &object;
+		}
+	}
+
+	/*
+	 * A station or an industry tile carries no typed landscape object: the pooled structure that
+	 * stands on it is what the generic `tile` spelling names, and its fingerprint covers the whole
+	 * tile and the lifetime of the pool item behind it. A named `what` has to be the structure kind
+	 * of this very tile, so a station reference never resolves an industry and a rebuilt structure is
+	 * never silently followed.
+	 */
+	std::optional<Json> structure_row;
+	if (found == nullptr && ref_type == "tile") {
+		structure_row = TileStructureRow(tile);
+		if (structure_row.has_value() && (named_what.empty() || (*structure_row)["what"] == named_what)) {
+			found = &*structure_row;
 		}
 	}
 
@@ -2035,6 +2315,8 @@ Json ResolveTileObjectRef(std::string_view ref_type, const Json &ref, bool requi
 		row["tile"] = location;
 		row["what"] = Json::array();
 		for (const Json &object : objects) row["what"].push_back(object["type"]);
+		/* A structure tile carries no typed object, but the structure itself is what stands there. */
+		if (structure_row.has_value()) row["what"].push_back((*structure_row)["what"]);
 		return row;
 	}
 
@@ -2119,13 +2401,203 @@ Json ResolveTileObjectRef(std::string_view ref_type, const Json &ref, bool requi
 }
 
 /**
+ * Name of a setting scope, as used in the protocol.
+ * @param type The setting type.
+ * @return The scope name.
+ */
+std::string_view SettingScopeName(SettingType type)
+{
+	switch (type) {
+		case ST_GAME: return "game";
+		case ST_COMPANY: return "company";
+		case ST_CLIENT: return "client";
+		default: return "unknown";
+	}
+}
+
+/**
+ * The object a setting is read from.
+ *
+ * The engine keeps game settings in the game (or new game) settings object, client settings in the
+ * client settings object and per-company settings in the settings of one company. A per-company
+ * setting is read from the company the reference names and from nothing else: there is no fallback
+ * to the client's company defaults or to whoever the current actor is, because that would silently
+ * resolve another company's value.
+ * @param sd The setting.
+ * @param company The company a per-company setting is read from; it must be valid.
+ * @return The object the setting lives in.
+ */
+const void *SettingObjectForRef(const SettingDesc &sd, CompanyID company)
+{
+	switch (sd.GetType()) {
+		case ST_GAME: return &GetGameSettings();
+		case ST_CLIENT: return &_settings_client;
+		case ST_COMPANY: return &Company::Get(company)->settings;
+		default: NOT_REACHED();
+	}
+}
+
+/**
+ * The typed current value of a setting.
+ *
+ * The value is read through the setting descriptor of that very setting, so it has the type the
+ * setting has: a boolean setting reports a boolean and not 0 or 1, an integer setting reports the
+ * number the engine stores, a string setting reports its string. A list setting has no scalar value
+ * of its own; its engine formatted text is the value and this returns null.
+ * @param sd The setting.
+ * @param object The object the setting lives in.
+ * @return The typed value.
+ */
+Json SettingValueJson(const SettingDesc &sd, const void *object)
+{
+	if (sd.IsIntSetting()) {
+		const IntSettingDesc &isd = *sd.AsIntSetting();
+		const int32_t value = isd.Read(object);
+		if (isd.IsBoolSetting()) return Json(value != 0);
+		return Json(value);
+	}
+	if (sd.IsStringSetting()) return Json(sd.AsStringSetting()->Read(object));
+	return Json(nullptr);
+}
+
+/**
+ * Resolve a reference to one engine setting.
+ *
+ * A reference is `{type: "setting", setting_name, scope, company_id?, company_generation?,
+ * world_id?, epoch?, name?}`. The exact engine setting key and its scope are the whole identity of
+ * a setting: the value of the setting may change and the reference stays current, while a key this
+ * build does not have cannot be resolved at all. A shortcut or an alias the engine would also
+ * accept (`company.engine_renew`, `town_growth_rate`) is not the key the caller named, so it is
+ * reported as unknown together with the canonical name instead of silently resolving to another
+ * setting. The world and the epoch are checked by #ResolveRef before this is called, so a
+ * reference of a world that was left is stale.
+ *
+ * Only public settings resolve: the descriptor is looked up through the same resolver the settings
+ * tools use, so a key of the private or the secrets configuration table is unknown here as well.
+ *
+ * `scope` is mandatory for every setting, game and client settings included, and it is never
+ * inferred from the key: it must be the scope of the descriptor that holds the key. A per-company
+ * setting is owned by one company, and the id of a company is reused after the company is gone, so
+ * the owner is pinned: a company scoped reference has to name `company_id` and
+ * `company_generation`, and it only resolves while that very company lifetime still exists. A
+ * missing, deleted or recreated owner fails closed instead of resolving whichever company holds the
+ * id now. Game and client settings have no owner, no id and no generation at all.
+ *
+ * A write (`require_identity`) needs nothing more than that: there is no value to match, because
+ * the value is what a write changes.
+ * @param ref The reference.
+ * @param require_identity True for a write's `expected_refs`.
+ * @return The resolved setting, or an unknown_setting / scope / owner failure entry.
+ */
+Json ResolveSettingRef(const Json &ref, [[maybe_unused]] bool require_identity)
+{
+	const std::string name = JsonString(ref, "setting_name");
+	if (name.empty()) return RefFailure("setting", "missing_setting_name", "invalid_params");
+
+	const SettingDesc *sd = FindPublicSetting(name);
+	if (sd == nullptr) {
+		Json row = RefFailure("setting", "setting_not_found", "unknown_setting");
+		row["setting_name"] = name;
+		return row;
+	}
+	if (sd->GetName() != name) {
+		Json row = RefFailure("setting", "setting_not_found", "unknown_setting");
+		row["setting_name"] = name;
+		row["canonical_name"] = sd->GetName();
+		return row;
+	}
+
+	/* The scope is part of the identity, and every reference names it: a key is only ever owned by
+	 * the object its descriptor names, so a reference without a scope is incomplete and a reference
+	 * that claims another scope was built for a different thing. The scope is never inferred from
+	 * the key, because a key that moved between tables would then resolve to another setting
+	 * without the caller noticing. */
+	const std::string_view scope = SettingScopeName(sd->GetType());
+	const std::string named_scope = JsonString(ref, "scope");
+	if (named_scope.empty()) {
+		Json row = RefFailure("setting", "missing_scope", "invalid_params");
+		row["setting_name"] = sd->GetName();
+		row["scope"] = std::string(scope);
+		return row;
+	}
+	if (named_scope != scope) {
+		Json row = RefFailure("setting", "scope_mismatch");
+		row["setting_name"] = sd->GetName();
+		row["scope"] = std::string(scope);
+		row["scope_named"] = named_scope;
+		return row;
+	}
+
+	CompanyID company = CompanyID::Invalid();
+	int64_t company_generation = -1;
+	if (sd->GetType() == ST_COMPANY) {
+		/* The owner has to be named: the current actor is not the owner of a stored reference. */
+		int64_t company_id = 0;
+		if (!ReadBoundedInteger(ref, "company_id", static_cast<int64_t>(MAX_COMPANIES) - 1, company_id)) {
+			Json row = RefFailure("setting", "missing_company_id", "invalid_params");
+			row["setting_name"] = sd->GetName();
+			row["scope"] = std::string(scope);
+			return row;
+		}
+		if (!ReadBoundedInteger(ref, "company_generation", std::numeric_limits<int64_t>::max(), company_generation)) {
+			Json row = RefFailure("setting", "missing_company_generation", "invalid_params");
+			row["setting_name"] = sd->GetName();
+			row["scope"] = std::string(scope);
+			row["company_id"] = company_id;
+			return row;
+		}
+
+		company = static_cast<CompanyID>(company_id);
+		const Company *owner = Company::GetIfValid(company);
+		if (owner == nullptr) {
+			Json row = RefFailure("setting", "company_deleted");
+			row["setting_name"] = sd->GetName();
+			row["scope"] = std::string(scope);
+			row["company_id"] = company_id;
+			row["company_generation"] = company_generation;
+			return row;
+		}
+		if (owner->generation != static_cast<uint64_t>(company_generation)) {
+			/* The id was reused by a recreated company: same id, another company. */
+			Json row = RefFailure("setting", "company_lifetime_mismatch");
+			row["setting_name"] = sd->GetName();
+			row["scope"] = std::string(scope);
+			row["company_id"] = company_id;
+			row["company_generation"] = company_generation;
+			row["company_generation_now"] = owner->generation;
+			return row;
+		}
+	}
+
+	const void *object = SettingObjectForRef(*sd, company);
+
+	Json row = {
+		{"type", "setting"},
+		{"found", true},
+		{"identity", "setting"},
+		{"setting_name", sd->GetName()},
+		{"scope", std::string(scope)},
+		{"value", SettingValueJson(*sd, object)},
+		/* The text the engine's own settings window shows for the value, so the caller does not
+		 * have to format units, currencies or enum names itself. */
+		{"value_text", sd->FormatValue(object)},
+	};
+	if (sd->GetType() == ST_COMPANY) {
+		row["company_id"] = company.base();
+		row["company_generation"] = company_generation;
+	}
+	return row;
+}
+
+/**
  * Resolve one typed object reference against the current world.
  *
- * A reference is `{type, id?, tile?, generation?, world_id?, epoch?}`, exactly as the protocol
- * schema and `PickObjects()` describe it. The world and the epoch are checked first: a reference
- * read from another world or epoch can never resolve to a current object, so it is reported as
- * stale instead of being matched by id. Then the id and the generation are read as bounded
- * integers, and only then narrowed into the pool.
+ * A reference is `{type, id?, tile?, generation?, setting_name?, scope?, company_id?,
+ * company_generation?, world_id?, epoch?}`, exactly as the protocol schema and `PickObjects()`
+ * describe it; a setting reference always names `setting_name` and `scope`. The world and the
+ * epoch are checked first: a reference read from another world or epoch can never resolve to a
+ * current object, so it is reported as stale instead of being matched by id. Then the id and the
+ * generation are read as bounded integers, and only then narrowed into the pool.
  *
  * A pooled reference that names a generation is stale when that lifetime is gone, even if the id
  * has been reused. `require_identity` is set for a write: there a pooled reference must name a
@@ -2183,6 +2655,8 @@ Json ResolveRef(const Json &ref, bool require_identity)
 			 * not have to look the station up again; a station without an airport omits it. */
 			const Json airport = StationAirportJson(st);
 			if (!airport.is_null()) row["airport"] = airport;
+			/* The same current road stop access the station row carries. */
+			row["road_stops"] = StationRoadStopsJson(st);
 		});
 	}
 	if (type == "waypoint") {
@@ -2216,6 +2690,8 @@ Json ResolveRef(const Json &ref, bool require_identity)
 			row["what"] = std::string(TileTypeName(GetTileType(d.xy)));
 			row["tile"] = Json{{"x", TileX(d.xy)}, {"y", TileY(d.xy)}};
 			row["town_id"] = d.town != nullptr ? d.town->index.base() : -1;
+			/* The same current entrance facts the depot row carries, read from the tile. */
+			row["entrance"] = IsValidTile(d.xy) ? RoadDepotEntranceJson(d.xy) : Json(nullptr);
 		});
 	}
 	if (type == "engine") {
@@ -2238,6 +2714,8 @@ Json ResolveRef(const Json &ref, bool require_identity)
 			row["owner"] = g.owner.base();
 		});
 	}
+	/* A setting is identified by its engine key, not by a pool id or a tile. */
+	if (type == "setting") return ResolveSettingRef(ref, require_identity);
 	/* The objects a tile itself carries: typed categories, the generic `tile` and `point`. */
 	if (type == "tile" || type == "point" || TileObjectKindFromName(type).has_value()) {
 		return ResolveTileObjectRef(type, ref, require_identity);
@@ -2462,6 +2940,30 @@ std::optional<Json> CheckExpectedRefs(const Json &params)
 		}
 	}
 	return std::nullopt;
+}
+
+/**
+ * Read the current state of one tile as the typed reference a later guard names.
+ *
+ * It is the read a caller would take: the generic `tile` reference resolves the most specific
+ * object of the tile with the fingerprint of the state it has now, and a house or a map object
+ * keeps the pool lifetime that is part of its identity. An empty tile resolves to its terrain row,
+ * so the state a demolition leaves behind is a reference as well.
+ * @param tile The tile to read.
+ * @return The reference, or nothing when the tile carries no resolvable state.
+ */
+std::optional<Json> TileStateRef(TileIndex tile)
+{
+	const Json read = ResolveTileObjectRef("tile", Json{{"type", "tile"}, {"tile", {{"x", TileX(tile)}, {"y", TileY(tile)}}}}, false);
+	if (!read.value("found", false)) return std::nullopt;
+
+	Json ref = {{"type", JsonString(read, "type", "tile")}, {"tile", read["tile"]}};
+	/* Only what the engine reported is copied: the state fingerprint, the category of the generic
+	 * spelling, and the lifetime that is part of the identity of a house or of a map object. */
+	for (const char *key : {"fingerprint", "what", "town_generation", "object_generation", "object_id"}) {
+		if (read.contains(key) && !read[key].is_null()) ref[key] = read[key];
+	}
+	return ref;
 }
 
 /**
@@ -2888,6 +3390,16 @@ Json ExecuteRequest(const Json &request, bool &deferred)
 		} else {
 			RecordExecution(_state.query_timing, micros, INLINE_BUDGET_US);
 		}
+
+		/*
+		 * What the guarded tiles are after the command ran: the receipt a caller advances its own
+		 * guard with. It belongs to the answer - and therefore to the stored receipt - so a replay
+		 * reports the same after state instead of reading a world that moved on since.
+		 */
+		Json postcondition = GuardPostcondition(request, result);
+		if (!postcondition.empty() && result.contains("value") && result["value"].is_object()) {
+			result["value"]["postcondition"] = std::move(postcondition);
+		}
 	}
 	return result;
 }
@@ -3237,18 +3749,23 @@ Json CoreContracts()
 		{"legacy", "world.info.date stays the raw day counter; it is not a date a player recognises, so do not show it"},
 	};
 	contracts["refs"] = {
-		{"identity_kinds", "pool (id + generation), tile (tile + fingerprint, plus town_id/town_generation for a house), point (location only, never stale)"},
+		{"identity_kinds", "pool (id + generation), tile (tile + fingerprint, plus town_id/town_generation for a house), point (location only, never stale), setting (exact engine key + scope, plus the pinned owner company_id/company_generation of a company scoped setting)"},
 		{"tile_types", "terrain, water, tree, rail, signal, road, tram, bridge, tunnel, mapobject, house; `tile` is the generic spelling and takes `what`"},
 		{"tile_fields", "type, what, subtype, identity, tile, owner, fingerprint"},
 		{"owner", "the owner the engine records for that category: rail, signal, bridge, tunnel, water and mapobject use the tile owner; road and tram use the owner of their own transport type, so the road and the tram on one tile can report different owners; terrain, tree and house report null; OWNER_WATER (open sea) and OWNER_NONE report null"},
 		{"house_fields", "a house adds town_id and town_generation: the identity is the tile (the stored house id, its translated HouseID and the random bits) plus the lifetime of its town, never the whole town. A house has no pool generation of its own, so a same-type reconstruction on the same tile in the same town with the same random bits is not distinguishable"},
 		{"mapobject_fields", "a map object adds object_id and object_generation: the pooled object behind the tile is part of the identity, so replacing it with one of the same type is a different identity"},
 		{"point_fields", "type=point, identity=point, tile; no fingerprint, so a point names a location and can never be stale"},
+		{"setting_fields", "type=setting, identity=setting, setting_name, scope (game, client or company; always named, never inferred); a resolved setting adds value (the typed current value: a boolean for a boolean setting, a number for an integer setting, a string for a string setting, null for a list setting) and value_text (the text the engine's own settings window shows). A company scoped setting is owned and adds company_id and company_generation; a game or client setting carries neither an id nor a generation nor a tile nor a fingerprint"},
+		{"setting_identity", "the exact engine setting key (the descriptor's own name, e.g. economy.town_growth_rate) together with its scope is the identity: a value change does not make the reference stale, so a write that names the key is current while the key exists. scope is mandatory for every setting, game and client included: a reference without it answers error=invalid_params with reason=missing_scope, and one that names another scope than the descriptor that holds the key answers scope_mismatch. The scope is never inferred from the key, so a key that moved between tables cannot resolve to another setting unnoticed. A shortcut or alias the engine would also accept is not the key the caller named and answers error=unknown_setting with canonical_name instead of resolving to another setting. Only public settings resolve - the generic and per-company tables the engine's own settings picker offers - so a key of the private or the secrets configuration table (a host name, a password, an invite code, a key) answers unknown_setting too"},
+		{"setting_owner", "a company scoped setting is owned by one company, and company ids are reused: the reference must name company_id and company_generation, and it resolves only against that company lifetime. A missing owner answers error=invalid_params with reason=missing_company_id or missing_company_generation, a deleted owner answers reason=company_deleted and a recreated company that holds the id now answers reason=company_lifetime_mismatch with company_generation_now. The owner is never taken from the current actor, and a company scoped setting never falls back to the client company defaults"},
+		{"setting_world", "a setting reference is bound to the world and epoch it was read in like every other reference, so a reference of a world that was left answers world_mismatch or epoch_mismatch"},
 		{"fingerprint", "FNV-1a over the native tile values that identify the object and its state (tile type, height, the category fields, the recorded owner and both halves of every 64 bit pool lifetime), not over map-array bytes and not over an address"},
 		{"signal_note", "signal states are changed by passing trains, so a signal reference can go stale without anyone building anything: inspect again instead of treating it as an error"},
 		{"write_rule", "expected_refs of a write must name a generation for a pooled type, and a fingerprint plus town_generation (house) or object_generation (map object) for a tile object; a point needs nothing"},
-		{"stale", "a stale reference answers found=false with error=stale_ref and a reason: world_mismatch, epoch_mismatch, deleted, generation_required, generation_mismatch, tile_type_mismatch, tile_state_changed, fingerprint_required, town_generation_required, town_lifetime_mismatch, object_generation_required, object_lifetime_mismatch"},
-		{"invalid", "error=invalid_params with reason=invalid_ref, missing_type, invalid_id, invalid_tile, invalid_fingerprint, invalid_generation or unknown_what"},
+		{"stale", "a stale reference answers found=false with error=stale_ref and a reason: world_mismatch, epoch_mismatch, deleted, generation_required, generation_mismatch, tile_type_mismatch, tile_state_changed, fingerprint_required, town_generation_required, town_lifetime_mismatch, object_generation_required, object_lifetime_mismatch, scope_mismatch, company_deleted, company_lifetime_mismatch"},
+		{"invalid", "error=invalid_params with reason=invalid_ref, missing_type, invalid_id, invalid_tile, invalid_fingerprint, invalid_generation, missing_setting_name, missing_scope, missing_company_id, missing_company_generation or unknown_what"},
+		{"unknown_setting", "a setting key this build does not have, or a shortcut of one, answers found=false with error=unknown_setting and reason=setting_not_found; canonical_name is reported when the engine resolved the shortcut to a real key"},
 		{"unsupported", "a type the kernel cannot resolve answers error=unsupported_ref_type with reason=unknown_type or not_a_pooled_object (a cargo has no lifetime)"},
 		{"bounded", "a tile reference reads only the requested tile: no map scan and no render"},
 	};
@@ -3630,6 +4147,149 @@ Json DescribeTileObjects(TileIndex tile)
 Json ResolveObjectRef(const Json &ref, bool require_identity)
 {
 	return ResolveRef(ref, require_identity);
+}
+
+/**
+ * Whether a module result is the receipt of a command that really ran.
+ *
+ * A guard may only be advanced on the module's own word that the engine executed the command. The
+ * modules state the mode of a call in `dry_run`, which they write on every command receipt (the
+ * game and transport modules through `MarkExecution`, the command catalog for `world.command`),
+ * as `false` for an actual execution and `true` for an estimate. A receipt that leaves `dry_run`
+ * out, or carries a value that is not a boolean, states no mode at all and is therefore not read
+ * as an execution. The two other mode flags are written only by the modules that can state them:
+ * `estimated` repeats the mode of `MarkExecution`, and `executed` is the word of a module that can
+ * answer without running the command (`NotExecuted`). Where they are present they have to agree
+ * with an actual execution, and a flag of another type is a malformed receipt that proves nothing.
+ * @param value The module result inside the bridge result.
+ * @return True iff the result is the receipt of an actual execution.
+ */
+bool IsActualExecutionReceipt(const Json &value)
+{
+	if (!value.is_object()) return false;
+	if (!value.contains("dry_run") || !value["dry_run"].is_boolean() || value["dry_run"].get<bool>()) return false;
+
+	if (value.contains("estimated") && (!value["estimated"].is_boolean() || value["estimated"].get<bool>())) return false;
+	if (value.contains("executed") && (!value["executed"].is_boolean() || !value["executed"].get<bool>())) return false;
+
+	return true;
+}
+
+/**
+ * The category of state a reference names.
+ *
+ * A reference may name its category with the typed `type` (`road`, `terrain`, ...), or with the
+ * generic `tile` spelling and the category in `what`; a row the bridge reads carries both. The
+ * category is taken from `what` when there is one and from `type` otherwise, so the same state
+ * spelled in both ways compares equal. The generic spelling without a `what` names whatever the
+ * tile carries, which is the unknown category `tile` and matches any state.
+ * @param ref The reference or the row to read the category of.
+ * @return The category of the state it names.
+ */
+std::string RefCategory(const Json &ref)
+{
+	const std::string what = JsonString(ref, "what");
+	return what.empty() ? JsonString(ref, "type") : what;
+}
+
+/**
+ * The postcondition receipt of a guarded mutation.
+ *
+ * A guard is the state a command was planned for, and a command that really ran leaves the tile it
+ * was guarded with in another state. Only the engine can say what that state is, so the bridge
+ * reads every guarded tile here, on the main thread, immediately after the command returned, and
+ * reports the state the guard was checked against next to the state it found. A caller (the
+ * backend) may advance the guard of its own successful write to the reported after state, and
+ * never to a later read of its own.
+ *
+ * Nothing is reported when no command ran: a dry run, an estimate, a command the engine refused
+ * before it was dispatched and a request the module answered with a failure all leave the world as
+ * it was, so a receipt of them would advance a guard that was never proven. A guarded tile whose
+ * state the command did not change is not an effect either and is left out; `complete` says
+ * whether every guarded tile was examined, `truncated` whether the bound cut the report short.
+ * @param request The request, for its id, task, world, epoch, method and parameters.
+ * @param result The result of the request.
+ * @return The postcondition block, or an empty object when there is nothing to report.
+ */
+Json GuardPostcondition(const Json &request, const Json &result)
+{
+	const std::string method = JsonString(request, "method");
+	const Json params = request.contains("params") && request["params"].is_object() ? request["params"] : Json::object();
+	if (!IsMutation(method, params)) return Json::object();
+
+	const auto refs = params.find("expected_refs");
+	if (refs == params.end() || !refs->is_array()) return Json::object();
+
+	/* A receipt only follows an execution, and only the module's own mode flags say whether one
+	 * ran: see IsActualExecutionReceipt(). */
+	if (!result.contains("ok") || !result["ok"].is_boolean() || !result["ok"].get<bool>()) return Json::object();
+	if (!result.contains("value") || !result["value"].is_object()) return Json::object();
+	if (!IsActualExecutionReceipt(result["value"])) return Json::object();
+
+	Json tiles = Json::array();
+	size_t guarded = 0;
+	bool complete = true;
+	bool truncated = false;
+	for (const Json &ref : *refs) {
+		/* Only a tile-carrying reference is a tile guard: a pooled or company reference names no tile
+		 * state, and a `point` names a location without an identity, so neither is read here. */
+		if (!ref.is_object() || !ref.contains("tile")) continue;
+		if (JsonString(ref, "type") == "point") continue;
+		TileIndex tile = INVALID_TILE;
+		if (!ReadRefTile(ref, tile) || !IsValidTile(tile)) {
+			complete = false;
+			continue;
+		}
+		if (guarded >= MAX_OBJECT_REFS) {
+			truncated = true;
+			complete = false;
+			break;
+		}
+		guarded++;
+
+		/* The fingerprint the guard was checked against, exactly as the request carried it. */
+		int64_t before = 0;
+		if (!ReadBoundedInteger(ref, "fingerprint", std::numeric_limits<uint32_t>::max(), before)) {
+			complete = false;
+			continue;
+		}
+
+		const std::optional<Json> after = TileStateRef(tile);
+		if (!after.has_value()) {
+			complete = false;
+			continue;
+		}
+		int64_t after_fingerprint = 0;
+		if (!ReadBoundedInteger(*after, "fingerprint", std::numeric_limits<uint32_t>::max(), after_fingerprint)) {
+			complete = false;
+			continue;
+		}
+
+		/*
+		 * An unchanged tile is no effect: the state a later guard needs is the one it already had.
+		 * The guard and the fresh read may spell the same state differently (a typed `road` against
+		 * the generic `tile` spelling of the object, or the other way round), so the categories the
+		 * two spellings resolve to are compared, and a guard without a category matches any state.
+		 */
+		const std::string before_category = RefCategory(ref);
+		if (after_fingerprint == before && (before_category == "tile" || before_category == RefCategory(*after))) continue;
+
+		Json before_ref = {{"type", JsonString(ref, "type")}, {"fingerprint", before}};
+		if (ref.contains("what") && ref["what"].is_string()) before_ref["what"] = ref["what"];
+		tiles.push_back({{"tile", (*after)["tile"]}, {"before", std::move(before_ref)}, {"after", *after}, {"changed", true}});
+	}
+	if (guarded == 0) return Json::object();
+
+	return {
+		{"request_id", JsonString(request, "request_id")},
+		{"task_id", JsonString(request, "task_id")},
+		{"world_id", JsonString(request, "world_id")},
+		{"epoch", JsonString(request, "epoch")},
+		{"guarded", guarded},
+		{"tiles", std::move(tiles)},
+		{"complete", complete},
+		{"truncated", truncated},
+	};
 }
 
 /**

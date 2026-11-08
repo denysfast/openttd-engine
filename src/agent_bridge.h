@@ -132,11 +132,13 @@ Json PickObjects(TileIndex tile);
  * `object_generation` (the pooled object behind the tile). Only the requested tile is read, so a
  * call is bounded and never scans the map.
  *
- * The fingerprint is FNV-1a over the values the engine stores for the object (tile type and
- * height, the recorded owner, both halves of every 64 bit pool lifetime, plus the subtype specific
- * fields listed at the implementation), not over the bytes of the map array and not over an
- * address, so it is stable across runs for the same state. Signal states change with passing
- * traffic, so a signal reference can go stale without anyone building anything.
+ * The fingerprint is FNV-1a over the values the engine stores for the object (tile type, the height
+ * of the north corner and the slope of the tile, the recorded owner, both halves of every 64 bit
+ * pool lifetime, plus the subtype specific fields listed at the implementation), not over the bytes
+ * of the map array and not over an address, so it is stable across runs for the same state. Signal
+ * states change with passing traffic, so a signal reference can go stale without anyone building
+ * anything. A road and a tram on one tile are one cell, so both rows carry the fingerprint of the
+ * whole cell and either of them goes stale when either family changes.
  * @param tile The tile to describe.
  * @return Array of typed tile object rows.
  */
@@ -146,17 +148,50 @@ Json DescribeTileObjects(TileIndex tile);
  * Resolve one typed reference against the current world, as `world.objects` does.
  *
  * A reference is `{type, id?, tile?, generation?, fingerprint?, what?, town_generation?,
- * object_generation?, world_id?, epoch?}`. A read resolves the object as it is now and reports its
- * identity; a write (`require_identity`) additionally rejects a pooled reference without a
- * generation, a tile object without a fingerprint (or, for a house, without the generation of its
- * town, or for a map object without the generation of the pooled object behind it) and any
- * reference whose recorded state is no longer current. A `point` reference names a location only
- * and has no identity to check.
+ * object_generation?, setting_name?, scope?, company_id?, company_generation?, world_id?,
+ * epoch?}`. A read resolves the object as it is now and reports its identity; a write
+ * (`require_identity`) additionally rejects a pooled reference without a generation, a tile object
+ * without a fingerprint (or, for a house, without the generation of its town, or for a map object
+ * without the generation of the pooled object behind it) and any reference whose recorded state is
+ * no longer current. The generic `tile` spelling also resolves the pooled structure that stands on
+ * a station or an industry tile (such a tile carries no typed landscape object of its own): the row
+ * has `what` = `station` or `industry` and a fingerprint over the whole tile and the lifetime of
+ * the `BaseStation` or `Industry` behind it, so a removal of that structure is guarded by a read.
+ * A `point` reference names a location only and has no identity to check. A
+ * `setting` reference is identified by its exact engine key (`setting_name`) and its `scope`, and
+ * both are mandatory: its value may change while the reference stays current, a key this build does
+ * not have is rejected as `unknown_setting`, a reference without a scope as `missing_scope` and a
+ * scope that is not the scope of the descriptor as `scope_mismatch`. A company scoped setting is
+ * owned, so the reference must also name `company_id` and `company_generation` and only resolves
+ * while that company lifetime exists: a deleted or recreated owner fails closed instead of
+ * resolving whichever company holds the id now.
  * @param ref The reference.
  * @param require_identity True for a write's `expected_refs`.
  * @return The resolved object, or a stale_ref entry with `reason`.
  */
 Json ResolveObjectRef(const Json &ref, bool require_identity);
+
+/**
+ * The postcondition receipt of a guarded mutation, as the bridge adds it to the answer.
+ *
+ * A write is admitted with `expected_refs`, so the state of every guarded tile is the precondition
+ * the command ran against. The receipt reports, for each guarded tile the command actually left in
+ * another state, the state the guard was checked against (`before`) next to the state the engine
+ * reads on that tile immediately after the command (`after`), bound to the request, the task, the
+ * world and the epoch. A caller may advance the guard of its own successful write to `after`, and
+ * must not do it for anything else: a dry run, an estimate, a refused or never dispatched command
+ * answers no receipt, and a tile the command did not change is not reported as an effect. Only the
+ * module's own mode flags can state that the command really ran: a receipt without a boolean
+ * `dry_run`, or with an `estimated` or `executed` flag that disagrees, reports nothing.
+ *
+ * The block is `{request_id, task_id, world_id, epoch, guarded, tiles, complete, truncated}`;
+ * `complete` is false when a guarded tile could not be examined, and `truncated` when the bound of
+ * one request's references cut the report short. An answer with nothing to report carries no block.
+ * @param request The request, for its id, task, world, epoch, method and parameters.
+ * @param result The result of the request.
+ * @return The postcondition block, or an empty object when there is nothing to report.
+ */
+Json GuardPostcondition(const Json &request, const Json &result);
 
 /**
  * Send a request to the backend on behalf of the native UI. The UI token is

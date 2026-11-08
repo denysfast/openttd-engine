@@ -4029,6 +4029,7 @@ static bool ConRailRoute(std::span<std::string_view> argv)
 	RailRoutePlan plan = PlanRailRoute(TileXY(*x1, *y1), TileXY(*x2, *y2), options);
 	auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - start).count();
 	if (!plan.error.empty()) {
+		LogRailRouteFailure(TileXY(*x1, *y1), TileXY(*x2, *y2), options, plan);
 		IConsolePrint(CC_ERROR, "Cannot build the trunk line: {}.", plan.error);
 		return true;
 	}

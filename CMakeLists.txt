@@ -248,6 +248,9 @@ set_target_properties(openttd PROPERTIES OUTPUT_NAME "${BINARY_NAME}")
 # All other files are added via target_sources()
 
 if(MSVC)
+    # Optimized JSON command dispatch exceeds the standard COFF section limit.
+    set_property(SOURCE src/agent_command_catalog.cpp APPEND PROPERTY COMPILE_OPTIONS /bigobj)
+
     # Add DPI manifest to project; other WIN32 targets get this via ottdres.rc
     target_sources(openttd PRIVATE "${CMAKE_SOURCE_DIR}/os/windows/openttd.manifest")
 

@@ -1069,6 +1069,21 @@ static CallBackFunction MenuClickNewspaper(int index)
 	return CallBackFunction::None;
 }
 
+/* --- Agent chat button --- */
+
+/**
+ * Open the in-game agent chat window from the toolbar.
+ *
+ * The button is a plain toolbar button, not a menu: the window is the same one the Newspaper menu
+ * entry and the Ctrl+Shift+A hotkey open, so the three ways in stay one code path.
+ * @return #CallBackFunction::None
+ */
+static CallBackFunction ToolbarAgentChatClick(Window *)
+{
+	ShowAgentChatWindow();
+	return CallBackFunction::None;
+}
+
 /* --- Help button menu --- */
 
 static CallBackFunction PlaceLandBlockInfo()
@@ -2002,6 +2017,7 @@ static ToolbarButtonProc * const _toolbar_button_procs[] = {
 	ToolbarNewspaperClick,
 	ToolbarHelpClick,
 	ToolbarSwitchClick,
+	ToolbarAgentChatClick,
 };
 
 /** Main toolbar. */
@@ -2262,8 +2278,52 @@ static std::unique_ptr<NWidgetBase> MakeMainToolbar()
 	return hor;
 }
 
+/** Width of the labelled agent chat button, in unscaled pixels. */
+static const uint AGENT_CHAT_BUTTON_WIDTH = 70;
+
+/**
+ * Container of the main toolbar: the adaptive icon toolbar and the labelled agent chat button.
+ *
+ * The labelled button is a child of this row instead of an icon of the adaptive container, so it
+ * keeps its own width - the icons do not become text wide - and it stays visible while the icon
+ * toolbar switches between its upper and lower rows on a small screen.
+ */
+class NWidgetMainToolbarRow : public NWidgetHorizontal {
+public:
+	void SetupSmallestSize(Window *w) override
+	{
+		this->NWidgetHorizontal::SetupSmallestSize(w);
+		/* The icon container can only report the width of its own buttons, so the width of the
+		 * labelled button is added to the toolbar width here, measured from the widget itself. The
+		 * toolbar, its position and the status bar then stay as wide as what is drawn. */
+		for (const auto &child : this->children) {
+			const NWidgetCore *nwc = dynamic_cast<const NWidgetCore *>(child.get());
+			if (nwc != nullptr && nwc->GetIndex() == WID_TN_AGENT_CHAT) _toolbar_width += nwc->smallest_x;
+		}
+	}
+};
+
+/**
+ * Make the main toolbar: the adaptive icon toolbar, and next to it the labelled agent chat button.
+ * @return widgets for the main toolbar.
+ */
+static std::unique_ptr<NWidgetBase> MakeMainToolbarWithAgentChat()
+{
+	auto hor = std::make_unique<NWidgetMainToolbarRow>();
+	hor->Add(MakeMainToolbar());
+
+	auto chat = std::make_unique<NWidgetLeaf>(WWT_PUSHTXTBTN, Colours::Grey, WID_TN_AGENT_CHAT,
+			WidgetData{.string = STR_AGENT_CHAT_TOOLBAR_BUTTON}, STR_TOOLBAR_TOOLTIP_AGENT_CHAT);
+	chat->SetMinimalSize(AGENT_CHAT_BUTTON_WIDTH, 0);
+	/* A text button is never filled by the leaf setup, so it is given the row height explicitly. */
+	chat->SetResize(0, 1);
+	hor->Add(std::move(chat));
+
+	return hor;
+}
+
 static constexpr std::initializer_list<NWidgetPart> _nested_toolbar_normal_widgets = {
-	NWidgetFunction(MakeMainToolbar),
+	NWidgetFunction(MakeMainToolbarWithAgentChat),
 };
 
 /** Window definition for the normal (top) toolbar. */

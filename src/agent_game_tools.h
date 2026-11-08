@@ -14,7 +14,9 @@
 #include "cargo_type.h"
 #include "command_type.h"
 #include "company_type.h"
+#include "direction_type.h"
 #include "group_type.h"
+#include "road_type.h"
 #include "tile_type.h"
 #include "vehicle_type.h"
 
@@ -141,6 +143,115 @@ void AgentRefitVehicleCallback(Commands cmd, const CommandCost &result, uint ref
  * @param veh_id The vehicle that was created.
  */
 void AgentCloneVehicleCallback(Commands cmd, const CommandCost &result, VehicleID veh_id);
+
+/*
+ * Road reads.
+ *
+ * These helpers answer one question the engine answers silently: does a road actually connect where
+ * a depot door or a stop entrance is? `CmdBuildRoadDepot` and `CmdBuildRoadStop` accept a tile
+ * whose entrance side has no road, and the road pathfinder then turns every vehicle that leaves
+ * around on the tile it started from. All facts below come from the engine's own map accessors
+ * (`GetRoadDepotDirection`, `GetBayRoadStopDir`, `GetDriveThroughStopAxis`, `GetAnyRoadBits`,
+ * `GetTileTrackStatus`, `DiagdirReachesTrackdirs`, `TrackdirToExitdir`) and never from an offset or
+ * a remembered build.
+ *
+ * One connection (a depot exit or a stop entry) is reported as an object with these fields:
+ *   `family`             `road` or `tram`: the road or tram family this connection was read for. The
+ *                        two are separate track, so they are always read separately.
+ *   `direction`          the direction from the reported tile to the neighbour tile, as `ne`/`se`/
+ *                        `sw`/`nw` (the engine's `DiagDirection`).
+ *   `tile`               the neighbour tile, from the engine's own `TileAddByDiagDir`, or null when
+ *                        it is outside the map.
+ *   `required_road_bit`  the road or tram piece that neighbour tile must have on the side facing
+ *                        the reported tile (`nw`/`sw`/`se`/`ne`), or null when the neighbour is
+ *                        outside the map.
+ *   `road_bits`          the pieces that neighbour tile really has now, in the engine's piece order.
+ *   `has_required_bit`   the raw piece test: is `required_road_bit` among `road_bits`? A one-piece
+ *                        stub passes this and still cannot be driven on.
+ *   `drivable`           the engine's track test: the tile the vehicle comes from carries its piece
+ *                        towards the other one and the tile it drives into offers a track reachable
+ *                        when moving in the direction of travel (`GetTileTrackStatus &
+ *                        DiagdirReachesTrackdirs`, which `RoadFindPathToDest` applies to the entered
+ *                        tile with the direction of motion). For a depot exit the vehicle drives out
+ *                        of the depot tile, for a stop entry it drives from the neighbour into the
+ *                        stop tile. The entered tile's own one-way state is part of its track status,
+ *                        so a one-way tile only lets a vehicle in along its arrow, and for a stop
+ *                        entry the neighbour's own one-way state counts as well: an arrow that points
+ *                        away from the stop leaves no trackdir of that neighbour exiting towards it.
+ *   `connected`          `has_required_bit && drivable`. This is the field to check: a vehicle can
+ *                        only get through when it is true. The other fields say why it is not.
+ */
+
+/**
+ * The entrance of a road or tram depot that is on the map, read from the depot tile itself.
+ *
+ * The direction is the engine's `GetRoadDepotDirection` and the road/tram family is the one the tile
+ * carries, so the answer follows the tile when it is rebuilt or when the road next to it changes.
+ * @param depot_tile Tile of the depot.
+ * @return The connection object described above, or null when the tile is not a road or tram depot.
+ */
+Json RoadDepotEntranceJson(TileIndex depot_tile);
+
+/**
+ * What a planned depot exit would meet, for a depot that is not on the map yet.
+ *
+ * A dry run builds nothing, so the depot tile carries no exit piece and no `connected` can be read.
+ * This reports only what the neighbour tile offers now, and marks itself `planned` so it is never
+ * taken for the current state of a depot: `RoadDepotEntranceJson` is the current answer once the
+ * depot is there.
+ * @param depot_tile Tile the depot is planned for.
+ * @param dir The planned exit direction.
+ * @param rtt The planned road or tram family.
+ * @return `{family, direction, tile, required_road_bit, road_bits, has_required_bit, planned,
+ *         neighbour_drivable}`. `neighbour_drivable` is the engine's track test on the neighbour
+ *         tile alone, for a vehicle entering it from the depot side, so a one-piece stub is caught
+ *         before the depot exists. A built depot always carries its own exit piece, so the depot is
+ *         usable exactly when `has_required_bit` and `neighbour_drivable` are both true.
+ */
+Json RoadDepotExitProposalJson(TileIndex depot_tile, DiagDirection dir, RoadTramType rtt);
+
+/**
+ * The access of one bus or truck stop tile, read from the stop tile itself.
+ *
+ * A bay stop has exactly one entry, on the side the engine stored with `GetBayRoadStopDir`. A
+ * drive-through stop is entered from either end of the axis the engine stored with
+ * `GetDriveThroughStopAxis`, so it has two. A multi-tile drive-through platform is reported one
+ * tile at a time, exactly as the engine stores it: the entries of the reported tile are its own
+ * neighbours.
+ *
+ * A stop tile can carry a road and a tram road type at once, and those are separate track. Every
+ * family the tile carries is read on its own, so a road-only neighbour never answers for tram and the
+ * road-only one-way rule never blocks tram track.
+ * @param stop_tile Tile of the road stop.
+ * @return `{tile, station_id, type, kind, axis?, road?, tram?, entries}` where `type` is `bus` or
+ *         `truck`, `kind` is `bay` or `drive_through`, `axis` is `x` or `y` for a drive-through stop
+ *         only. `road` and `tram` are present for each family the tile carries, as
+ *         `{road_type_id, entries}`, and their `entries` hold the connection objects of that family
+ *         alone (one for a bay, two for a drive-through). `entries` is the combined list kept for
+ *         existing readers: the road entries first, then the tram entries, each carrying its own
+ *         `family`. That label is all the combined list gives: a mixed stop has a road entry and a
+ *         tram entry for the same end, so one entry of `entries` is not the answer for the other
+ *         family, and a reader that needs the access of one family must take that family's subobject
+ *         or select the entries whose `family` it wants. Null when the tile is not a bus or truck
+ *         stop.
+ */
+Json RoadStopAccessJson(TileIndex stop_tile);
+
+/**
+ * The road or tram state of one tile, as the engine has it now.
+ * @param tile The tile.
+ * @param rtt The road or tram family to read.
+ * @return `{road_bits, road_type_id, road_type, one_way, disallowed_directions, drivable_exits}`:
+ *         the pieces of that family on the tile, the engine's road type id for it and its own
+ *         classification of that id (`road`/`tram`, both null when the tile carries none), whether
+ *         the tile is a one-way road, the engine's `DisallowedRoadDirection` values that are set
+ *         (`northbound`/`southbound`, the engine's own names, not screen directions), and the
+ *         diagonal directions a vehicle can actually drive off this tile in. The exits are the
+ *         tile's track status mapped through the engine's own `TrackdirToExitdir`, so a curve
+ *         reports the two sides it joins and a one-way tile reports only the direction it allows.
+ *         The one-way state of the neighbouring tiles is a per-pair test and is not folded in.
+ */
+Json RoadTileJson(TileIndex tile, RoadTramType rtt);
 
 /**
  * The road type fields of a vehicle row, for the tests.

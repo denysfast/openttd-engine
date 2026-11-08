@@ -224,7 +224,7 @@ TEST_CASE("RailRouteBothHalvesOfDiagonalStartStayFixed")
 	for (Track piece : {Track::Left, Track::Right, Track::Upper, Track::Lower}) {
 		MakeRailNormal(TileXY(64, 64), _current_company, piece, o.railtype);
 		o.start = GetRailRouteStartOrientation(TileXY(64, 64), o.railtype);
-		for (auto [dx, dy] : {std::pair{20, 10}, {-20, -10}, {10, 20}, {-10, -20}}) {
+		for (auto [dx, dy] : {std::pair{20, 10}, {-20, -10}, {10, 20}, {-10, -20}, {2, 5}, {5, 2}, {-2, -5}, {-5, -2}}) {
 			if (o.start == RailRouteStart::EW) dy = -dy;
 			CAPTURE(piece, dx, dy);
 			auto plan = PlanRailRoute(TileXY(64, 64), TileXY(64 + dx, 64 + dy), o);
@@ -365,4 +365,77 @@ TEST_CASE("RailRouteDoesNotRemoveSignalsForTurnouts")
 	CHECK_FALSE(plan.error.empty());
 	CHECK(plan.prepare.empty());
 	CHECK(plan.build.empty());
+}
+
+TEST_CASE("RailRouteFindsBendsBetweenBlockedSamples")
+{
+	RouteMap map;
+	RailRouteOptions o;
+	o.tracks = 1;
+	o.start = RailRouteStart::X;
+	o.terraform = false;
+	/* Block all four distinct fixed-X samples, leaving other bend positions free. */
+	for (auto [x, y] : {std::pair{45, 30}, {40, 35}, {45, 35}, {50, 35}}) {
+		MakeRailNormal(TileXY(x, y), CompanyID{1}, Track::Y, o.railtype);
+	}
+	auto plan = PlanRailRoute(TileXY(30, 30), TileXY(70, 50), o);
+	REQUIRE(plan.error.empty());
+	CHECK(plan.end == TileXY(70, 50));
+	CHECK(plan.prepare.empty());
+	CHECK(PlannedBits(plan, 30, 30) == Track::X);
+	for (auto [x, y] : {std::pair{45, 30}, {40, 35}, {45, 35}, {50, 35}}) {
+		CHECK(PlannedBits(plan, x, y).None());
+		CHECK(GetTileOwner(TileXY(x, y)) == CompanyID{1});
+		CHECK(GetTrackBits(TileXY(x, y)) == Track::Y);
+	}
+}
+
+TEST_CASE("RailRouteClearGroundSweep")
+{
+	RouteMap map;
+	RailRouteOptions o;
+	for (bool hills : {false, true}) {
+		CAPTURE(hills);
+		for (Tile t : Map::Iterate()) {
+			int distance = std::max(std::abs(static_cast<int>(TileX(t)) - 65), std::abs(static_cast<int>(TileY(t)) - 65));
+			SetTileHeight(t, 3 + (hills ? std::max(0, 4 - distance) : 0));
+		}
+		for (uint8_t lanes : {1, 2, 4, 8, 16, 30}) {
+			o.tracks = lanes;
+			for (RailRouteStart start : {RailRouteStart::X, RailRouteStart::Y, RailRouteStart::NS, RailRouteStart::EW}) {
+				o.start = start;
+				for (int dx : {-40, -25, -12, -5, -2, 2, 5, 12, 25, 40}) {
+					for (int dy : {-40, -25, -12, -5, -2, 2, 5, 12, 25, 40}) {
+						if ((start == RailRouteStart::NS && (dx > 0) != (dy > 0)) ||
+								(start == RailRouteStart::EW && (dx > 0) == (dy > 0))) continue;
+						auto plan = PlanRailRoute(TileXY(64, 64), TileXY(64 + dx, 64 + dy), o);
+						CAPTURE(lanes, start, dx, dy, plan.error, plan.diagnostics);
+						REQUIRE(plan.error.empty());
+						for (auto [tile, bits] : GetRailRouteStartPieces(TileXY(64, 64), start, lanes)) {
+							CHECK((PlannedBits(plan, TileX(tile), TileY(tile)) & bits) == bits);
+						}
+					}
+				}
+			}
+		}
+	}
+}
+
+TEST_CASE("RailRouteShortDiagonalProjectsEndForAllStartPieces")
+{
+	RouteMap map;
+	RailRouteOptions o;
+	o.start = RailRouteStart::NS;
+	o.tracks = 4;
+	auto plan = PlanRailRoute(TileXY(64, 64), TileXY(66, 69), o);
+	REQUIRE(plan.error.empty());
+	CHECK(plan.end == TileXY(67, 69));
+	CHECK(plan.prepare.empty());
+	for (auto [tile, bits] : GetRailRouteStartPieces(TileXY(64, 64), o.start, o.tracks)) {
+		CHECK((PlannedBits(plan, TileX(tile), TileY(tile)) & bits) == bits);
+	}
+	/* A reachable requested endpoint must keep its original position. */
+	auto longer = PlanRailRoute(TileXY(64, 64), TileXY(74, 84), o);
+	REQUIRE(longer.error.empty());
+	CHECK(longer.end == TileXY(74, 84));
 }

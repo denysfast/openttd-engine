@@ -197,7 +197,10 @@ inline Point WorldToScreen(const Viewport &vp, int x, int y, int z)
  * A requested projection is returned as "projection":
  * - tile to screen: "coordinate_space": "screen_pixels", "tile" (index/x/y), "world"
  *   (x/y/z of the tile centre at ground height), "screen" (x/y), "in_viewport", "visible",
- *   "occluding_window" (null, or the class/number of the window covering that pixel) and
+ *   "occluding_window" (null, or the class/number of the window covering that pixel; a class a
+ *   caller can recognise also names its "kind" - "finances", "news", "agent_chat" or
+ *   "agent_chat_settings" - and reports the screen rectangle of the close box it really has as
+ *   "close_rect", omitted when the window has none) and
  *   "zoom".
  * - screen to tile: "coordinate_space": "world", "screen" (x/y), "world" (x/y as returned
  *   by TranslateXYToTileCoord(), or null when the pixel is outside the viewport), "tile"
@@ -215,6 +218,22 @@ inline Point WorldToScreen(const Viewport &vp, int x, int y, int z)
  * @return The JSON result describing the camera and the projection.
  */
 Json InspectGameViewport(const Json &params);
+
+/**
+ * Describe the native window that covers a screen pixel.
+ *
+ * This is the read-only description InspectGameViewport() reports as "occluding_window": the
+ * window "class" and "number", the "kind" of a class a caller can recognise ("finances", "news",
+ * "agent_chat" or "agent_chat_settings") and the screen rectangle of the close box the window
+ * really has as "close_rect", omitted when it has none. Nothing is clicked, focused, closed or
+ * reordered, so a caller can recognise the window that hides a pixel of the native UI and close it
+ * by the close box it measures here.
+ *
+ * @param x Screen x.
+ * @param y Screen y.
+ * @return The window as JSON, or null when the main window or no window is at that pixel.
+ */
+Json DescribeWindowAtPoint(int x, int y);
 
 /**
  * Move and zoom the main viewport through the normal native UI camera APIs.
